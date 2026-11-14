@@ -299,7 +299,9 @@ def run_strict_selftest() -> int:
         scroll_parse_ok = (parsed_turn.scroll_direction == "down") and (parsed_turn.scroll_amount == 6)
 
         previous_snapshot = jarvis_services.ScreenCaptureService._last_raw_logical_image
+        previous_regions = list(jarvis_services.ScreenCaptureService._used_underline_regions)
         try:
+            jarvis_services.ScreenCaptureService.reset_underline_baselines()
             synthetic_screen = Image.new("RGB", (600, 300), (20, 22, 28))
             synthetic_draw = ImageDraw.Draw(synthetic_screen)
             for bar_x in range(104, 256, 5):
@@ -316,8 +318,64 @@ def run_strict_selftest() -> int:
                 off_baseline_cmd
             )
             baseline_snap_ok = abs(snapped_cmd.y - 142.0) <= 18.0 and (snapped_cmd.y < 140.0)
+
+            # Stacked 34px-spaced list test matching HRM list layout:
+            # verify distinct baseline locking + strict horizontal trimming without Line 2/overshoot leak
+            jarvis_services.ScreenCaptureService.reset_underline_baselines()
+            stacked_screen = Image.new("RGB", (900, 500), (24, 24, 24))
+            stacked_draw = ImageDraw.Draw(stacked_screen)
+            line_specs = [
+                (150, 164, 80, 580),  # Point 1: 500px
+                (184, 198, 80, 620),  # Point 2: 540px
+                (218, 232, 80, 510),  # Point 3: 430px (shorter than 1 & 2)
+                (252, 266, 80, 500),  # Point 4: 420px
+            ]
+            for top_row, bottom_row, col_start, col_end in line_specs:
+                for glyph_x in range(col_start, col_end, 5):
+                    stacked_draw.rectangle([glyph_x, top_row, glyph_x + 2, bottom_row], fill=(235, 240, 248))
+            jarvis_services.ScreenCaptureService._last_raw_logical_image = stacked_screen
+
+            snap_line_1 = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(
+                jarvis_response_parser.DrawingCommand(
+                    kind="underline", x=80.0, y=168.0, width=500.0, label="1. Artificial Intelligence"
+                )
+            )
+            # Deliberately supply slightly high Y near Line 1 to ensure it locks onto unused Line 2
+            snap_line_2 = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(
+                jarvis_response_parser.DrawingCommand(
+                    kind="underline", x=80.0, y=174.0, width=540.0, label="2. Remote Working"
+                )
+            )
+            # Deliberately supply huge overshooting width (640px) on Line 3 (actual text ends at x=510, w=430)
+            snap_line_3 = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(
+                jarvis_response_parser.DrawingCommand(
+                    kind="underline", x=80.0, y=236.0, width=640.0, label="3. HR Analytics"
+                )
+            )
+            stacked_list_snap_ok = (
+                (snap_line_2.y > snap_line_1.y + 20.0)
+                and (abs(snap_line_3.y - 236.0) <= 6.0)
+                and (snap_line_3.width <= 442.0)
+                and (snap_line_3.width >= 415.0)
+            )
+
+            adaptive_scroll_ok = (
+                jarvis_services.ScreenCaptureService.recommend_adaptive_scroll_ticks(
+                    direction="down", requested_ticks=6, user_prompt="scroll down a little"
+                ) == 3
+                and jarvis_services.ScreenCaptureService.recommend_adaptive_scroll_ticks(
+                    direction="down", requested_ticks=6, user_prompt="scroll half page"
+                ) == 5
+                and jarvis_services.ScreenCaptureService.recommend_adaptive_scroll_ticks(
+                    direction="down", requested_ticks=6, user_prompt="scroll a full page"
+                ) == 9
+                and jarvis_services.ScreenCaptureService.recommend_adaptive_scroll_ticks(
+                    direction="down", requested_ticks=0, user_prompt="explain this", force_if_needed=True
+                ) == 0
+            )
         finally:
             jarvis_services.ScreenCaptureService._last_raw_logical_image = previous_snapshot
+            jarvis_services.ScreenCaptureService._used_underline_regions = previous_regions
 
         single_char_violations: List[str] = []
         active_module_paths = [
@@ -453,6 +511,38 @@ def run_strict_selftest() -> int:
             and (admin_intent.admin_request is not None)
         )
 
+        intro_block_parsed = jarvis_response_parser.parse_model_response(
+            'underline(80, 168, 490, "1. Artificial Intelligence (AI)")\n'
+            'underline(80, 202, 520, "2. Remote Working")\n'
+            'underline(80, 236, 430, "3. HR Analytics")\n'
+            "Emerging trends in HRM are new practices shaping organizations.\n"
+            "First, Artificial Intelligence speeds up resume screening.\n"
+            "Second, Remote Working lets staff work from home.\n"
+            "Third, HR Analytics turns employee metrics into better decisions.\n"
+        )
+        post_sentence_parsed = jarvis_response_parser.parse_model_response(
+            "Artificial Intelligence helps in resume screening and recruitment.\n"
+            'underline(80, 168, 490, "1. Artificial Intelligence (AI)")\n'
+            "Remote Working allows employees to work from home.\n"
+            'underline(80, 202, 520, "2. Remote Working")\n'
+        )
+        semantic_sync_ok = (
+            [cmd_item.sentence_index for cmd_item in intro_block_parsed.commands if cmd_item.kind == "underline"] == [1, 2, 3]
+            and [cmd_item.sentence_index for cmd_item in post_sentence_parsed.commands if cmd_item.kind == "underline"] == [0, 1]
+            and (
+                jarvis_response_parser.command_label_matches_sentence(
+                    "2. Remote Working",
+                    "1. Artificial Intelligence helps in resume screening.",
+                ) < 0
+            )
+            and (
+                jarvis_response_parser.command_label_matches_sentence(
+                    "2. Remote Working",
+                    "Remote working lets employees work from home instead of the office.",
+                ) > 0
+            )
+        )
+
         parser_ok = (
             "internal reasoning hidden" not in parsed_turn.spoken_text
             and len(collected_commands) >= 4
@@ -463,6 +553,9 @@ def run_strict_selftest() -> int:
             and agent_ok
             and multitask_agent_ok
             and voice_sync_ok
+            and semantic_sync_ok
+            and stacked_list_snap_ok
+            and adaptive_scroll_ok
             and memory_ok
             and diagram_notes_ok
             and intent_router_ok
@@ -483,7 +576,9 @@ def run_strict_selftest() -> int:
                 f"mean_ms={main_mean_ms:.3f}ms, hidden={hidden_on_close}, "
                 f"personal={main_personal_ok}, scroll_ok={scroll_intent_ok and scroll_parse_ok}, "
                 f"snap_ok={baseline_snap_ok}, agent_ok={agent_ok}, multitask_ok={multitask_agent_ok}, "
-                f"sync_ok={voice_sync_ok}, memory_ok={memory_ok}, diagram_ok={diagram_notes_ok}, "
+                f"sync_ok={voice_sync_ok}, semantic_sync={semantic_sync_ok}, "
+                f"stacked_snap={stacked_list_snap_ok}, adaptive_scroll={adaptive_scroll_ok}, "
+                f"memory_ok={memory_ok}, diagram_ok={diagram_notes_ok}, "
                 f"intent_ok={intent_router_ok}, precise_ok={precise_norm_ok}, "
                 f"single_char={single_char_violations[:8]}"
             ),

@@ -66,7 +66,11 @@ class JarvisApplicationController(QObject):
         self._active_tts_generation = 0
         self._sentences_enqueued_in_turn = 0
         self._pending_voice_synced_commands: Dict[int, List[jarvis_response_parser.DrawingCommand]] = {}
+        self._turn_sentences: List[str] = []
+        self._current_turn_prompt_text: str = ""
+        self._brain_turn_done: bool = True
         self._current_spoken_sentence_index: int = -1
+        self._current_spoken_sentence_text: str = ""
         self._agent_worker_generation: int = 0
         self._scroll_explain_active = False
         self._scroll_explain_user_prompt = ""
@@ -552,7 +556,11 @@ class JarvisApplicationController(QObject):
         self._pending_admin_request = None
         self._pending_direct_agent_commands = []
         self._pending_voice_synced_commands.clear()
+        self._turn_sentences = []
+        self._current_turn_prompt_text = ""
+        self._brain_turn_done = True
         self._current_spoken_sentence_index = -1
+        self._current_spoken_sentence_text = ""
         self._cancel_scroll_explain_sequence()
         self.overlay_window.cancel_interactive_lasso_mode()
         self.brain_service.stop_current_turn()
@@ -582,7 +590,11 @@ class JarvisApplicationController(QObject):
         self.tts_service.stop_speaking()
         self.sound_player.stop_drawing_sound()
         self._pending_voice_synced_commands.clear()
+        self._turn_sentences = []
+        self._current_turn_prompt_text = prompt_text or ""
+        self._brain_turn_done = False
         self._current_spoken_sentence_index = -1
+        self._current_spoken_sentence_text = ""
 
         self._executed_agent_command_in_turn = False
         agent_actions_enabled = bool(self.settings_store.get("agent_actions_enabled", True))
@@ -975,7 +987,69 @@ class JarvisApplicationController(QObject):
         if self._force_captions_for_turn or bool(self.settings_store.get("captions_enabled", False)):
             self.overlay_window.set_caption_text(partial_text, force_visible=self._force_captions_for_turn)
 
+    def _realign_pending_commands_with_sentences(self) -> None:
+        if not self._turn_sentences or not self._pending_voice_synced_commands:
+            return
+        realigned_buckets: Dict[int, List[jarvis_response_parser.DrawingCommand]] = {}
+        for old_key in sorted(self._pending_voice_synced_commands.keys()):
+            for queued_cmd in self._pending_voice_synced_commands[old_key]:
+                if (queued_cmd.label or "").strip():
+                    matched_idx = jarvis_response_parser.match_command_to_best_sentence_index(
+                        queued_cmd,
+                        self._turn_sentences,
+                        fallback_index=old_key,
+                        min_score=4,
+                    )
+                    queued_cmd.sentence_index = matched_idx
+                    realigned_buckets.setdefault(matched_idx, []).append(queued_cmd)
+                else:
+                    realigned_buckets.setdefault(old_key, []).append(queued_cmd)
+        self._pending_voice_synced_commands = realigned_buckets
+
+    def _should_execute_command_for_spoken_sentence(
+        self,
+        cmd_item: jarvis_response_parser.DrawingCommand,
+        sentence_key: int,
+        spoken_idx: int,
+        spoken_text: str,
+    ) -> bool:
+        if spoken_idx < 0:
+            return False
+
+        label_text = (cmd_item.label or "").strip()
+        if label_text and spoken_text:
+            current_score = jarvis_response_parser.command_label_matches_sentence(label_text, spoken_text)
+            later_sentences = self._turn_sentences[spoken_idx + 1 :] if (spoken_idx + 1) < len(self._turn_sentences) else []
+            if later_sentences:
+                best_later_score = max(
+                    jarvis_response_parser.command_label_matches_sentence(label_text, later_sent)
+                    for later_sent in later_sentences
+                )
+                if best_later_score > current_score and best_later_score >= 4:
+                    return False
+
+            if current_score < 0:
+                return False
+
+            if current_score >= 6:
+                return True
+
+            if (
+                cmd_item.kind == "underline"
+                and current_score == 0
+                and spoken_idx == 0
+                and (not self._brain_turn_done or len(self._turn_sentences) > 1)
+            ):
+                # Hold back Point 1 underline during an introductory summary sentence while more sentences follow.
+                return False
+
+        return sentence_key <= spoken_idx
+
     def _on_brain_sentence_ready(self, sentence_text: str) -> None:
+        cleaned_sentence = (sentence_text or "").strip()
+        if cleaned_sentence:
+            self._turn_sentences.append(cleaned_sentence)
+            self._realign_pending_commands_with_sentences()
         self.overlay_window.set_cursor_visual_state(
             listening=False,
             thinking=False,
@@ -1001,19 +1075,48 @@ class JarvisApplicationController(QObject):
                 hold_seconds=3.2,
             )
 
-    def _flush_pending_voice_synced_commands(self, max_sentence_index: Optional[int] = None) -> None:
+    def _flush_pending_voice_synced_commands(
+        self,
+        max_sentence_index: Optional[int] = None,
+        current_sentence_text: str = "",
+    ) -> None:
         pending_keys = sorted(self._pending_voice_synced_commands.keys())
+        if max_sentence_index is None:
+            for sentence_key in pending_keys:
+                queued_list = self._pending_voice_synced_commands.pop(sentence_key, [])
+                for queued_cmd in queued_list:
+                    self._execute_visual_drawing_command(queued_cmd)
+            return
+
+        active_sentence_text = current_sentence_text or self._current_spoken_sentence_text
+        if not active_sentence_text and 0 <= max_sentence_index < len(self._turn_sentences):
+            active_sentence_text = self._turn_sentences[max_sentence_index]
+
         for sentence_key in pending_keys:
-            if max_sentence_index is not None and sentence_key > max_sentence_index:
-                continue
-            queued_list = self._pending_voice_synced_commands.pop(sentence_key, [])
+            queued_list = self._pending_voice_synced_commands.get(sentence_key, [])
+            remaining_cmds: List[jarvis_response_parser.DrawingCommand] = []
             for queued_cmd in queued_list:
-                self._execute_visual_drawing_command(queued_cmd)
+                if self._should_execute_command_for_spoken_sentence(
+                    queued_cmd,
+                    sentence_key=sentence_key,
+                    spoken_idx=max_sentence_index,
+                    spoken_text=active_sentence_text,
+                ):
+                    self._execute_visual_drawing_command(queued_cmd)
+                else:
+                    remaining_cmds.append(queued_cmd)
+            if remaining_cmds:
+                self._pending_voice_synced_commands[sentence_key] = remaining_cmds
+            else:
+                self._pending_voice_synced_commands.pop(sentence_key, None)
 
     def _on_tts_sentence_started(self, sentence_index: int, sentence_text: str) -> None:
-        del sentence_text
         self._current_spoken_sentence_index = max(self._current_spoken_sentence_index, int(sentence_index))
-        self._flush_pending_voice_synced_commands(max_sentence_index=self._current_spoken_sentence_index)
+        self._current_spoken_sentence_text = (sentence_text or "").strip()
+        self._flush_pending_voice_synced_commands(
+            max_sentence_index=self._current_spoken_sentence_index,
+            current_sentence_text=self._current_spoken_sentence_text,
+        )
 
     def _on_brain_drawing_command(self, command: jarvis_response_parser.DrawingCommand) -> None:
         if command.kind == "scroll":
@@ -1046,6 +1149,16 @@ class JarvisApplicationController(QObject):
             return
 
         snapped_command = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(command)
+        if self._turn_sentences and (snapped_command.label or "").strip():
+            matched_idx = jarvis_response_parser.match_command_to_best_sentence_index(
+                snapped_command,
+                self._turn_sentences,
+                fallback_index=-1,
+                min_score=4,
+            )
+            if matched_idx >= 0:
+                snapped_command.sentence_index = matched_idx
+
         target_desc = snapped_command.label or snapped_command.header or f"({snapped_command.x:.0f},{snapped_command.y:.0f})"
         self.memory_service.record_action(
             action_kind=snapped_command.kind,
@@ -1058,7 +1171,12 @@ class JarvisApplicationController(QObject):
             return
 
         target_sentence_idx = max(0, int(snapped_command.sentence_index))
-        if self._current_spoken_sentence_index >= target_sentence_idx:
+        if self._should_execute_command_for_spoken_sentence(
+            snapped_command,
+            sentence_key=target_sentence_idx,
+            spoken_idx=self._current_spoken_sentence_index,
+            spoken_text=self._current_spoken_sentence_text,
+        ):
             self._execute_visual_drawing_command(snapped_command)
         else:
             self._pending_voice_synced_commands.setdefault(target_sentence_idx, []).append(snapped_command)
@@ -1080,6 +1198,16 @@ class JarvisApplicationController(QObject):
         self.overlay_window.set_bubble_message(status_msg, word_by_word=False, hold_seconds=2.8)
 
     def _on_brain_turn_completed(self, parsed_response: jarvis_response_parser.ParsedTurnResponse) -> None:
+        self._brain_turn_done = True
+        if parsed_response.sentences and len(parsed_response.sentences) > len(self._turn_sentences):
+            self._turn_sentences = list(parsed_response.sentences)
+            self._realign_pending_commands_with_sentences()
+        if self._current_spoken_sentence_index >= 0:
+            self._flush_pending_voice_synced_commands(
+                max_sentence_index=self._current_spoken_sentence_index,
+                current_sentence_text=self._current_spoken_sentence_text,
+            )
+
         if (
             self._pending_direct_agent_commands
             and not self._executed_agent_command_in_turn
@@ -1115,9 +1243,26 @@ class JarvisApplicationController(QObject):
             self._scroll_explain_active = False
             self._scroll_step_index = 0
         elif parsed_response.scroll_direction in ("down", "up"):
-            scroll_task = (parsed_response.scroll_direction, int(parsed_response.scroll_amount or 6))
+            adaptive_ticks = jarvis_services.ScreenCaptureService.recommend_adaptive_scroll_ticks(
+                direction=parsed_response.scroll_direction,
+                requested_ticks=int(parsed_response.scroll_amount or 0),
+                user_prompt=self._current_turn_prompt_text,
+                force_if_needed=False,
+            )
+            if adaptive_ticks > 0:
+                scroll_task = (parsed_response.scroll_direction, adaptive_ticks)
         elif self._scroll_explain_active and self._scroll_step_index < self._max_scroll_steps:
-            scroll_task = ("down", 6)
+            adaptive_ticks = jarvis_services.ScreenCaptureService.recommend_adaptive_scroll_ticks(
+                direction="down",
+                requested_ticks=0,
+                user_prompt=self._current_turn_prompt_text,
+                force_if_needed=True,
+            )
+            if adaptive_ticks > 0:
+                scroll_task = ("down", adaptive_ticks)
+            else:
+                self._scroll_explain_active = False
+                self._scroll_step_index = 0
 
         has_pending_tts_speech = False
         if self._speak_current_turn:

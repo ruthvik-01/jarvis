@@ -571,6 +571,12 @@ class ScreenCaptureService:
 
     _last_raw_logical_image: Optional[Image.Image] = None
     _last_lasso_crop_b64: str = ""
+    _used_underline_regions: List[Tuple[float, float, float]] = []
+
+    @classmethod
+    def reset_underline_baselines(cls) -> None:
+        """Clear tracked per-turn underline baselines when starting a new turn or screenshot."""
+        cls._used_underline_regions = []
 
     @classmethod
     def get_last_lasso_crop_b64(cls) -> str:
@@ -624,6 +630,7 @@ class ScreenCaptureService:
         logical_width = max(1, int(logical_width))
         logical_height = max(1, int(logical_height))
         cls._last_lasso_crop_b64 = ""
+        cls.reset_underline_baselines()
 
         full_res_shot = cls._grab_raw_pil_screenshot()
         if full_res_shot is None:
@@ -686,15 +693,74 @@ class ScreenCaptureService:
             return 1.0
 
     @classmethod
+    def _detect_single_line_bands(
+        cls,
+        strip_gray: np.ndarray,
+        bg_luminance: float,
+        min_active_pixels: int = 8,
+    ) -> List[Tuple[int, int]]:
+        """
+        Detect horizontal text bands in a grayscale strip and recursively split any merged
+        multi-line band taller than 24px at its internal minimum-ink valley.
+        """
+        pixel_deltas = np.abs(strip_gray - bg_luminance) > 18.0
+        row_counts = np.sum(pixel_deltas, axis=1).astype(np.float32)
+        active_rows = row_counts >= float(max(6, min_active_pixels))
+        if not np.any(active_rows):
+            return []
+
+        raw_bands: List[Tuple[int, int]] = []
+        band_start: Optional[int] = None
+        for row_offset, is_active in enumerate(active_rows):
+            if is_active and band_start is None:
+                band_start = row_offset
+            elif not is_active and band_start is not None:
+                if (row_offset - band_start) >= 3:
+                    raw_bands.append((band_start, row_offset - 1))
+                band_start = None
+        if band_start is not None and (len(active_rows) - band_start) >= 3:
+            raw_bands.append((band_start, len(active_rows) - 1))
+
+        split_bands: List[Tuple[int, int]] = []
+        pending_bands = list(raw_bands)
+        while pending_bands:
+            curr_start, curr_end = pending_bands.pop(0)
+            curr_height = curr_end - curr_start + 1
+            if curr_height <= 24:
+                split_bands.append((curr_start, curr_end))
+                continue
+            inner_start = curr_start + 5
+            inner_end = curr_end - 4
+            if inner_end <= inner_start:
+                split_bands.append((curr_start, curr_end))
+                continue
+            inner_slice = row_counts[inner_start:inner_end]
+            peak_count = float(np.max(row_counts[curr_start : curr_end + 1]))
+            valley_rel = int(np.argmin(inner_slice))
+            valley_idx = inner_start + valley_rel
+            valley_count = float(row_counts[valley_idx])
+            if peak_count > 0.0 and valley_count <= peak_count * 0.65:
+                upper_end = valley_idx - 1
+                lower_start = valley_idx + 1
+                if (upper_end - curr_start) >= 3 and (curr_end - lower_start) >= 3:
+                    pending_bands.insert(0, (lower_start, curr_end))
+                    pending_bands.insert(0, (curr_start, upper_end))
+                    continue
+            split_bands.append((curr_start, curr_end))
+        return split_bands
+
+    @classmethod
     def snap_drawing_command_to_content(
         cls,
         command: jarvis_response_parser.DrawingCommand,
         reference_image: Optional[Image.Image] = None,
     ) -> jarvis_response_parser.DrawingCommand:
         """
-        Refines vertical underline placement using luminance contrast rows in the captured
-        screenshot so underlines rest cleanly beneath actual text instead of crossing letters.
-        Adjustment is capped to +-18 logical pixels to guard against background gradients.
+        Snap an underline or highlight cleanly beneath its exact single line of text:
+        - Splits merged multi-line vertical bands on tight lists so adjacent lines stay separate.
+        - Avoids re-snapping onto an already-underlined overlapping baseline in the same turn.
+        - Measures contiguous horizontal ink runs (bridging word gaps <= 24px) so underlines
+          never overshoot past the last character of a shorter line into empty background.
         """
         source_image = reference_image or cls._last_raw_logical_image
         if source_image is None or command.kind not in ("underline", "highlight"):
@@ -702,49 +768,74 @@ class ScreenCaptureService:
 
         try:
             img_width, img_height = source_image.size
-            left_px = max(0, int(round(command.x)))
-            right_px = min(img_width, int(round(command.x + max(24.0, command.width))))
+            req_width = max(24.0, float(command.width))
+            req_left_px = max(0, int(round(command.x)))
+            req_right_px = min(img_width, int(round(command.x + req_width)))
+            scan_left_px = max(0, req_left_px - 32)
+            right_expand_cap = int(round(min(96.0, req_width * 0.40)))
+            scan_right_px = min(img_width, req_right_px + right_expand_cap)
             center_y_px = int(round(command.y))
-            if (right_px - left_px) < 16:
+            if (scan_right_px - scan_left_px) < 16:
                 return command
 
-            def _find_snapped_band(search_margin_px: int) -> Optional[Tuple[int, float, np.ndarray, float]]:
+            def _is_region_already_underlined(cand_y: float, x_left: float, x_right: float) -> bool:
+                for used_y, used_left, used_right in cls._used_underline_regions:
+                    if abs(cand_y - used_y) < 13.0:
+                        overlap_px = min(x_right, used_right) - max(x_left, used_left)
+                        if overlap_px > 48.0:
+                            return True
+                return False
+
+            def _find_snapped_band(
+                search_margin_px: int,
+                skip_used: bool,
+            ) -> Optional[Tuple[int, float, np.ndarray, float]]:
                 top_px = max(0, center_y_px - search_margin_px)
                 bottom_px = min(img_height, center_y_px + search_margin_px)
                 if (bottom_px - top_px) < 10:
                     return None
                 strip_gray = np.asarray(
-                    source_image.crop((left_px, top_px, right_px, bottom_px)).convert("L"),
+                    source_image.crop((scan_left_px, top_px, scan_right_px, bottom_px)).convert("L"),
                     dtype=np.float32,
                 )
                 bg_luminance = float(np.median(strip_gray))
-                row_activity = np.mean(np.abs(strip_gray - bg_luminance) > 16.0, axis=1)
-                active_rows = row_activity > 0.025
-                if not np.any(active_rows):
-                    return None
-                text_bands: List[Tuple[int, int]] = []
-                band_start: Optional[int] = None
-                for row_offset, is_active in enumerate(active_rows):
-                    if is_active and band_start is None:
-                        band_start = row_offset
-                    elif not is_active and band_start is not None:
-                        if (row_offset - band_start) >= 3:
-                            text_bands.append((band_start, row_offset - 1))
-                        band_start = None
-                if band_start is not None and (len(active_rows) - band_start) >= 3:
-                    text_bands.append((band_start, len(active_rows) - 1))
+                text_bands = cls._detect_single_line_bands(
+                    strip_gray=strip_gray,
+                    bg_luminance=bg_luminance,
+                    min_active_pixels=8,
+                )
                 if not text_bands:
                     return None
-                chosen_band = min(
-                    text_bands,
-                    key=lambda band: abs((top_px + band[1] + 5.0) - command.y),
-                )
-                candidate_y = float(top_px + chosen_band[1] + 5.0)
-                if abs(candidate_y - command.y) > float(search_margin_px):
-                    return None
-                return chosen_band[0], candidate_y, strip_gray[chosen_band[0] : chosen_band[1] + 1, :], bg_luminance
 
-            band_hit = _find_snapped_band(22) or _find_snapped_band(56)
+                eligible_bands: List[Tuple[Tuple[int, int], float]] = []
+                for cand_band in text_bands:
+                    cand_y = float(top_px + cand_band[1] + 4.0)
+                    if abs(cand_y - command.y) > float(search_margin_px):
+                        continue
+                    if skip_used and _is_region_already_underlined(cand_y, float(req_left_px), float(req_right_px)):
+                        continue
+                    eligible_bands.append((cand_band, cand_y))
+
+                if not eligible_bands:
+                    return None
+
+                chosen_band, chosen_y = min(
+                    eligible_bands,
+                    key=lambda item: abs(item[1] - command.y),
+                )
+                return (
+                    chosen_band[0],
+                    chosen_y,
+                    strip_gray[chosen_band[0] : chosen_band[1] + 1, :],
+                    bg_luminance,
+                )
+
+            band_hit = (
+                _find_snapped_band(20, skip_used=True)
+                or _find_snapped_band(44, skip_used=True)
+                or _find_snapped_band(20, skip_used=False)
+                or _find_snapped_band(44, skip_used=False)
+            )
             if band_hit is None:
                 return command
             _band_top_offset, snapped_y, band_rows_slice, bg_luminance = band_hit
@@ -752,15 +843,68 @@ class ScreenCaptureService:
             snapped_x = command.x
             snapped_width = command.width
             if command.kind == "underline":
-                col_activity = np.mean(np.abs(band_rows_slice - bg_luminance) > 16.0, axis=0)
-                active_cols = np.where(col_activity > 0.06)[0]
-                if active_cols.size >= 8:
-                    trimmed_left = left_px + int(active_cols[0])
-                    trimmed_right = left_px + int(active_cols[-1]) + 1
-                    trimmed_span = float(trimmed_right - trimmed_left)
-                    if trimmed_span >= 18.0:
-                        snapped_x = max(0.0, float(trimmed_left - 2))
-                        snapped_width = trimmed_span + 4.0
+                col_foreground = np.sum(np.abs(band_rows_slice - bg_luminance) > 20.0, axis=0) >= 2
+                if np.sum(col_foreground) >= 6:
+                    # Bridge inter-word spaces (<= 24px) without bridging blank margins (> 24px)
+                    bridged_ink = col_foreground.copy()
+                    false_run_start: Optional[int] = None
+                    saw_true_before = False
+                    for col_idx, has_ink in enumerate(col_foreground):
+                        if has_ink:
+                            if saw_true_before and false_run_start is not None:
+                                if (col_idx - false_run_start) <= 24:
+                                    bridged_ink[false_run_start:col_idx] = True
+                            saw_true_before = True
+                            false_run_start = None
+                        elif saw_true_before and false_run_start is None:
+                            false_run_start = col_idx
+
+                    segments: List[Tuple[int, int]] = []
+                    seg_start: Optional[int] = None
+                    for col_idx, is_filled in enumerate(bridged_ink):
+                        if is_filled and seg_start is None:
+                            seg_start = col_idx
+                        elif not is_filled and seg_start is not None:
+                            segments.append((seg_start, col_idx - 1))
+                            seg_start = None
+                    if seg_start is not None:
+                        segments.append((seg_start, len(bridged_ink) - 1))
+
+                    req_rel_left = max(0, req_left_px - scan_left_px)
+                    req_rel_right = max(req_rel_left + 12, req_right_px - scan_left_px)
+                    valid_segments = [seg for seg in segments if (seg[1] - seg[0] + 1) >= 12]
+                    if valid_segments:
+                        overlapping = [
+                            seg
+                            for seg in valid_segments
+                            if min(seg[1] + 1, req_rel_right) - max(seg[0], req_rel_left) > 0
+                        ]
+                        if overlapping:
+                            chosen_seg = max(
+                                overlapping,
+                                key=lambda seg: min(seg[1] + 1, req_rel_right) - max(seg[0], req_rel_left),
+                            )
+                        else:
+                            chosen_seg = min(
+                                valid_segments,
+                                key=lambda seg: abs(((seg[0] + seg[1]) * 0.5) - ((req_rel_left + req_rel_right) * 0.5)),
+                            )
+                        true_cols_in_seg = np.where(col_foreground[chosen_seg[0] : chosen_seg[1] + 1])[0]
+                        if true_cols_in_seg.size >= 6:
+                            seg_first_ink = chosen_seg[0] + int(true_cols_in_seg[0])
+                            seg_last_ink = chosen_seg[0] + int(true_cols_in_seg[-1])
+                            # Do not stretch a short phrase highlight past a reasonable expansion cap,
+                            # while always allowing full inward trimming when LLM width overshot.
+                            max_allowed_right_rel = req_rel_right + right_expand_cap
+                            clipped_last_ink = min(seg_last_ink, max_allowed_right_rel)
+                            trimmed_left = scan_left_px + seg_first_ink
+                            trimmed_right = scan_left_px + clipped_last_ink + 1
+                            trimmed_span = float(trimmed_right - trimmed_left)
+                            if trimmed_span >= 18.0:
+                                snapped_x = max(0.0, float(trimmed_left - 2))
+                                snapped_width = trimmed_span + 4.0
+
+                cls._used_underline_regions.append((snapped_y, snapped_x, snapped_x + snapped_width))
 
             return jarvis_response_parser.DrawingCommand(
                 kind=command.kind,
@@ -777,6 +921,121 @@ class ScreenCaptureService:
             )
         except Exception:
             return command
+
+    @classmethod
+    def _measure_content_row_range(
+        cls,
+        source_image: Image.Image,
+    ) -> Tuple[int, int, List[int]]:
+        """Return `(img_height, lowest_text_baseline_y, all_band_baselines)` in logical pixels."""
+        img_width, img_height = source_image.size
+        roi_left = max(32, int(img_width * 0.12))
+        roi_right = min(img_width - 32, int(img_width * 0.88))
+        roi_top = max(56, int(img_height * 0.08))
+        roi_bottom = min(img_height - 40, int(img_height * 0.92))
+        if (roi_right - roi_left) < 100 or (roi_bottom - roi_top) < 60:
+            return img_height, 0, []
+        roi_gray = np.asarray(
+            source_image.crop((roi_left, roi_top, roi_right, roi_bottom)).convert("L"),
+            dtype=np.float32,
+        )
+        bg_luma = float(np.median(roi_gray))
+        bands = cls._detect_single_line_bands(
+            strip_gray=roi_gray,
+            bg_luminance=bg_luma,
+            min_active_pixels=max(12, int((roi_right - roi_left) * 0.03)),
+        )
+        baselines = [roi_top + band[1] + 4 for band in bands if (band[1] - band[0] + 1) >= 6]
+        lowest_y = max(baselines) if baselines else 0
+        return img_height, lowest_y, baselines
+
+    @classmethod
+    def has_unread_content_below_explained_lines(cls) -> bool:
+        """
+        Determine whether text clearly continues near/below the viewport bottom edge beyond
+        what Jarvis already underlined on the current screen.
+        """
+        source_image = cls._last_raw_logical_image
+        if source_image is None:
+            return False
+        try:
+            img_height, lowest_y, baselines = cls._measure_content_row_range(source_image)
+            if not baselines:
+                return False
+            near_bottom_count = sum(1 for base_y in baselines if base_y >= int(img_height * 0.80))
+            if near_bottom_count >= 2:
+                return True
+            if cls._used_underline_regions:
+                lowest_underlined_y = max(region[0] for region in cls._used_underline_regions)
+                unread_bands_below = [base_y for base_y in baselines if base_y > lowest_underlined_y + 36.0]
+                if len(unread_bands_below) >= 2 and lowest_y >= int(img_height * 0.78):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @classmethod
+    def recommend_adaptive_scroll_ticks(
+        cls,
+        direction: str = "down",
+        requested_ticks: int = 0,
+        user_prompt: str = "",
+        force_if_needed: bool = False,
+    ) -> int:
+        """
+        Compute requirement-based scroll wheel ticks (`0` means no scroll required).
+        """
+        normalized_prompt = (user_prompt or "").lower().strip()
+        explicit_match = re.search(
+            r"\bscroll\s+(?:down|up)?\s*(?:by|about)?\s*(\d{1,2})\s*(?:lines?|ticks?|steps?)\b",
+            normalized_prompt,
+        )
+        if explicit_match:
+            return int(max(1, min(14, int(explicit_match.group(1)))))
+
+        if any(phrase in normalized_prompt for phrase in ("little", "slightly", "small scroll", "few lines", "bit down")):
+            return 3
+        if any(phrase in normalized_prompt for phrase in ("half page", "next section", "medium scroll", "paragraph")):
+            return 5
+        if any(phrase in normalized_prompt for phrase in ("full page", "all the way", "whole screen", "a lot", "far down")):
+            return 9
+
+        source_image = cls._last_raw_logical_image
+        if source_image is None:
+            return int(max(0, min(12, requested_ticks))) if requested_ticks > 0 else (5 if force_if_needed else 0)
+
+        try:
+            img_height, lowest_text_y, baselines = cls._measure_content_row_range(source_image)
+            if requested_ticks <= 0:
+                if not force_if_needed or not cls.has_unread_content_below_explained_lines():
+                    return 0
+
+            if not baselines:
+                return int(max(2, min(10, requested_ticks or 5)))
+
+            if direction == "up":
+                return int(max(2, min(10, requested_ticks or 5)))
+
+            if cls._used_underline_regions:
+                lowest_explained_y = max(region[0] for region in cls._used_underline_regions)
+                unread_baselines = [base_y for base_y in baselines if base_y > lowest_explained_y + 28.0]
+                if unread_baselines:
+                    next_unread_y = float(min(unread_baselines))
+                    target_top_y = float(img_height) * 0.24
+                    scroll_delta_px = max(90.0, next_unread_y - target_top_y)
+                else:
+                    target_top_y = float(img_height) * 0.24
+                    scroll_delta_px = max(120.0, float(lowest_text_y) - target_top_y)
+            else:
+                scroll_delta_px = max(140.0, float(lowest_text_y) * 0.48)
+
+            geometry_ticks = int(max(2, min(10, round(scroll_delta_px / 58.0))))
+            if requested_ticks > 0 and requested_ticks != 6:
+                blended = int(round((requested_ticks * 0.6) + (geometry_ticks * 0.4)))
+                return int(max(1, min(12, blended)))
+            return geometry_ticks
+        except Exception:
+            return int(max(2, min(10, requested_ticks or 5)))
 
     @classmethod
     def detect_visual_text_anchors(

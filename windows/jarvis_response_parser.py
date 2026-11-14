@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 @dataclass
@@ -73,6 +73,228 @@ _COLON_CALL_LINE_PATTERN = re.compile(
 )
 
 _THINK_BLOCK_PATTERN = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
+
+_ORDINAL_NUMBER_MAP = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+
+_CARDINAL_WORD_MAP = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+_MATCH_STOP_WORDS = {
+    "the",
+    "and",
+    "for",
+    "that",
+    "with",
+    "from",
+    "this",
+    "into",
+    "are",
+    "was",
+    "were",
+    "can",
+    "will",
+    "have",
+    "has",
+    "had",
+    "not",
+    "but",
+    "all",
+    "out",
+    "you",
+    "your",
+    "here",
+    "there",
+    "they",
+    "them",
+    "their",
+    "what",
+    "when",
+    "where",
+    "which",
+    "how",
+    "why",
+    "uses",
+    "used",
+    "using",
+    "helps",
+    "help",
+    "allows",
+    "allow",
+    "make",
+    "makes",
+    "better",
+    "about",
+    "each",
+    "more",
+    "very",
+    "just",
+    "only",
+    "also",
+    "such",
+    "point",
+    "step",
+    "item",
+    "number",
+    "section",
+    "next",
+    "first",
+    "second",
+    "third",
+    "fourth",
+    "fifth",
+    "sixth",
+    "work",
+    "working",
+    "employee",
+    "employees",
+    "company",
+    "people",
+}
+
+
+def _extract_point_number_and_keywords(raw_text: str) -> Tuple[Optional[int], List[str]]:
+    """Extract an optional explicit point/step index and discriminative keywords from text."""
+    text_value = (raw_text or "").strip()
+    if not text_value:
+        return None, []
+
+    lowered = text_value.lower()
+    detected_number: Optional[int] = None
+
+    leading_digit_match = re.match(r"^\s*(?:point|step|number|item|trend|#)?\s*(\d{1,2})\s*(?:[.):\-]|$)", lowered)
+    if leading_digit_match:
+        candidate_num = int(leading_digit_match.group(1))
+        if 1 <= candidate_num <= 20:
+            detected_number = candidate_num
+    else:
+        explicit_ref_match = re.search(
+            r"\b(?:point|step|number|item|trend)\s+(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+            lowered,
+        )
+        if explicit_ref_match:
+            ref_token = explicit_ref_match.group(1)
+            if ref_token.isdigit():
+                candidate_num = int(ref_token)
+                if 1 <= candidate_num <= 20:
+                    detected_number = candidate_num
+            elif ref_token in _CARDINAL_WORD_MAP:
+                detected_number = _CARDINAL_WORD_MAP[ref_token]
+        else:
+            ordinal_match = re.match(
+                r"^(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b",
+                lowered,
+            )
+            if not ordinal_match:
+                ordinal_match = re.search(
+                    r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:point|one|trend|step|item|activity|feature|method|advantage|concept|principle)\b",
+                    lowered,
+                )
+            if ordinal_match:
+                detected_number = _ORDINAL_NUMBER_MAP[ordinal_match.group(1)]
+
+    keywords: List[str] = []
+    seen_keywords = set()
+    for raw_token in re.findall(r"[A-Za-z0-9]+", text_value):
+        token_lower = raw_token.lower()
+        is_short_acronym = raw_token.isupper() and len(raw_token) >= 2
+        if (len(token_lower) >= 3 or is_short_acronym) and token_lower not in _MATCH_STOP_WORDS:
+            if token_lower not in seen_keywords:
+                seen_keywords.add(token_lower)
+                keywords.append(token_lower)
+
+    return detected_number, keywords
+
+
+def _extract_leading_phrase(command_label: str) -> str:
+    """Return the title/phrase portion of an underline label without numbering or colon descriptions."""
+    stripped = re.sub(r"^\s*(?:point|step|item|#)?\s*\d{1,2}\s*[.):\-]?\s*", "", (command_label or "").strip())
+    if ":" in stripped:
+        stripped = stripped.split(":", 1)[0].strip()
+    stripped = re.sub(r"\([^)]*\)", "", stripped).strip()
+    return stripped.lower()
+
+
+def command_label_matches_sentence(command_label: str, sentence_text: str) -> int:
+    """
+    Score how strongly a drawing command's label matches a spoken sentence.
+
+    Returns > 0 when the sentence discusses the label, 0 when ambiguous/unlabeled,
+    and < 0 when the label belongs to a different explicit point number than the sentence.
+    """
+    clean_label = (command_label or "").strip()
+    clean_sentence = (sentence_text or "").strip()
+    if not clean_label or not clean_sentence:
+        return 0
+
+    label_num, label_keywords = _extract_point_number_and_keywords(clean_label)
+    sentence_num, sentence_keywords = _extract_point_number_and_keywords(clean_sentence)
+    normalized_sentence = clean_sentence.lower()
+
+    shared_count = 0
+    for kw_token in label_keywords:
+        if kw_token in sentence_keywords or re.search(rf"\b{re.escape(kw_token)}\b", normalized_sentence):
+            shared_count += 1
+        elif len(kw_token) >= 5 and any(
+            cand.startswith(kw_token[:5]) or kw_token.startswith(cand[:5])
+            for cand in sentence_keywords
+            if len(cand) >= 5
+        ):
+            shared_count += 1
+
+    score = shared_count * 4
+    core_phrase = _extract_leading_phrase(clean_label)
+    if len(core_phrase) >= 5 and core_phrase in normalized_sentence:
+        score += 6
+
+    if label_num is not None and sentence_num is not None:
+        if label_num == sentence_num:
+            score += 5
+        elif shared_count == 0:
+            return -6
+        else:
+            score -= 3
+
+    return score
+
+
+def match_command_to_best_sentence_index(
+    command: DrawingCommand,
+    sentences: Sequence[str],
+    fallback_index: int = 0,
+    min_score: int = 4,
+) -> int:
+    """Return the index in `sentences` that best matches `command.label`, or `fallback_index`."""
+    if not sentences or not (command.label or "").strip():
+        return fallback_index
+    best_index = fallback_index
+    best_score = min_score - 1
+    for candidate_idx, candidate_sentence in enumerate(sentences):
+        candidate_score = command_label_matches_sentence(command.label, candidate_sentence)
+        if candidate_score > best_score:
+            best_score = candidate_score
+            best_index = candidate_idx
+    return best_index
 
 
 def extract_key_topic_phrase(raw_text: str, max_words: int = 3) -> str:
@@ -297,8 +519,8 @@ def build_vision_system_prompt(
         "Keep spoken replies warm, direct, and easy to follow (2 to 4 natural sentences).",
         "Always inspect the current screenshot freshly; never repeat steps or sections you already explained earlier.",
         "CRITICAL FORMATTING & VOICE-SYNCED DRAWING RULES:",
-        "1. VOICE-SYNCHRONIZED TIMING: Put each visual command (`paper(...)` or `underline(...)`) on its OWN standalone line IMMEDIATELY BEFORE the spoken sentence that explains that exact line or concept! Jarvis triggers each screen drawing at the exact moment your spoken sentence begins.",
-        "2. Example synced sequence:\npaper(36, 140, 320, 340, \"Topic Title\", \"Visual Map\", \"Topic 1 -> Topic 2 | section:Core Mechanism | doc:Input -> Outcome\")\nunderline(420, 210, 360, \"exact first phrase on screen\")\nFirst spoken sentence explaining that first underlined concept and summarizing its topic flow in the note card.\nunderline(420, 320, 340, \"exact second phrase on screen\")\nSecond spoken sentence explaining the second underlined line on screen.",
+        "1. VOICE-SYNCHRONIZED TIMING: Put each visual command (`paper(...)` or `underline(...)`) on its OWN standalone line IMMEDIATELY BEFORE the spoken sentence that explains that exact line or concept! If you open with an introductory sentence before Point 1, emit Point 1's underline RIGHT BEFORE Point 1's sentence (NOT before the intro sentence). ALWAYS pass the exact visible numbered title/phrase as the 4th argument of `underline(x, y, width, \"exact point title\")` so Jarvis locks the stroke to the matching sentence.",
+        "2. Example synced sequence:\npaper(36, 140, 320, 340, \"Topic Title\", \"Visual Map\", \"Topic 1 -> Topic 2 | section:Core Mechanism | doc:Input -> Outcome\")\nIntroductory sentence summarizing the main question before starting point 1.\nunderline(420, 210, 360, \"1. First Point Title\")\nSpoken sentence explaining point 1 right after its underline command.\nunderline(420, 245, 340, \"2. Second Point Title\")\nSpoken sentence explaining point 2 right after its underline command.",
         "3. NO markdown bullets (- or *), NO numbering, NO backticks, NO trailing arrow comments on command lines.",
         "4. NEVER speak or write command names like 'underline', 'paper', 'point', 'ring', 'box', or coordinates inside your spoken sentences.",
         "5. Never use markdown asterisks (**bold** or *italic*), bullet symbols, emojis, or code blocks in your spoken text.",
@@ -386,16 +608,17 @@ def build_vision_system_prompt(
                 f"SCROLL-AND-EXPLAIN MODE (Section {max(1, scroll_step_index)} of {max_scroll_steps}):",
                 "You are walking the user visually through a scrollable page (such as a ChatGPT answer or article).",
                 "Explain the section currently visible on screen with accurate, neatly placed underlines beneath key phrases.",
-                "If more content clearly continues below the visible bottom of this pane AND more scroll steps remain, place `scroll(\"down\", 6)` on its own final line so Jarvis scrolls down to explain the next section automatically.",
-                "If the answer has clearly ended or reached the bottom of the conversation, do NOT emit `scroll(...)`.",
+                "REQUIREMENT-BASED ADAPTIVE SCROLLING: Only emit `scroll(\"down\", ticks)` on its own final line when more unread content is clearly cut off below the visible bottom of this pane AND more scroll steps remain.",
+                "Choose `ticks` dynamically based on how much needs to move: use `2` or `3` for a small nudge (1-2 cut-off lines), `4` or `5` for half a paragraph/section, and `7` to `10` for a full screen page.",
+                "If all key points and the conclusion/ending are already visible on screen (or the input bar sits right below the last line), do NOT emit `scroll(...)`.",
             ]
         )
     else:
         prompt_sections.extend(
             [
                 "",
-                "OPTIONAL SCROLL COMMAND:",
-                "- scroll(\"down\", 6) -> only emit this on its own final line if the user explicitly asked you to scroll and keep explaining what appears below.",
+                "OPTIONAL ADAPTIVE SCROLL COMMAND:",
+                "- scroll(\"down\", ticks) -> only emit this on its own final line when the user asked to scroll OR unread content continues below the visible pane. Pick `ticks` proportionally (`2..3` = small scroll, `4..6` = medium section, `7..10` = full page). Omit `scroll(...)` completely if everything needed is already on screen.",
             ]
         )
 
@@ -938,6 +1161,30 @@ def _extract_scroll_intent(commands: List[DrawingCommand]) -> Tuple[Optional[str
     return None, 0
 
 
+def align_commands_with_sentences(commands: Sequence[DrawingCommand], sentences: Sequence[str]) -> None:
+    """Refine `command.sentence_index` against complete sentences using semantic label matching."""
+    if not sentences:
+        return
+    last_matched_underline_index = -1
+    for cmd_item in commands:
+        if cmd_item.kind not in ("underline", "paper", "point", "ring", "box", "highlight"):
+            continue
+        if (cmd_item.label or "").strip():
+            matched_idx = match_command_to_best_sentence_index(
+                cmd_item,
+                sentences,
+                fallback_index=cmd_item.sentence_index if cmd_item.sentence_index >= 0 else 0,
+                min_score=4,
+            )
+            if cmd_item.kind == "underline":
+                if matched_idx < last_matched_underline_index and last_matched_underline_index < len(sentences):
+                    best_score = command_label_matches_sentence(cmd_item.label, sentences[matched_idx])
+                    if best_score < 8:
+                        matched_idx = max(matched_idx, last_matched_underline_index)
+                last_matched_underline_index = matched_idx
+            cmd_item.sentence_index = min(max(0, matched_idx), max(0, len(sentences) - 1))
+
+
 def parse_model_response(
     raw_text: str,
     scale_x: float = 1.0,
@@ -954,6 +1201,17 @@ def parse_model_response(
     def _assign_parsed_sentence_index(cmd_item: DrawingCommand) -> None:
         nonlocal next_underline_sentence_index
         if cmd_item.sentence_index >= 0:
+            return
+        matched_prior = match_command_to_best_sentence_index(
+            cmd_item,
+            sentences_completed_so_far,
+            fallback_index=-1,
+            min_score=4,
+        )
+        if matched_prior >= 0:
+            cmd_item.sentence_index = matched_prior
+            if cmd_item.kind == "underline":
+                next_underline_sentence_index = max(next_underline_sentence_index, matched_prior + 1)
             return
         base_sentence_index = len(sentences_completed_so_far)
         if cmd_item.kind == "underline":
@@ -990,6 +1248,7 @@ def parse_model_response(
     if remainder:
         sentences.append(remainder)
 
+    align_commands_with_sentences(commands, sentences)
     scroll_direction, scroll_amount = _extract_scroll_intent(commands)
     return ParsedTurnResponse(
         spoken_text=full_spoken,
@@ -1023,6 +1282,19 @@ class StreamingSentenceExtractor:
 
     def _assign_sentence_index_to_command(self, cmd_item: DrawingCommand) -> None:
         if cmd_item.sentence_index >= 0:
+            return
+        matched_prior = match_command_to_best_sentence_index(
+            cmd_item,
+            self.all_sentences,
+            fallback_index=-1,
+            min_score=4,
+        )
+        if matched_prior >= 0:
+            cmd_item.sentence_index = matched_prior
+            if cmd_item.kind == "underline":
+                self._next_unassigned_underline_sentence_index = max(
+                    self._next_unassigned_underline_sentence_index, matched_prior + 1
+                )
             return
         base_sentence_index = len(self.all_sentences)
         if cmd_item.kind == "underline":
@@ -1157,6 +1429,7 @@ class StreamingSentenceExtractor:
         return " ".join(parts).strip()
 
     def build_final_response(self) -> ParsedTurnResponse:
+        align_commands_with_sentences(self.all_commands, self.all_sentences)
         scroll_direction, scroll_amount = _extract_scroll_intent(self.all_commands)
         return ParsedTurnResponse(
             spoken_text=self.spoken_text,

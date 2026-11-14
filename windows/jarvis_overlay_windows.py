@@ -1638,8 +1638,9 @@ class OverlayCanvasWindow(QWidget):
                     x=max(12.0, command.x - span_radius),
                     y=command.y + span_radius * 0.55,
                     width=max(48.0, min(span_radius * 2.0, 260.0)),
-                    label="",
+                    label=command.label,
                     tone=command.tone,
+                    sentence_index=command.sentence_index,
                 )
                 try:
                     import jarvis_services
@@ -1654,8 +1655,9 @@ class OverlayCanvasWindow(QWidget):
                     x=command.x,
                     y=command.y,
                     width=command.width,
-                    label="",
+                    label=command.label,
                     tone=command.tone,
+                    sentence_index=command.sentence_index,
                 )
 
         return command
@@ -1709,10 +1711,13 @@ class OverlayCanvasWindow(QWidget):
                     leading_edge[1] - self._cursor_y_spring.value,
                 )
                 if flight_dist > 110.0:
-                    initial_flight_lead = 0.16
+                    initial_flight_lead = 0.06
+            elif now_seconds >= (self._next_stroke_schedule_time - 0.14):
+                # Start voice-synced underlines crisply when the previous stroke has nearly finished
+                self._next_stroke_schedule_time = now_seconds
             scheduled_start = max(now_seconds + initial_flight_lead, self._next_stroke_schedule_time)
             delay_seconds = max(0.0, scheduled_start - now_seconds)
-            self._next_stroke_schedule_time = scheduled_start + stroke_duration + 0.14
+            self._next_stroke_schedule_time = scheduled_start + stroke_duration + 0.08
 
         drawing_item = _ActiveDrawingItem(
             command=prepared_command,

@@ -10,6 +10,7 @@ windows/memory/
 __pycache__/
 *.pyc
 *.pyo
+.exe
 
 # Workspace directories & files not part of Jarvis
 .remember/

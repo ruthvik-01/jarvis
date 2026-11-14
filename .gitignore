@@ -6,6 +6,7 @@
 user_settings.json
 windows/user_settings.json
 *.log
+windows/memory/
 __pycache__/
 *.pyc
 *.pyo

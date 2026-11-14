@@ -17,6 +17,8 @@ import asyncio
 import base64
 import ctypes
 from ctypes import wintypes
+from dataclasses import dataclass
+from datetime import datetime
 import io
 import json
 import math
@@ -60,6 +62,299 @@ AUDIO_CHANNELS = 1
 AUDIO_FRAMES_PER_BUFFER = 1600  # 100 ms chunks at 16 kHz
 TTS_SAMPLE_RATE = 24000
 ASSEMBLYAI_TTS_URL = "https://tts.us.assemblyai.com/v1/speech"
+
+
+class JarvisMemoryService(QObject):
+    """
+    Persists every Jarvis session, user message, screen action, spoken response, and live
+    screen observation into daily Markdown files (`windows/memory/DD-MM-YYYY/summary.md`
+    and `jarvis-session-HHMMSS.md`), mirroring the structured daily memory pattern.
+    """
+
+    memoryUpdated = Signal(str)
+
+    def __init__(self, base_dir: Optional[str] = None) -> None:
+        super().__init__()
+        self._base_dir = base_dir or os.path.join(jarvis_theme.WINDOWS_DIRECTORY, "memory")
+        self._lock = threading.Lock()
+        self._session_id = ""
+        self._date_folder_name = ""
+        self._session_filename = ""
+        self._session_file_path = ""
+        self._summary_file_path = ""
+        self._message_count = 0
+        self._action_count = 0
+        self._response_count = 0
+        self._session_topic = "General assistant session"
+        self._last_action_status = "Session started"
+        self._last_observed_window = ""
+        self._last_observation_time = 0.0
+
+    def _ensure_session_locked(self) -> None:
+        now = datetime.now()
+        today_folder = now.strftime("%d-%m-%Y")
+        if self._session_id and self._date_folder_name == today_folder and self._session_file_path:
+            os.makedirs(os.path.dirname(self._session_file_path), exist_ok=True)
+            if not os.path.exists(self._summary_file_path):
+                self._rewrite_summary_locked()
+            return
+
+        self._date_folder_name = today_folder
+        day_dir = os.path.join(self._base_dir, today_folder)
+        os.makedirs(day_dir, exist_ok=True)
+
+        stamp = now.strftime("%H%M%S")
+        self._session_id = f"session-{stamp}"
+        self._session_filename = f"jarvis-{self._session_id}.md"
+        self._session_file_path = os.path.join(day_dir, self._session_filename)
+        self._summary_file_path = os.path.join(day_dir, "summary.md")
+        self._message_count = 0
+        self._action_count = 0
+        self._response_count = 0
+
+        if not os.path.exists(self._session_file_path):
+            initial_doc = (
+                f"# Jarvis Session Memory ({today_folder})\n"
+                f"Session ID: `{self._session_id}` | Index: [summary.md](summary.md)\n\n"
+                "## Jarvis Session Log\n"
+            )
+            with open(self._session_file_path, "w", encoding="utf-8") as session_handle:
+                session_handle.write(initial_doc)
+
+        if not os.path.exists(self._summary_file_path):
+            summary_header = (
+                f"# Jarvis Memory Summary: {today_folder}\n"
+                "Timezone: Local. Read only topic files relevant to the current session.\n\n"
+                "| Topic file | Session ID | Covers | Counts | Status / last action |\n"
+                "|---|---|---|---|---|\n"
+            )
+            with open(self._summary_file_path, "w", encoding="utf-8") as summary_handle:
+                summary_handle.write(summary_header)
+
+        self._rewrite_summary_locked()
+
+    @staticmethod
+    def _sanitize_markdown_cell(raw_text: str, max_length: int = 120) -> str:
+        collapsed = re.sub(r"\s+", " ", (raw_text or "").strip())
+        collapsed = collapsed.replace("|", "/")
+        if len(collapsed) > max_length:
+            return collapsed[: max_length - 3].rstrip() + "..."
+        return collapsed
+
+    def _rewrite_summary_locked(self) -> None:
+        if not self._summary_file_path or not self._session_filename:
+            return
+        row_text = (
+            f"| [{self._session_filename}]({self._session_filename}) "
+            f"| `{self._session_id}` "
+            f"| {self._sanitize_markdown_cell(self._session_topic, 76)} "
+            f"| msgs:{self._message_count} acts:{self._action_count} replies:{self._response_count} "
+            f"| {self._sanitize_markdown_cell(self._last_action_status, 90)} |"
+        )
+        existing_lines: List[str] = []
+        if os.path.exists(self._summary_file_path):
+            try:
+                with open(self._summary_file_path, "r", encoding="utf-8") as read_handle:
+                    existing_lines = read_handle.read().splitlines()
+            except Exception:
+                existing_lines = []
+
+        if not existing_lines:
+            existing_lines = [
+                f"# Jarvis Memory Summary: {self._date_folder_name}",
+                "Timezone: Local. Read only topic files relevant to the current session.",
+                "",
+                "| Topic file | Session ID | Covers | Counts | Status / last action |",
+                "|---|---|---|---|---|",
+            ]
+
+        row_marker = f"| [{self._session_filename}]({self._session_filename})"
+        replaced_existing = False
+        updated_lines: List[str] = []
+        for line_item in existing_lines:
+            if line_item.startswith(row_marker):
+                updated_lines.append(row_text)
+                replaced_existing = True
+            else:
+                updated_lines.append(line_item)
+        if not replaced_existing:
+            updated_lines.append(row_text)
+
+        with open(self._summary_file_path, "w", encoding="utf-8") as write_handle:
+            write_handle.write("\n".join(updated_lines) + "\n")
+
+    def _append_session_line_locked(self, markdown_line: str) -> None:
+        self._ensure_session_locked()
+        with open(self._session_file_path, "a", encoding="utf-8") as append_handle:
+            append_handle.write(markdown_line.rstrip() + "\n")
+        self._rewrite_summary_locked()
+
+    def start_session(self, initial_context: str = "") -> str:
+        with self._lock:
+            self._ensure_session_locked()
+            now_stamp = datetime.now().strftime("%H:%M:%S")
+            note = self._sanitize_markdown_cell(initial_context or "Desktop companion initialized", 160)
+            self._last_action_status = f"[{now_stamp}] Session ready"
+            self._append_session_line_locked(f"### [{now_stamp}] Session Started\n- Context: {note}")
+            session_path = self._session_file_path
+        self.memoryUpdated.emit(session_path)
+        return session_path
+
+    def record_user_message(
+        self,
+        prompt_text: str,
+        source_mode: str = "voice",
+        foreground_window: str = "",
+    ) -> None:
+        cleaned_prompt = self._sanitize_markdown_cell(prompt_text, 340)
+        if not cleaned_prompt:
+            return
+        window_note = self._sanitize_markdown_cell(foreground_window, 90)
+        with self._lock:
+            self._ensure_session_locked()
+            if self._message_count == 0:
+                self._session_topic = self._sanitize_markdown_cell(prompt_text, 76) or self._session_topic
+            self._message_count += 1
+            now_stamp = datetime.now().strftime("%H:%M:%S")
+            self._last_action_status = f"[{now_stamp}] User ({source_mode}): {self._sanitize_markdown_cell(prompt_text, 54)}"
+            suffix = f" *(window: {window_note})*" if window_note else ""
+            bullet = f"- **[{now_stamp}] User ({source_mode})**: {cleaned_prompt}{suffix}"
+            self._append_session_line_locked(bullet)
+            session_path = self._session_file_path
+        self.memoryUpdated.emit(session_path)
+
+    def record_action(
+        self,
+        action_kind: str,
+        target_summary: str,
+        status_text: str,
+        succeeded: bool = True,
+    ) -> None:
+        safe_kind = self._sanitize_markdown_cell(action_kind, 40)
+        safe_target = self._sanitize_markdown_cell(target_summary, 140)
+        safe_status = self._sanitize_markdown_cell(status_text, 160)
+        with self._lock:
+            self._ensure_session_locked()
+            self._action_count += 1
+            now_stamp = datetime.now().strftime("%H:%M:%S")
+            self._last_action_status = f"[{now_stamp}] {safe_kind}: {self._sanitize_markdown_cell(safe_status, 52)}"
+            bullet = (
+                f"- **[{now_stamp}] Action (`{safe_kind}`)**: "
+                f"target={safe_target} -> {safe_status} (ok={bool(succeeded)})"
+            )
+            self._append_session_line_locked(bullet)
+            session_path = self._session_file_path
+        self.memoryUpdated.emit(session_path)
+
+    def record_assistant_response(self, spoken_text: str, drawing_summary: str = "") -> None:
+        cleaned_reply = self._sanitize_markdown_cell(spoken_text, 380)
+        if not cleaned_reply:
+            return
+        visuals = self._sanitize_markdown_cell(drawing_summary, 140)
+        with self._lock:
+            self._ensure_session_locked()
+            self._response_count += 1
+            now_stamp = datetime.now().strftime("%H:%M:%S")
+            self._last_action_status = f"[{now_stamp}] Jarvis replied"
+            suffix = f" *(visuals: {visuals})*" if visuals else ""
+            bullet = f"- **[{now_stamp}] Jarvis**: {cleaned_reply}{suffix}"
+            self._append_session_line_locked(bullet)
+            session_path = self._session_file_path
+        self.memoryUpdated.emit(session_path)
+
+    def record_screen_observation(self, window_title: str, observation_note: str) -> None:
+        clean_title = self._sanitize_markdown_cell(window_title, 110)
+        clean_note = self._sanitize_markdown_cell(observation_note, 160)
+        if not clean_title and not clean_note:
+            return
+        now_monotonic = time.monotonic()
+        with self._lock:
+            if (
+                clean_title
+                and clean_title == self._last_observed_window
+                and (now_monotonic - self._last_observation_time) < 20.0
+            ):
+                return
+            self._last_observed_window = clean_title
+            self._last_observation_time = now_monotonic
+            self._ensure_session_locked()
+            now_stamp = datetime.now().strftime("%H:%M:%S")
+            bullet = f"- **[{now_stamp}] Screen Monitor**: window={clean_title or 'Desktop'} | {clean_note}"
+            self._append_session_line_locked(bullet)
+
+    def get_today_summary_path(self) -> str:
+        with self._lock:
+            self._ensure_session_locked()
+            return self._summary_file_path
+
+    def get_active_session_path(self) -> str:
+        with self._lock:
+            self._ensure_session_locked()
+            return self._session_file_path
+
+    def build_memory_context_for_prompt(self, max_chars: int = 1600) -> str:
+        with self._lock:
+            self._ensure_session_locked()
+            summary_path = self._summary_file_path
+            session_path = self._session_file_path
+
+        sections: List[str] = []
+        try:
+            if summary_path and os.path.exists(summary_path):
+                with open(summary_path, "r", encoding="utf-8") as summary_handle:
+                    summary_lines = [
+                        line_item.strip()
+                        for line_item in summary_handle.read().splitlines()
+                        if line_item.strip()
+                    ]
+                if summary_lines:
+                    sections.append("Today's Summary:\n" + "\n".join(summary_lines[-6:]))
+        except Exception:
+            pass
+
+        try:
+            if os.path.isdir(self._base_dir):
+                day_folders = sorted(
+                    folder_name
+                    for folder_name in os.listdir(self._base_dir)
+                    if os.path.isdir(os.path.join(self._base_dir, folder_name))
+                )
+                prior_folders = [
+                    folder_name for folder_name in day_folders if folder_name != self._date_folder_name
+                ]
+                if prior_folders:
+                    latest_prior_summary = os.path.join(self._base_dir, prior_folders[-1], "summary.md")
+                    if os.path.exists(latest_prior_summary):
+                        with open(latest_prior_summary, "r", encoding="utf-8") as prior_handle:
+                            prior_lines = [
+                                line_item.strip()
+                                for line_item in prior_handle.read().splitlines()
+                                if line_item.strip()
+                            ]
+                        if prior_lines:
+                            sections.append(
+                                f"Prior Summary ({prior_folders[-1]}):\n" + "\n".join(prior_lines[-4:])
+                            )
+        except Exception:
+            pass
+
+        try:
+            if session_path and os.path.exists(session_path):
+                with open(session_path, "r", encoding="utf-8") as session_handle:
+                    log_lines = [
+                        line_item.rstrip()
+                        for line_item in session_handle.read().splitlines()
+                        if line_item.strip() and not line_item.startswith("#") and not line_item.startswith("Session ID:")
+                    ]
+                if log_lines:
+                    sections.append("Recent Session Actions & Messages:\n" + "\n".join(log_lines[-18:]))
+        except Exception:
+            pass
+
+        combined_context = "\n\n".join(sections).strip()
+        if len(combined_context) > max_chars:
+            combined_context = combined_context[-max_chars:]
+        return combined_context
 
 
 def _iter_assemblyai_pcm_chunks(response: Any) -> Any:
@@ -410,49 +705,53 @@ class ScreenCaptureService:
             left_px = max(0, int(round(command.x)))
             right_px = min(img_width, int(round(command.x + max(24.0, command.width))))
             center_y_px = int(round(command.y))
-            top_px = max(0, center_y_px - 22)
-            bottom_px = min(img_height, center_y_px + 22)
-            if (right_px - left_px) < 16 or (bottom_px - top_px) < 10:
+            if (right_px - left_px) < 16:
                 return command
 
-            strip_gray = np.asarray(
-                source_image.crop((left_px, top_px, right_px, bottom_px)).convert("L"),
-                dtype=np.float32,
-            )
-            bg_luminance = float(np.median(strip_gray))
-            row_activity = np.mean(np.abs(strip_gray - bg_luminance) > 16.0, axis=1)
-            active_rows = row_activity > 0.025
-            if not np.any(active_rows):
-                return command
+            def _find_snapped_band(search_margin_px: int) -> Optional[Tuple[int, float, np.ndarray, float]]:
+                top_px = max(0, center_y_px - search_margin_px)
+                bottom_px = min(img_height, center_y_px + search_margin_px)
+                if (bottom_px - top_px) < 10:
+                    return None
+                strip_gray = np.asarray(
+                    source_image.crop((left_px, top_px, right_px, bottom_px)).convert("L"),
+                    dtype=np.float32,
+                )
+                bg_luminance = float(np.median(strip_gray))
+                row_activity = np.mean(np.abs(strip_gray - bg_luminance) > 16.0, axis=1)
+                active_rows = row_activity > 0.025
+                if not np.any(active_rows):
+                    return None
+                text_bands: List[Tuple[int, int]] = []
+                band_start: Optional[int] = None
+                for row_offset, is_active in enumerate(active_rows):
+                    if is_active and band_start is None:
+                        band_start = row_offset
+                    elif not is_active and band_start is not None:
+                        if (row_offset - band_start) >= 3:
+                            text_bands.append((band_start, row_offset - 1))
+                        band_start = None
+                if band_start is not None and (len(active_rows) - band_start) >= 3:
+                    text_bands.append((band_start, len(active_rows) - 1))
+                if not text_bands:
+                    return None
+                chosen_band = min(
+                    text_bands,
+                    key=lambda band: abs((top_px + band[1] + 5.0) - command.y),
+                )
+                candidate_y = float(top_px + chosen_band[1] + 5.0)
+                if abs(candidate_y - command.y) > float(search_margin_px):
+                    return None
+                return chosen_band[0], candidate_y, strip_gray[chosen_band[0] : chosen_band[1] + 1, :], bg_luminance
 
-            # Find contiguous vertical text glyph bands inside the strip
-            text_bands: List[Tuple[int, int]] = []
-            band_start: Optional[int] = None
-            for row_offset, is_active in enumerate(active_rows):
-                if is_active and band_start is None:
-                    band_start = row_offset
-                elif not is_active and band_start is not None:
-                    if (row_offset - band_start) >= 3:
-                        text_bands.append((band_start, row_offset - 1))
-                    band_start = None
-            if band_start is not None and (len(active_rows) - band_start) >= 3:
-                text_bands.append((band_start, len(active_rows) - 1))
-
-            if not text_bands:
+            band_hit = _find_snapped_band(22) or _find_snapped_band(56)
+            if band_hit is None:
                 return command
-
-            best_band = min(
-                text_bands,
-                key=lambda band: abs((top_px + band[1] + 5.0) - command.y),
-            )
-            snapped_y = float(top_px + best_band[1] + 5.0)
-            if abs(snapped_y - command.y) > 22.0:
-                return command
+            _band_top_offset, snapped_y, band_rows_slice, bg_luminance = band_hit
 
             snapped_x = command.x
             snapped_width = command.width
             if command.kind == "underline":
-                band_rows_slice = strip_gray[best_band[0] : best_band[1] + 1, :]
                 col_activity = np.mean(np.abs(band_rows_slice - bg_luminance) > 16.0, axis=0)
                 active_cols = np.where(col_activity > 0.06)[0]
                 if active_cols.size >= 8:
@@ -474,6 +773,7 @@ class ScreenCaptureService:
                 header=command.header,
                 body=command.body,
                 tone=command.tone,
+                sentence_index=command.sentence_index,
             )
         except Exception:
             return command
@@ -1084,6 +1384,7 @@ class StreamingTTSService(QObject):
     """
 
     speechStarted = Signal()
+    sentenceStarted = Signal(int, str)
     speechWordProgress = Signal(str, int, int)
     audioLevelChanged = Signal(float)
     speechFinished = Signal()
@@ -1093,7 +1394,8 @@ class StreamingTTSService(QObject):
         self._settings_store = settings_store
         self._lock = threading.Lock()
         self._generation_id = 0
-        self._queue: "queue.Queue[Tuple[int, str, Optional[str]]]" = queue.Queue()
+        self._sentence_enqueue_counter = 0
+        self._queue: "queue.Queue[Tuple[int, str, Any]]" = queue.Queue()
         self._is_speaking = False
         self._last_engine_used = "elevenlabs"
         self._worker_thread = threading.Thread(target=self._playback_worker_loop, daemon=True)
@@ -1111,6 +1413,7 @@ class StreamingTTSService(QObject):
         """Clears any earlier utterance and opens a new pipelined speech turn."""
         with self._lock:
             self._generation_id += 1
+            self._sentence_enqueue_counter = 0
             active_generation = self._generation_id
             while not self._queue.empty():
                 try:
@@ -1123,9 +1426,12 @@ class StreamingTTSService(QObject):
         cleaned = sentence_text.strip()
         if not cleaned:
             return
-        target_gen = self._generation_id if turn_generation is None else turn_generation
-        if target_gen == self._generation_id:
-            self._queue.put((target_gen, "sentence", cleaned))
+        with self._lock:
+            target_gen = self._generation_id if turn_generation is None else turn_generation
+            if target_gen == self._generation_id:
+                sentence_idx = self._sentence_enqueue_counter
+                self._sentence_enqueue_counter += 1
+                self._queue.put((target_gen, "sentence", (sentence_idx, cleaned)))
 
     def mark_turn_complete(self, turn_generation: Optional[int] = None) -> None:
         target_gen = self._generation_id if turn_generation is None else turn_generation
@@ -1141,6 +1447,7 @@ class StreamingTTSService(QObject):
     def stop_speaking(self) -> None:
         with self._lock:
             self._generation_id += 1
+            self._sentence_enqueue_counter = 0
             while not self._queue.empty():
                 try:
                     self._queue.get_nowait()
@@ -1148,9 +1455,9 @@ class StreamingTTSService(QObject):
                     break
 
     def speak_blocking_for_test(self, text: str) -> Tuple[str, float]:
-        """Synchronous helper used by `--selftest` to verify live ElevenLabs PCM synthesis."""
+        """Synchronous helper used by `--selftest` to verify live AssemblyAI PCM synthesis."""
         start_time = time.perf_counter()
-        engine = self._speak_one_sentence(text, generation_id=self._generation_id)
+        engine = self._speak_one_sentence(text, generation_id=self._generation_id, sentence_index=0)
         return engine, time.perf_counter() - start_time
 
     def _playback_worker_loop(self) -> None:
@@ -1161,11 +1468,15 @@ class StreamingTTSService(QObject):
                 continue
 
             if item_kind == "sentence" and payload:
+                if isinstance(payload, tuple) and len(payload) == 2:
+                    sentence_idx, sentence_text_item = int(payload[0]), str(payload[1])
+                else:
+                    sentence_idx, sentence_text_item = 0, str(payload)
                 if announced_start_for_gen != gen_id:
                     announced_start_for_gen = gen_id
                     self._is_speaking = True
                     self.speechStarted.emit()
-                self._speak_one_sentence(payload, generation_id=gen_id)
+                self._speak_one_sentence(sentence_text_item, generation_id=gen_id, sentence_index=sentence_idx)
 
             elif item_kind == "done":
                 if announced_start_for_gen == gen_id:
@@ -1173,7 +1484,12 @@ class StreamingTTSService(QObject):
                     self.audioLevelChanged.emit(0.0)
                     self.speechFinished.emit()
 
-    def _speak_one_sentence(self, sentence_text: str, generation_id: int) -> str:
+    def _speak_one_sentence(
+        self,
+        sentence_text: str,
+        generation_id: int,
+        sentence_index: int = 0,
+    ) -> str:
         voice_id = str(self._settings_store.get("voice_id", jarvis_config.DEFAULT_SETTINGS["voice_id"]))
         speech_speed = float(self._settings_store.get("speech_speed", 1.0))
         speech_speed = max(0.7, min(1.2, speech_speed))
@@ -1200,6 +1516,8 @@ class StreamingTTSService(QObject):
                         word_idx = min(total_words, max(1, int(math.ceil(fraction * total_words))))
                         self.speechWordProgress.emit(sentence_text, word_idx, total_words)
 
+                    if self._generation_id == generation_id:
+                        self.sentenceStarted.emit(sentence_index, sentence_text)
                     self.speechWordProgress.emit(sentence_text, 1, total_words)
                     _play_pcm_stream_blocking(
                         chunk_iterator=_iter_assemblyai_pcm_chunks(response),
@@ -1215,6 +1533,8 @@ class StreamingTTSService(QObject):
                 pass
 
         # Fallback to Windows built-in SAPI if offline or configured to Windows voice
+        if self._generation_id == generation_id:
+            self.sentenceStarted.emit(sentence_index, sentence_text)
         self.speechWordProgress.emit(sentence_text, total_words, total_words)
         _speak_with_sapi_blocking(
             sentence_text,
@@ -1275,6 +1595,8 @@ class VisionBrainService(QObject):
         logical_screen_size: Tuple[int, int] = (1536, 864),
         scroll_step_index: int = 0,
         max_scroll_steps: int = 0,
+        memory_context: str = "",
+        live_screen_context: str = "",
     ) -> int:
         with self._lock:
             self._generation_id += 1
@@ -1302,6 +1624,8 @@ class VisionBrainService(QObject):
                 logical_screen_size,
                 scroll_step_index,
                 max_scroll_steps,
+                memory_context,
+                live_screen_context,
             ),
             daemon=True,
         ).start()
@@ -1317,6 +1641,8 @@ class VisionBrainService(QObject):
         logical_screen_size: Tuple[int, int],
         scroll_step_index: int = 0,
         max_scroll_steps: int = 0,
+        memory_context: str = "",
+        live_screen_context: str = "",
     ) -> None:
         api_key = self._settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
         if not api_key:
@@ -1358,6 +1684,8 @@ class VisionBrainService(QObject):
                 )
             ),
             agent_actions_enabled=bool(self._settings_store.get("agent_actions_enabled", True)),
+            memory_context=memory_context,
+            live_screen_context=live_screen_context,
         )
 
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -1474,7 +1802,7 @@ class VisionBrainService(QObject):
                         self.drawingCommandReady.emit(synthesized_card)
                 if not has_underline:
                     anchors = ScreenCaptureService.detect_visual_text_anchors(img_w, img_h, count=2)
-                    for anchor_x, baseline_y, span_width in anchors:
+                    for underline_idx, (anchor_x, baseline_y, span_width) in enumerate(anchors):
                         fallback_underline = jarvis_response_parser.DrawingCommand(
                             kind="underline",
                             x=anchor_x,
@@ -1482,6 +1810,7 @@ class VisionBrainService(QObject):
                             width=span_width,
                             label="",
                             tone="blue",
+                            sentence_index=underline_idx,
                         )
                         parsed_response.commands.append(fallback_underline)
                         self.drawingCommandReady.emit(fallback_underline)
@@ -1543,6 +1872,7 @@ class VisionBrainService(QObject):
             header="Visual Notes",
             body=" | ".join(body_parts),
             tone="blue",
+            sentence_index=0,
         )
 
 
@@ -1747,8 +2077,99 @@ class GlobalHotkeyService(QObject):
 
 
 # ---------------------------------------------------------------------------
-# Safe Desktop & Browser Agent Actions
+# Continuous Screen Monitor & Safe Desktop / Browser Multitasking Agent
 # ---------------------------------------------------------------------------
+
+
+class AgentScreenMonitorService(QObject):
+    """
+    Periodically samples the active foreground window title and lightweight screen diffs
+    so Jarvis knows what is currently visible on screen during agent & tutoring sessions.
+    """
+
+    foregroundWindowChanged = Signal(str)
+    screenActivityDetected = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self._poll_counter = 0
+        self._current_window_title = ""
+        self._last_diff_ratio = 0.0
+        self._last_snapshot_image: Optional[Image.Image] = None
+        self._recent_transitions: List[str] = []
+
+    @staticmethod
+    def get_foreground_window_title() -> str:
+        try:
+            user32 = ctypes.windll.user32
+            active_hwnd = int(user32.GetForegroundWindow())
+            if not active_hwnd:
+                return ""
+            title_buffer = ctypes.create_unicode_buffer(512)
+            char_count = int(user32.GetWindowTextW(active_hwnd, title_buffer, len(title_buffer)))
+            if char_count <= 0:
+                return ""
+            return title_buffer.value.strip()
+        except Exception:
+            return ""
+
+    def poll_once(self) -> Dict[str, Any]:
+        window_title = self.get_foreground_window_title()
+        window_changed = False
+        diff_ratio = self._last_diff_ratio
+        activity_summary = ""
+
+        with self._lock:
+            self._poll_counter += 1
+            poll_number = self._poll_counter
+            if window_title and window_title != self._current_window_title:
+                window_changed = True
+                self._current_window_title = window_title
+                stamp = datetime.now().strftime("%H:%M:%S")
+                self._recent_transitions.append(f"[{stamp}] {window_title[:70]}")
+                self._recent_transitions = self._recent_transitions[-8:]
+
+        if (poll_number % 2 == 0) or window_changed:
+            sampled_image = ScreenCaptureService.capture_logical_snapshot_image((160, 90))
+            if sampled_image is not None:
+                with self._lock:
+                    if self._last_snapshot_image is not None:
+                        diff_ratio = ScreenCaptureService.compute_screen_difference_ratio(
+                            self._last_snapshot_image,
+                            sampled_image,
+                        )
+                    self._last_snapshot_image = sampled_image
+                    self._last_diff_ratio = diff_ratio
+
+        if window_changed and window_title:
+            self.foregroundWindowChanged.emit(window_title)
+            activity_summary = f"Active window switched to {window_title}"
+        elif diff_ratio >= 0.045:
+            activity_summary = f"Screen content changed ({diff_ratio:.2f}) in {window_title or 'Desktop'}"
+
+        if activity_summary:
+            self.screenActivityDetected.emit(activity_summary)
+
+        return {
+            "window_title": window_title,
+            "window_changed": window_changed,
+            "diff_ratio": diff_ratio,
+        }
+
+    def get_live_screen_context_summary(self) -> str:
+        live_title = self.get_foreground_window_title()
+        with self._lock:
+            if live_title:
+                self._current_window_title = live_title
+            active_title = self._current_window_title or "Desktop"
+            transitions_text = "; ".join(self._recent_transitions[-4:]) or "None yet"
+            last_diff = self._last_diff_ratio
+        return (
+            f"Current foreground window: {active_title}\n"
+            f"Recent window transitions: {transitions_text}\n"
+            f"Last screen change ratio: {last_diff:.3f}"
+        )
 
 
 class DesktopAgentService:
@@ -1932,11 +2353,51 @@ class DesktopAgentService:
             return False
 
     @classmethod
+    def describe_step_for_speech(cls, command: jarvis_response_parser.DrawingCommand) -> str:
+        """Returns a crisp 3-to-6 word phrase spoken right as each agent step begins."""
+        argument_text = (command.body or command.label or command.header or "").strip()
+        if command.kind == "open_app":
+            app_display = argument_text.capitalize() if argument_text else "app"
+            if app_display.lower() == "chrome":
+                app_display = "Chrome"
+            elif app_display.lower() == "vscode":
+                app_display = "VS Code"
+            return f"Opening {app_display}."
+        if command.kind in ("open_browser", "open_url"):
+            short_label = (command.label or argument_text or "browser")[:34]
+            if short_label.startswith(("http://", "https://")):
+                return "Opening site in browser."
+            return f"Opening {short_label}."
+        if command.kind == "search_web":
+            return f"Searching for {argument_text[:34]}."
+        if command.kind == "type_text":
+            return f"Typing {argument_text[:34]}."
+        if command.kind == "press_keys":
+            return f"Pressing {argument_text}."
+        return "Running step."
+
+    @classmethod
+    def execute_agent_command_blocking(
+        cls,
+        command: jarvis_response_parser.DrawingCommand,
+    ) -> Tuple[bool, str]:
+        """Executes one agent step synchronously so multi-task chains finish typing before switching focus."""
+        return cls._execute_agent_command_internal(command, block_for_typing=True)
+
+    @classmethod
     def execute_agent_command(
         cls,
         command: jarvis_response_parser.DrawingCommand,
     ) -> Tuple[bool, str]:
         """Executes a parsed desktop/browser command safely and returns (ok, status_message)."""
+        return cls._execute_agent_command_internal(command, block_for_typing=False)
+
+    @classmethod
+    def _execute_agent_command_internal(
+        cls,
+        command: jarvis_response_parser.DrawingCommand,
+        block_for_typing: bool = False,
+    ) -> Tuple[bool, str]:
         command_kind = command.kind
         argument_text = (command.body or command.label or command.header or "").strip()
 
@@ -1981,8 +2442,9 @@ class DesktopAgentService:
                 except Exception as exc:
                     return False, str(exc)
             if normalized_app in ("browser", "webbrowser", "defaultbrowser"):
-                return cls.execute_agent_command(
-                    jarvis_response_parser.DrawingCommand(kind="open_browser", label=argument_text)
+                return cls._execute_agent_command_internal(
+                    jarvis_response_parser.DrawingCommand(kind="open_browser", label=argument_text),
+                    block_for_typing=block_for_typing,
                 )
             launch_args = cls.SAFE_APP_LAUNCHERS.get(normalized_app)
             if normalized_app == "chrome":
@@ -2030,7 +2492,7 @@ class DesktopAgentService:
             if not argument_text:
                 return False, "No text to type"
             elapsed_since_launch = time.monotonic() - cls._last_app_launch_timestamp
-            recently_launched_app = elapsed_since_launch < 5.0
+            recently_launched_app = elapsed_since_launch < 6.0
             launched_browser = any(
                 browser_name in cls._last_launched_target
                 for browser_name in ("chrome", "edge", "msedge", "firefox", "browser")
@@ -2047,6 +2509,10 @@ class DesktopAgentService:
                         focus_address_bar=launched_browser,
                         submit_enter=should_submit,
                     )
+
+                if block_for_typing:
+                    _delayed_typing_worker()
+                    return True, f"Opened & typed {argument_text[:36]}"
 
                 threading.Thread(
                     target=_delayed_typing_worker,
@@ -2067,12 +2533,12 @@ class DesktopAgentService:
         return False, f"Unknown agent command: {command_kind}"
 
     @classmethod
-    def detect_direct_user_agent_commands(
+    def _detect_single_clause_commands(
         cls,
-        user_prompt: str,
+        clause_text: str,
     ) -> List[jarvis_response_parser.DrawingCommand]:
-        """Recognizes single and compound open+type/search user requests cleanly."""
-        cleaned = re.sub(r"\s+", " ", (user_prompt or "").strip())
+        """Parses one standalone or compound single clause (`open <app> and type <text>`)."""
+        cleaned = re.sub(r"\s+", " ", (clause_text or "").strip())
         if not cleaned:
             return []
         lowered = cleaned.lower().strip(" .,!?")
@@ -2094,17 +2560,18 @@ class DesktopAgentService:
                 ]
 
         compound_type_match = re.match(
-            r"^(?:please\s+)?(?:open|launch|start)\s+(?:my\s+)?(chrome|google\s+chrome|edge|firefox|browser|web\s+browser|notepad|terminal|powershell|cmd|vs\s?code|vscode)\s+(?:and|then)\s+(?:please\s+)?(?:type|write|enter|search(?:\s+for)?|look\s+up|ask)\s+(.+)$",
+            r"^(?:please\s+)?(?:open|launch|start)\s+(?:my\s+)?(chrome|google\s+chrome|edge|firefox|browser|web\s+browser|notepad|terminal|powershell|cmd|vs\s?code|vscode)\s+(?:and|then)\s+(?:please\s+)?(type|write|enter|search(?:\s+for)?|look\s+up|ask)\s+(.+)$",
             lowered,
         )
         if compound_type_match:
             app_name = compound_type_match.group(1).strip()
+            action_verb = compound_type_match.group(2).strip().lower()
             normalized_app_token = re.sub(r"\s+", "", app_name.lower())
-            if normalized_app_token in ("googlechrome",):
+            if normalized_app_token == "googlechrome":
                 normalized_app_token = "chrome"
-            elif normalized_app_token in ("webbrowser",):
+            elif normalized_app_token == "webbrowser":
                 normalized_app_token = "browser"
-            typed_payload = cleaned[compound_type_match.start(2) :].strip(" .!?")
+            typed_payload = cleaned[compound_type_match.start(3) :].strip(" .!?")
             if typed_payload:
                 open_cmd = (
                     jarvis_response_parser.DrawingCommand(
@@ -2119,13 +2586,18 @@ class DesktopAgentService:
                         label=normalized_app_token,
                     )
                 )
+                is_browser_submit = (
+                    normalized_app_token in ("chrome", "edge", "msedge", "firefox", "browser")
+                    or action_verb.startswith("search")
+                    or action_verb.startswith("look")
+                )
                 return [
                     open_cmd,
                     jarvis_response_parser.DrawingCommand(
                         kind="type_text",
                         body=typed_payload,
                         label=typed_payload,
-                        header="submit",
+                        header="submit" if is_browser_submit else "",
                     ),
                 ]
 
@@ -2171,6 +2643,21 @@ class DesktopAgentService:
                     )
                 ]
 
+        direct_type_match = re.match(
+            r"^(?:please\s+)?(?:type|write)\s+(.+)$",
+            lowered,
+        )
+        if direct_type_match:
+            typed_text = cleaned[direct_type_match.start(1) :].strip(" .!?")
+            if typed_text:
+                return [
+                    jarvis_response_parser.DrawingCommand(
+                        kind="type_text",
+                        body=typed_text,
+                        label=typed_text,
+                    )
+                ]
+
         app_match = re.match(
             r"^(?:please\s+)?(?:open|launch|start)\s+(?:my\s+)?(chrome|google\s+chrome|edge|firefox|notepad|calculator|calc|paint|explorer|terminal|powershell|cmd|vs\s?code|vscode|settings)$",
             lowered,
@@ -2190,6 +2677,50 @@ class DesktopAgentService:
         return []
 
     @classmethod
+    def detect_direct_user_agent_commands(
+        cls,
+        user_prompt: str,
+    ) -> List[jarvis_response_parser.DrawingCommand]:
+        """Recognizes single, compound, and multi-task sequential user agent requests."""
+        cleaned = re.sub(r"\s+", " ", (user_prompt or "").strip())
+        if not cleaned:
+            return []
+
+        primary_clauses = [
+            clause_item.strip()
+            for clause_item in re.split(
+                r"\s*(?:,\s*then|;\s*then|\band\s+then|\bthen|\band\s+also|;|,\s*and)\s+",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            if clause_item and clause_item.strip()
+        ]
+        if not primary_clauses:
+            primary_clauses = [cleaned]
+
+        collected_commands: List[jarvis_response_parser.DrawingCommand] = []
+        for primary_clause in primary_clauses:
+            direct_cmds = cls._detect_single_clause_commands(primary_clause)
+            if direct_cmds:
+                collected_commands.extend(direct_cmds)
+                continue
+
+            subclauses = [
+                sub_item.strip()
+                for sub_item in re.split(
+                    r"\s+\band\b\s+(?=(?:please\s+)?(?:open|launch|start|go\s+to|visit|search|google|press)\b)",
+                    primary_clause,
+                    flags=re.IGNORECASE,
+                )
+                if sub_item and sub_item.strip()
+            ]
+            if len(subclauses) >= 2:
+                for subclause in subclauses:
+                    collected_commands.extend(cls._detect_single_clause_commands(subclause))
+
+        return collected_commands
+
+    @classmethod
     def detect_direct_user_agent_command(
         cls,
         user_prompt: str,
@@ -2197,5 +2728,3 @@ class DesktopAgentService:
         """Backward-compatible single-command accessor for direct user agent requests."""
         detected_commands = cls.detect_direct_user_agent_commands(user_prompt)
         return detected_commands[0] if detected_commands else None
-
-        return None

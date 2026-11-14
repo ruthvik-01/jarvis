@@ -27,6 +27,7 @@ class DrawingCommand:
     header: str = ""
     body: str = ""
     tone: str = "blue"
+    sentence_index: int = -1
 
 
 @dataclass
@@ -84,6 +85,8 @@ def build_vision_system_prompt(
     max_scroll_steps: int = 0,
     drawing_mode: str = "lines_and_card",
     agent_actions_enabled: bool = True,
+    memory_context: str = "",
+    live_screen_context: str = "",
 ) -> str:
     """
     Constructs the system prompt for Jarvis's single-brain screen companion.
@@ -99,10 +102,12 @@ def build_vision_system_prompt(
         "A coordinate ruler runs along the top and left edges (ticks every 100px, faint grid every 200px). Read exact X and Y pixel values from those rulers so every underline lands directly under the intended text without drifting into whitespace.",
         "Keep spoken replies warm, direct, and easy to follow (2 to 4 natural sentences).",
         "Always inspect the current screenshot freshly; never repeat steps or sections you already explained earlier.",
-        "CRITICAL FORMATTING RULES:",
-        "1. Put every command on its OWN standalone line BEFORE the spoken sentence that explains it, with NO bullet (- or *), NO numbering, NO backticks, and NO trailing arrow comments.",
-        "2. NEVER speak or write command names like 'underline', 'paper', 'point', 'ring', 'box', or coordinates inside your spoken sentences.",
-        "3. Never use markdown asterisks (**bold** or *italic*), bullet symbols, emojis, or code blocks in your spoken text.",
+        "CRITICAL FORMATTING & VOICE-SYNCED DRAWING RULES:",
+        "1. VOICE-SYNCHRONIZED TIMING: Put each visual command (`paper(...)` or `underline(...)`) on its OWN standalone line IMMEDIATELY BEFORE the spoken sentence that explains that exact line or concept! Jarvis triggers each screen drawing at the exact moment your spoken sentence begins.",
+        "2. Example synced sequence:\npaper(36, 140, 320, 340, \"Topic Title\", \"Core Flow\", \"Step 1 -> Step 2 | section:Key Idea | doc:Summary -> Result\")\nunderline(420, 210, 360, \"exact first phrase on screen\")\nFirst spoken sentence explaining that first underlined concept and summarizing it in the note card.\nunderline(420, 320, 340, \"exact second phrase on screen\")\nSecond spoken sentence explaining the second underlined line on screen.",
+        "3. NO markdown bullets (- or *), NO numbering, NO backticks, NO trailing arrow comments on command lines.",
+        "4. NEVER speak or write command names like 'underline', 'paper', 'point', 'ring', 'box', or coordinates inside your spoken sentences.",
+        "5. Never use markdown asterisks (**bold** or *italic*), bullet symbols, emojis, or code blocks in your spoken text.",
         "",
         "VISUAL EXPLANATION & SCREEN DRAWING COMMANDS:",
     ]
@@ -111,17 +116,17 @@ def build_vision_system_prompt(
         prompt_sections.extend(
             [
                 "Cursor-only mode is enabled: do NOT emit underline, ring, box, highlight, or paper commands.",
-                f"Optionally emit up to 2 point(x, y, \"\") commands (x, y in 0..{screen_width} x 0..{screen_height}) on their own lines to aim the cursor cleanly.",
+                f"Optionally emit up to 2 point(x, y, \"\") commands (x, y in 0..{screen_width} x 0..{screen_height}) on their own lines right before the sentence referencing them.",
             ]
         )
     elif normalized_mode in ("precise_lines", "lines_and_card"):
         prompt_sections.extend(
             [
                 "Whenever you explain concepts, code, equations, or ChatGPT answers on screen, ALWAYS include BOTH:",
-                "First, one visual notes card on a clear side margin (empty left or right area, avoiding overlapping the main text) using exact format:",
+                "First (before sentence 1), one visual notes card placed in an empty left or right margin (avoiding main text) matching your spoken note explanation:",
                 "paper(24, 160, 320, 340, \"Topic Title\", \"Core Summary\", \"Concept A -> Concept B | section:Key Idea | Input -> Output\")",
-                f"Second, 2 to 4 crisp horizontal underlines placed directly underneath the exact key headings or phrases you explain on screen (y = baseline of that text + 4px, x = left edge of phrase, width = exact phrase pixel width in 0..{screen_width} x 0..{screen_height}):",
-                "underline(420, 310, 260, \"\")",
+                f"Second, 2 to 4 crisp horizontal underlines, each emitted right BEFORE the spoken sentence discussing that line (y = text baseline + 4px, x = left edge of phrase, width = exact phrase pixel width in 0..{screen_width} x 0..{screen_height}, 4th arg = exact 2 to 6 words on screen):",
+                "underline(420, 310, 260, \"exact phrase on screen\")",
                 "Optionally glide the cursor to a key term or button with:",
                 "point(420, 310, \"\")",
                 "STRICTLY AVOID: Do NOT emit box(...), frame(...), highlight(...), or ring(...). Never draw giant boxes around whole paragraphs.",
@@ -130,8 +135,8 @@ def build_vision_system_prompt(
     else:
         prompt_sections.extend(
             [
-                "While explaining ChatGPT responses, code, formulas, or articles, emit BOTH one paper(...) summary notes card AND 2 to 4 underline(...) commands on their own lines between sentences:",
-                f"underline(x, y, width, \"\")  (clean underline directly beneath a key heading/phrase; x, y in 0..{screen_width} x 0..{screen_height})",
+                "While explaining ChatGPT responses, code, formulas, or articles, emit BOTH one paper(...) summary notes card AND 2 to 4 underline(...) commands placed directly BEFORE each matching spoken sentence:",
+                f"underline(x, y, width, \"exact screen words\")  (clean underline directly beneath a key heading/phrase; x, y in 0..{screen_width} x 0..{screen_height})",
                 "paper(24, 160, 320, 340, \"Card Title\", \"short header\", \"Concept A -> Concept B | section:Key Idea | Input -> Output\")",
                 "ring(x, y, radius, \"label\")  (neat circle around a compact icon or term; radius <= 55)",
                 "point(x, y, \"label\")         (glides the Jarvis cursor to (x, y) and points cleanly)",
@@ -204,6 +209,16 @@ def build_vision_system_prompt(
         if cleaned_words:
             prompt_sections.append("")
             prompt_sections.append("Custom vocabulary the user uses: " + ", ".join(cleaned_words[:20]))
+
+    if live_screen_context and live_screen_context.strip():
+        prompt_sections.append("")
+        prompt_sections.append("LIVE SCREEN MONITOR STATE:")
+        prompt_sections.append(live_screen_context.strip())
+
+    if memory_context and memory_context.strip():
+        prompt_sections.append("")
+        prompt_sections.append("PERSISTENT JARVIS SESSION MEMORY:")
+        prompt_sections.append(memory_context.strip())
 
     return "\n".join(prompt_sections)
 
@@ -714,6 +729,21 @@ def parse_model_response(
     cleaned_raw = _THINK_BLOCK_PATTERN.sub("", raw_text or "")
     commands: List[DrawingCommand] = []
     spoken_lines: List[str] = []
+    sentences_completed_so_far: List[str] = []
+    pending_prose_buffer = ""
+    next_underline_sentence_index = 0
+
+    def _assign_parsed_sentence_index(cmd_item: DrawingCommand) -> None:
+        nonlocal next_underline_sentence_index
+        if cmd_item.sentence_index >= 0:
+            return
+        base_sentence_index = len(sentences_completed_so_far)
+        if cmd_item.kind == "underline":
+            assigned_index = max(base_sentence_index, next_underline_sentence_index)
+            cmd_item.sentence_index = assigned_index
+            next_underline_sentence_index = assigned_index + 1
+        elif cmd_item.kind in ("paper", "point", "ring", "box", "highlight"):
+            cmd_item.sentence_index = base_sentence_index
 
     for raw_line in cleaned_raw.splitlines():
         stripped_line = raw_line.strip()
@@ -721,15 +751,21 @@ def parse_model_response(
             continue
         parsed_cmd = parse_command_line(stripped_line, scale_x=scale_x, scale_y=scale_y)
         if parsed_cmd is not None:
+            _assign_parsed_sentence_index(parsed_cmd)
             commands.append(parsed_cmd)
             continue
         line_without_commands, inline_commands = _extract_inline_commands(
             stripped_line, scale_x=scale_x, scale_y=scale_y
         )
-        commands.extend(inline_commands)
+        for inline_cmd in inline_commands:
+            _assign_parsed_sentence_index(inline_cmd)
+            commands.append(inline_cmd)
         cleaned_line = clean_spoken_text(line_without_commands)
         if cleaned_line:
             spoken_lines.append(cleaned_line)
+            combined_prose = f"{pending_prose_buffer} {cleaned_line}".strip()
+            done_sentences, pending_prose_buffer = _split_complete_sentences(combined_prose)
+            sentences_completed_so_far.extend(done_sentences)
 
     full_spoken = " ".join(spoken_lines).strip()
     sentences, remainder = _split_complete_sentences(full_spoken)
@@ -762,9 +798,21 @@ class StreamingSentenceExtractor:
         self._prose_buffer = ""
         self._inside_think_block = False
         self._think_tail = ""
+        self._next_unassigned_underline_sentence_index = 0
         self.all_commands: List[DrawingCommand] = []
         self.all_sentences: List[str] = []
         self.spoken_text = ""
+
+    def _assign_sentence_index_to_command(self, cmd_item: DrawingCommand) -> None:
+        if cmd_item.sentence_index >= 0:
+            return
+        base_sentence_index = len(self.all_sentences)
+        if cmd_item.kind == "underline":
+            assigned_index = max(base_sentence_index, self._next_unassigned_underline_sentence_index)
+            cmd_item.sentence_index = assigned_index
+            self._next_unassigned_underline_sentence_index = assigned_index + 1
+        elif cmd_item.kind in ("paper", "point", "ring", "box", "highlight"):
+            cmd_item.sentence_index = base_sentence_index
 
     def feed_delta(self, text_delta: str) -> Tuple[List[str], List[DrawingCommand]]:
         """Processes one streamed text delta and returns `(new_sentences, new_commands)`."""
@@ -835,6 +883,8 @@ class StreamingSentenceExtractor:
                     ready_prefix, scale_x=self._scale_x, scale_y=self._scale_y
                 )
                 if inline_cmds:
+                    for inline_cmd in inline_cmds:
+                        self._assign_sentence_index_to_command(inline_cmd)
                     new_commands.extend(inline_cmds)
                     self.all_commands.extend(inline_cmds)
                 prose_prefix = clean_spoken_text(cleaned_prefix)
@@ -906,6 +956,7 @@ class StreamingSentenceExtractor:
 
         parsed_cmd = parse_command_line(stripped_line, scale_x=self._scale_x, scale_y=self._scale_y)
         if parsed_cmd is not None:
+            self._assign_sentence_index_to_command(parsed_cmd)
             self.all_commands.append(parsed_cmd)
             return [], [parsed_cmd]
 
@@ -913,6 +964,8 @@ class StreamingSentenceExtractor:
             stripped_line, scale_x=self._scale_x, scale_y=self._scale_y
         )
         if inline_commands:
+            for inline_cmd in inline_commands:
+                self._assign_sentence_index_to_command(inline_cmd)
             self.all_commands.extend(inline_commands)
 
         cleaned_line = clean_spoken_text(line_without_commands)

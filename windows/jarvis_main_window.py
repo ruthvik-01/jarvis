@@ -37,6 +37,8 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QTimer,
+    QUrl,
+    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
@@ -1035,6 +1037,8 @@ class JarvisMainWindow(QMainWindow):
     lassoModeRequested = Signal()
     clearOverlayRequested = Signal()
     quitRequested = Signal()
+    drawerVisibilityChanged = Signal(bool)
+    openMemoryRequested = Signal()
     voicePreviewRequested = Signal(str)
     microphoneTestRequested = Signal()
     shortcutTestRequested = Signal(str)
@@ -1049,6 +1053,8 @@ class JarvisMainWindow(QMainWindow):
         self._streaming_bubble: Optional[ChatMessageBubble] = None
         self._is_streaming_chat = False
         self._allow_close = False
+        self._opening_from_notch = False
+        self._drawer_open_animation: Optional[QVariantAnimation] = None
 
         self._sidebar_buttons: Dict[str, SidebarNavButton] = {}
         self._subtab_metadata: Dict[str, Dict[str, str]] = {}
@@ -1076,7 +1082,7 @@ class JarvisMainWindow(QMainWindow):
             | Qt.WindowType.Tool
             | Qt.WindowType.WindowStaysOnTopHint
         )
-        self.resize(860, 560)
+        self.resize(920, 560)
         self.setMinimumSize(780, 500)
         icon_path = jarvis_theme.asset_path("jarvis.ico")
         if os.path.exists(icon_path):
@@ -1087,17 +1093,60 @@ class JarvisMainWindow(QMainWindow):
                 qt_app.setWindowIcon(app_icon)
         self.position_under_notch()
 
-    def position_under_notch(self) -> None:
-        """Docks the frameless Studio/Chat panel directly under the top hardware notch."""
+    def _compute_notch_drawer_target_rect(self) -> QRect:
         primary_screen = QApplication.primaryScreen()
         screen_geo = primary_screen.geometry() if primary_screen is not None else QRect(0, 0, 1920, 1080)
-        panel_width = min(self.width(), max(720, screen_geo.width() - 48))
-        panel_height = min(self.height(), max(460, screen_geo.height() - 64))
-        if (panel_width, panel_height) != (self.width(), self.height()):
-            self.resize(panel_width, panel_height)
+        panel_width = min(max(self.width(), 920), max(760, screen_geo.width() - 48))
+        panel_height = min(self.height(), max(480, screen_geo.height() - 64))
         dock_x = screen_geo.x() + (screen_geo.width() - panel_width) // 2
-        dock_y = screen_geo.y() + 18
-        self.move(dock_x, dock_y)
+        dock_y = screen_geo.y()
+        return QRect(dock_x, dock_y, panel_width, panel_height)
+
+    def position_under_notch(self) -> None:
+        """Docks the frameless Studio/Chat panel flush against the top hardware notch."""
+        target_rect = self._compute_notch_drawer_target_rect()
+        self.setGeometry(target_rect)
+
+    def animate_open_from_notch(self, notch_geometry: Optional[QRect] = None) -> None:
+        """Expands the drawer smoothly downward out of the top Notch."""
+        target_rect = self._compute_notch_drawer_target_rect()
+        if self._drawer_open_animation is not None:
+            self._drawer_open_animation.stop()
+            self._drawer_open_animation = None
+
+        center_x = target_rect.center().x()
+        top_edge_y = target_rect.top()
+        if notch_geometry is not None and notch_geometry.width() > 40:
+            start_width = max(260, min(420, notch_geometry.width()))
+            start_height = max(36, min(64, notch_geometry.height()))
+            start_rect = QRect(center_x - start_width // 2, top_edge_y, start_width, start_height)
+        else:
+            start_rect = QRect(center_x - 160, top_edge_y, 320, 42)
+
+        self._opening_from_notch = True
+        self.setGeometry(start_rect)
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+        drawer_anim = QVariantAnimation(self)
+        drawer_anim.setDuration(170)
+        drawer_anim.setStartValue(start_rect)
+        drawer_anim.setEndValue(target_rect)
+        drawer_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        drawer_anim.valueChanged.connect(lambda val: self.setGeometry(val))
+
+        def _finish_drawer_open() -> None:
+            self._opening_from_notch = False
+            self._drawer_open_animation = None
+            self.setGeometry(target_rect)
+
+        drawer_anim.finished.connect(_finish_drawer_open)
+        self._drawer_open_animation = drawer_anim
+        drawer_anim.start()
 
     def keyPressEvent(self, key_event: Any) -> None:
         if key_event.key() == Qt.Key.Key_Escape:
@@ -1118,7 +1167,9 @@ class JarvisMainWindow(QMainWindow):
 
     def showEvent(self, show_event: Any) -> None:
         super().showEvent(show_event)
-        self.position_under_notch()
+        if not self._opening_from_notch:
+            self.position_under_notch()
+        self.drawerVisibilityChanged.emit(True)
         window_handle = int(self.winId())
         _enable_dark_title_bar(window_handle)
         jarvis_theme.set_window_excluded_from_capture(
@@ -1127,6 +1178,11 @@ class JarvisMainWindow(QMainWindow):
         )
         if self._active_top_tab == "chat":
             QTimer.singleShot(0, self._focus_chat_input)
+
+    def hideEvent(self, hide_event: Any) -> None:
+        self._opening_from_notch = False
+        super().hideEvent(hide_event)
+        self.drawerVisibilityChanged.emit(False)
 
     def changeEvent(self, change_event: Any) -> None:
         super().changeEvent(change_event)
@@ -1144,9 +1200,47 @@ class JarvisMainWindow(QMainWindow):
         root_widget.setObjectName("MainWindowRoot")
         self.setCentralWidget(root_widget)
 
-        root_layout = QHBoxLayout(root_widget)
+        outer_layout = QVBoxLayout(root_widget)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        # Integrated top-center Notch handle strip so the drawer visually opens directly out of the Notch.
+        notch_handle_bar = QFrame()
+        notch_handle_bar.setObjectName("IntegratedNotchHeaderBar")
+        notch_handle_bar.setFixedHeight(30)
+        notch_handle_layout = QHBoxLayout(notch_handle_bar)
+        notch_handle_layout.setContentsMargins(14, 3, 14, 3)
+        notch_handle_layout.setSpacing(8)
+
+        self._notch_memory_pill = QPushButton("Memory: Active (.md)")
+        self._notch_memory_pill.setObjectName("NotchMemoryPill")
+        self._notch_memory_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._notch_memory_pill.setToolTip("Open today's Jarvis Markdown memory log")
+        self._notch_memory_pill.clicked.connect(self.openMemoryRequested.emit)
+        notch_handle_layout.addWidget(self._notch_memory_pill, 0)
+
+        notch_handle_layout.addStretch(1)
+        notch_handle_layout.addWidget(JarvisMarkBadge(18), 0, Qt.AlignmentFlag.AlignVCenter)
+        notch_brand_label = QLabel("J.A.R.V.I.S")
+        notch_brand_label.setStyleSheet(
+            "color: #F4F4F6; font-size: 11px; font-weight: 700; letter-spacing: 1.8px;"
+        )
+        notch_handle_layout.addWidget(notch_brand_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        notch_handle_layout.addStretch(1)
+
+        self._notch_collapse_button = QPushButton("Collapse")
+        self._notch_collapse_button.setObjectName("NotchCollapsePill")
+        self._notch_collapse_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._notch_collapse_button.setToolTip("Collapse back into Notch (Esc)")
+        self._notch_collapse_button.clicked.connect(self.hide)
+        notch_handle_layout.addWidget(self._notch_collapse_button, 0)
+
+        outer_layout.addWidget(notch_handle_bar)
+
+        root_layout = QHBoxLayout()
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
+        outer_layout.addLayout(root_layout, 1)
 
         self._sidebar_panel = self._build_sidebar()
         root_layout.addWidget(self._sidebar_panel)
@@ -1323,6 +1417,7 @@ class JarvisMainWindow(QMainWindow):
 
         self._scroll_explain_button = QPushButton("Scroll && Explain")
         self._scroll_explain_button.setObjectName("HeaderSkyPillButton")
+        self._scroll_explain_button.setMinimumWidth(136)
         self._scroll_explain_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._scroll_explain_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._scroll_explain_button.clicked.connect(self.scrollExplainRequested.emit)
@@ -1330,6 +1425,7 @@ class JarvisMainWindow(QMainWindow):
 
         self._lasso_mode_button = QPushButton("Lasso")
         self._lasso_mode_button.setObjectName("HeaderSecondaryButton")
+        self._lasso_mode_button.setMinimumWidth(68)
         self._lasso_mode_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._lasso_mode_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._lasso_mode_button.clicked.connect(self.lassoModeRequested.emit)
@@ -1337,6 +1433,7 @@ class JarvisMainWindow(QMainWindow):
 
         self._demo_drawing_button = QPushButton("Demo")
         self._demo_drawing_button.setObjectName("HeaderSecondaryButton")
+        self._demo_drawing_button.setMinimumWidth(68)
         self._demo_drawing_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._demo_drawing_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._demo_drawing_button.clicked.connect(self.demoDrawingRequested.emit)
@@ -1344,6 +1441,7 @@ class JarvisMainWindow(QMainWindow):
 
         self._byok_status_pill = QPushButton("Keys Ready")
         self._byok_status_pill.setObjectName("HeaderSecondaryButton")
+        self._byok_status_pill.setMinimumWidth(96)
         self._byok_status_pill.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._byok_status_pill.setCursor(Qt.CursorShape.PointingHandCursor)
         self._byok_status_pill.clicked.connect(lambda: self.open_tab("settings:account"))
@@ -2397,6 +2495,24 @@ class JarvisMainWindow(QMainWindow):
             QWidget#MainWindowRoot {{
                 border: 1px solid #2A2A34;
             }}
+            QFrame#IntegratedNotchHeaderBar {{
+                background-color: #050507;
+                border-bottom: 1px solid #1E1E26;
+            }}
+            QPushButton#NotchMemoryPill, QPushButton#NotchCollapsePill {{
+                background-color: #121216;
+                color: #C4C4CE;
+                border: 1px solid #262630;
+                border-radius: 9px;
+                padding: 2px 10px;
+                font-size: 11px;
+                font-weight: 600;
+            }}
+            QPushButton#NotchMemoryPill:hover, QPushButton#NotchCollapsePill:hover {{
+                background-color: #1C1C23;
+                color: #F4F4F6;
+                border-color: #464652;
+            }}
             QFrame#SidebarPanel, QScrollArea#SidebarScrollArea, QWidget#SidebarScrollContents {{
                 background-color: {DARK_PALETTE["sidebar"]};
                 color: {DARK_PALETTE["text_primary"]};
@@ -2479,7 +2595,7 @@ class JarvisMainWindow(QMainWindow):
                 color: {DARK_PALETTE["text_primary"]};
                 border: 1px solid {DARK_PALETTE["separator"]};
                 border-radius: 14px;
-                padding: 5px 11px;
+                padding: 6px 14px;
                 font-size: 12px;
                 font-weight: 600;
             }}
@@ -2492,7 +2608,7 @@ class JarvisMainWindow(QMainWindow):
                 color: #F4F4F6;
                 border: 1px solid #52525B;
                 border-radius: 14px;
-                padding: 5px 12px;
+                padding: 6px 14px;
                 font-size: 12px;
                 font-weight: 600;
             }}

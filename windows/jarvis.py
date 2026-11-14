@@ -252,6 +252,7 @@ def run_strict_selftest() -> int:
     # -----------------------------------------------------------------------
     try:
         import ast
+        import tempfile
         from PIL import Image, ImageDraw
 
         main_window = jarvis_main_window.JarvisMainWindow(settings_store)
@@ -381,6 +382,48 @@ def run_strict_selftest() -> int:
         )
         temp_overlay.close()
 
+        multitask_cmds = jarvis_services.DesktopAgentService.detect_direct_user_agent_commands(
+            "open chrome and search HRM scope, then open notepad and type key points"
+        )
+        multitask_agent_ok = [cmd_item.kind for cmd_item in multitask_cmds] == [
+            "open_app",
+            "type_text",
+            "open_app",
+            "type_text",
+        ]
+
+        sync_extractor = jarvis_response_parser.StreamingSentenceExtractor(scale_x=1.0, scale_y=1.0)
+        sync_extractor.feed_delta(
+            'paper(24, 140, 320, 320, "Notes", "Core", "A -> B")\n'
+            'underline(320, 200, 220, "first line")\n'
+            'underline(320, 280, 220, "second line")\n'
+            "First sentence explains the top line. Second sentence explains the next line.\n"
+        )
+        sync_extractor.flush_remaining()
+        sync_parsed = sync_extractor.build_final_response()
+        sync_paper_cmds = [cmd_item for cmd_item in sync_parsed.commands if cmd_item.kind == "paper"]
+        sync_underline_cmds = [cmd_item for cmd_item in sync_parsed.commands if cmd_item.kind == "underline"]
+        voice_sync_ok = (
+            len(sync_paper_cmds) == 1
+            and sync_paper_cmds[0].sentence_index == 0
+            and [cmd_item.sentence_index for cmd_item in sync_underline_cmds] == [0, 1]
+        )
+
+        memory_ok = False
+        with tempfile.TemporaryDirectory() as memory_temp_dir:
+            temp_memory = jarvis_services.JarvisMemoryService(base_dir=memory_temp_dir)
+            session_md_path = temp_memory.start_session("Selftest session")
+            summary_md_path = temp_memory.get_today_summary_path()
+            temp_memory.record_user_message("Explain HRM", source_mode="chat", foreground_window="Chrome")
+            temp_memory.record_action("underline", "Definition", "synced@0", succeeded=True)
+            temp_memory.record_assistant_response("HRM manages people cleanly.", "paper, underline")
+            memory_context_text = temp_memory.build_memory_context_for_prompt()
+            memory_ok = (
+                os.path.exists(summary_md_path)
+                and os.path.exists(session_md_path)
+                and ("User" in memory_context_text)
+            )
+
         parser_ok = (
             "internal reasoning hidden" not in parsed_turn.spoken_text
             and len(collected_commands) >= 4
@@ -389,6 +432,9 @@ def run_strict_selftest() -> int:
             and scroll_intent_ok
             and scroll_parse_ok
             and agent_ok
+            and multitask_agent_ok
+            and voice_sync_ok
+            and memory_ok
             and precise_norm_ok
         )
         suite4_ok = (
@@ -405,7 +451,8 @@ def run_strict_selftest() -> int:
             (
                 f"mean_ms={main_mean_ms:.3f}ms, hidden={hidden_on_close}, "
                 f"personal={main_personal_ok}, scroll_ok={scroll_intent_ok and scroll_parse_ok}, "
-                f"snap_ok={baseline_snap_ok}, agent_ok={agent_ok}, precise_ok={precise_norm_ok}, "
+                f"snap_ok={baseline_snap_ok}, agent_ok={agent_ok}, multitask_ok={multitask_agent_ok}, "
+                f"sync_ok={voice_sync_ok}, memory_ok={memory_ok}, precise_ok={precise_norm_ok}, "
                 f"single_char={single_char_violations[:8]}"
             ),
         )

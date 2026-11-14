@@ -11,7 +11,9 @@ Connects:
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Tuple
+import threading
+import time
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon
@@ -30,12 +32,16 @@ class JarvisApplicationController(QObject):
     """Coordinates windows, hotkeys, voice capture, vision streaming, TTS, and screen ink."""
 
     aboutToQuit = Signal()
+    _agentStepSpeechRequested = Signal(str, str)
+    _agentSequenceCompleted = Signal(str)
 
     def __init__(self, settings_store: Optional[jarvis_config.SettingsStore] = None) -> None:
         super().__init__()
         jarvis_theme.register_bundled_fonts()
 
         self.settings_store = settings_store or jarvis_config.SettingsStore()
+        self.memory_service = jarvis_services.JarvisMemoryService()
+        self.screen_monitor = jarvis_services.AgentScreenMonitorService()
         self.sound_player = jarvis_services.SoundEffectsPlayer(self.settings_store)
         self.mic_service = jarvis_services.MicrophoneStreamService(self.settings_store)
         self.tts_service = jarvis_services.StreamingTTSService(self.settings_store)
@@ -47,6 +53,9 @@ class JarvisApplicationController(QObject):
         self.main_window = jarvis_main_window.JarvisMainWindow(self.settings_store)
 
         self._tray_icon: Optional[QSystemTrayIcon] = None
+        self._agent_monitor_timer = QTimer(self)
+        self._agent_monitor_timer.setInterval(1500)
+        self._agent_monitor_timer.timeout.connect(self._on_screen_monitor_tick)
         self._active_voice_mode = "idle"  # "idle" | "ptt" | "dictate" | "mic_test"
         self._last_highlight_points: List[Tuple[float, float]] = []
         self._speak_current_turn = False
@@ -54,6 +63,9 @@ class JarvisApplicationController(QObject):
         self._last_turn_from_typed_notch = False
         self._active_tts_generation = 0
         self._sentences_enqueued_in_turn = 0
+        self._pending_voice_synced_commands: Dict[int, List[jarvis_response_parser.DrawingCommand]] = {}
+        self._current_spoken_sentence_index: int = -1
+        self._agent_worker_generation: int = 0
         self._scroll_explain_active = False
         self._scroll_explain_user_prompt = ""
         self._scroll_step_index = 0
@@ -100,9 +112,15 @@ class JarvisApplicationController(QObject):
         self.brain_service.turnFailed.connect(self._on_brain_turn_failed)
 
         # Streaming TTS
+        self.tts_service.sentenceStarted.connect(self._on_tts_sentence_started)
         self.tts_service.audioLevelChanged.connect(self._on_tts_audio_level)
         self.tts_service.speechWordProgress.connect(self._on_tts_word_progress)
         self.tts_service.speechFinished.connect(self._on_tts_finished)
+
+        # Agent Screen Monitor & Multitask Worker Signals
+        self.screen_monitor.foregroundWindowChanged.connect(self._on_foreground_window_changed)
+        self._agentStepSpeechRequested.connect(self._on_agent_step_speech_requested)
+        self._agentSequenceCompleted.connect(self._on_agent_sequence_completed)
 
         # Notch Window
         self.notch_window.promptSubmitted.connect(self._on_notch_prompt_submitted)
@@ -129,6 +147,8 @@ class JarvisApplicationController(QObject):
         self.main_window.agentCommandRequested.connect(self._on_main_window_agent_command)
         self.main_window.clearOverlayRequested.connect(self._on_escape_pressed)
         self.main_window.quitRequested.connect(self.quit_application)
+        self.main_window.drawerVisibilityChanged.connect(self._on_main_drawer_visibility_changed)
+        self.main_window.openMemoryRequested.connect(self._on_open_memory_requested)
         self.main_window.voicePreviewRequested.connect(self._on_voice_preview_requested)
         self.main_window.microphoneTestRequested.connect(self._on_microphone_test_requested)
         self.main_window.shortcutTestRequested.connect(self._on_shortcut_test_requested)
@@ -200,9 +220,13 @@ class JarvisApplicationController(QObject):
     # -----------------------------------------------------------------------
 
     def start(self, auto_demo: bool = False) -> None:
+        self.memory_service.start_session("Jarvis Windows desktop companion active")
+        self.screen_monitor.poll_once()
         self.overlay_window.show()
         self.notch_window.show()
         self.hotkey_service.start()
+        if not auto_demo:
+            self._agent_monitor_timer.start()
         self.sound_player.play_earcon("reveal-boot", volume=0.45)
 
         if auto_demo:
@@ -216,6 +240,9 @@ class JarvisApplicationController(QObject):
         if self._quitting:
             return
         self._quitting = True
+        self._agent_worker_generation += 1
+        self._agent_monitor_timer.stop()
+        self.memory_service.record_action("shutdown", "Jarvis", "Application session ended")
         self.aboutToQuit.emit()
 
         self.hotkey_service.stop()
@@ -246,18 +273,48 @@ class JarvisApplicationController(QObject):
         else:
             mapped_tab = normalized
 
+        notch_start_rect = self.notch_window.geometry()
         if self.notch_window.current_mode() == jarvis_notch_window.NotchVisualMode.HOME_PEEK:
             self.notch_window.collapse_to_idle()
+        self.notch_window.hide()
 
         self.main_window.open_tab(mapped_tab)
-        if hasattr(self.main_window, "position_under_notch"):
-            self.main_window.position_under_notch()
-        if self.main_window.isMinimized():
-            self.main_window.showNormal()
+        if hasattr(self.main_window, "animate_open_from_notch"):
+            self.main_window.animate_open_from_notch(notch_start_rect)
         else:
+            if hasattr(self.main_window, "position_under_notch"):
+                self.main_window.position_under_notch()
             self.main_window.show()
-        self.main_window.raise_()
-        self.main_window.activateWindow()
+            self.main_window.raise_()
+            self.main_window.activateWindow()
+        self.memory_service.record_action("open_drawer", mapped_tab, "Expanded Studio drawer from Notch")
+
+    def _on_main_drawer_visibility_changed(self, is_visible: bool) -> None:
+        if not is_visible and not self._quitting:
+            if not self.notch_window.isVisible():
+                self.notch_window.show()
+                self.notch_window.raise_()
+
+    def _on_open_memory_requested(self) -> None:
+        memory_path = self.memory_service.get_active_session_path()
+        try:
+            if memory_path and os.path.exists(memory_path):
+                os.startfile(memory_path)
+                return
+        except Exception as err:
+            self.overlay_window.set_bubble_message(
+                f"Memory file saved at {memory_path} ({err})",
+                word_by_word=False,
+                hold_seconds=3.5,
+            )
+
+    def _on_screen_monitor_tick(self) -> None:
+        if self._quitting or not bool(self.settings_store.get("agent_actions_enabled", True)):
+            return
+        self.screen_monitor.poll_once()
+
+    def _on_foreground_window_changed(self, window_title: str) -> None:
+        self.memory_service.record_screen_observation(window_title, "Foreground window active")
 
     def _cancel_scroll_explain_sequence(self) -> None:
         """Stop any multi-step scroll-and-explain walkthrough and invalidate pending timers."""
@@ -485,7 +542,10 @@ class JarvisApplicationController(QObject):
         self._start_turn(prompt_text=prompt_text, speak_reply=speak, from_typed_notch=False)
 
     def _on_stop_requested(self) -> None:
+        self._agent_worker_generation += 1
         self._pending_direct_agent_commands = []
+        self._pending_voice_synced_commands.clear()
+        self._current_spoken_sentence_index = -1
         self._cancel_scroll_explain_sequence()
         self.overlay_window.cancel_interactive_lasso_mode()
         self.brain_service.stop_current_turn()
@@ -510,9 +570,12 @@ class JarvisApplicationController(QObject):
         highlight_points: Optional[List[Tuple[float, float]]] = None,
         preserve_scroll_session: bool = False,
     ) -> None:
+        self._agent_worker_generation += 1
         self.brain_service.stop_current_turn()
         self.tts_service.stop_speaking()
         self.sound_player.stop_drawing_sound()
+        self._pending_voice_synced_commands.clear()
+        self._current_spoken_sentence_index = -1
 
         self._executed_agent_command_in_turn = False
         agent_actions_enabled = bool(self.settings_store.get("agent_actions_enabled", True))
@@ -545,6 +608,14 @@ class JarvisApplicationController(QObject):
             self.overlay_window.clear_all_drawings()
             displayed_user_message = prompt_text
 
+        source_label = "notch" if from_typed_notch else ("voice" if speak_reply else "chat")
+        current_foreground = self.screen_monitor.get_foreground_window_title()
+        self.memory_service.record_user_message(
+            prompt_text=displayed_user_message,
+            source_mode=source_label,
+            foreground_window=current_foreground,
+        )
+
         self._speak_current_turn = bool(speak_reply)
         self._force_captions_for_turn = False
         self._sentences_enqueued_in_turn = 0
@@ -559,27 +630,17 @@ class JarvisApplicationController(QObject):
             self.notch_window.set_mode(jarvis_notch_window.NotchVisualMode.THINKING, status_text="Thinking")
             self.overlay_window.set_cursor_visual_state(listening=False, thinking=True, speaking=False)
 
-        if len(self._pending_direct_agent_commands) >= 2:
-            action_statuses: List[str] = []
-            any_action_ok = False
-            for direct_command in self._pending_direct_agent_commands:
-                action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command(direct_command)
-                any_action_ok = any_action_ok or action_ok
-                if status_msg:
-                    action_statuses.append(status_msg)
-            self._executed_agent_command_in_turn = True
+        if len(self._pending_direct_agent_commands) >= 1:
+            commands_to_run = list(self._pending_direct_agent_commands)
             self._pending_direct_agent_commands = []
-            combined_status = ", ".join(action_statuses) if action_statuses else "Done."
-            self.sound_player.play_earcon("jarvis-text-send" if any_action_ok else "jarvis-error", volume=0.45)
-            self.overlay_window.set_bubble_message(combined_status, word_by_word=False, hold_seconds=2.8)
-            direct_summary = f"{combined_status}."
-            self._on_brain_turn_completed(
-                jarvis_response_parser.ParsedTurnResponse(
-                    spoken_text=direct_summary,
-                    sentences=[direct_summary],
-                    commands=[],
-                )
-            )
+            self._executed_agent_command_in_turn = True
+            captured_worker_gen = self._agent_worker_generation
+            threading.Thread(
+                target=self._run_multitask_agent_worker,
+                args=(commands_to_run, captured_worker_gen),
+                name="JarvisMultitaskAgentWorker",
+                daemon=True,
+            ).start()
             return
 
         self.brain_service.start_vision_turn(
@@ -592,7 +653,95 @@ class JarvisApplicationController(QObject):
             logical_screen_size=(max(640, self.overlay_window.width()), max(480, self.overlay_window.height())),
             scroll_step_index=self._scroll_step_index if self._scroll_explain_active else 0,
             max_scroll_steps=self._max_scroll_steps if self._scroll_explain_active else 0,
+            memory_context=self.memory_service.build_memory_context_for_prompt(),
+            live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
         )
+
+    def _run_multitask_agent_worker(
+        self,
+        commands_to_run: List[jarvis_response_parser.DrawingCommand],
+        worker_generation: int,
+    ) -> None:
+        action_statuses: List[str] = []
+        any_action_failed = False
+
+        for agent_cmd in commands_to_run:
+            if self._quitting or worker_generation != self._agent_worker_generation:
+                return
+            step_speech = jarvis_services.DesktopAgentService.describe_step_for_speech(agent_cmd)
+            self._agentStepSpeechRequested.emit(step_speech, step_speech)
+
+            action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command_blocking(agent_cmd)
+            self.memory_service.record_action(
+                action_kind=agent_cmd.kind,
+                target_summary=agent_cmd.label or agent_cmd.body or agent_cmd.header,
+                status_text=status_msg,
+                succeeded=action_ok,
+            )
+            if status_msg:
+                action_statuses.append(status_msg)
+            if not action_ok:
+                any_action_failed = True
+
+            if self._quitting or worker_generation != self._agent_worker_generation:
+                return
+            self.screen_monitor.poll_once()
+            time.sleep(0.18)
+
+        if self._quitting or worker_generation != self._agent_worker_generation:
+            return
+        active_window = self.screen_monitor.get_foreground_window_title()
+        if any_action_failed or not action_statuses:
+            final_summary = (", ".join(action_statuses) + ".") if action_statuses else "Done."
+        elif active_window:
+            final_summary = f"{', '.join(action_statuses)}. Active window: {active_window[:48]}."
+        else:
+            final_summary = f"{', '.join(action_statuses)}."
+        self._agentSequenceCompleted.emit(final_summary)
+
+    def _on_agent_step_speech_requested(self, step_speech: str, bubble_status: str) -> None:
+        if self._quitting:
+            return
+        self.sound_player.play_earcon("jarvis-text-send", volume=0.35)
+        self.overlay_window.set_bubble_message(bubble_status, word_by_word=False, hold_seconds=2.2)
+        self.main_window.update_streaming_assistant_message(bubble_status, is_generating=True)
+        if self.notch_window.current_mode() == jarvis_notch_window.NotchVisualMode.TEXT_RESPONSE:
+            self.notch_window.set_streaming_response(bubble_status, is_generating=True)
+        elif self.notch_window.current_mode() not in (
+            jarvis_notch_window.NotchVisualMode.HOME_PEEK,
+            jarvis_notch_window.NotchVisualMode.TEXT_INPUT,
+        ):
+            self.notch_window.set_mode(
+                jarvis_notch_window.NotchVisualMode.SPEAKING
+                if self._speak_current_turn
+                else jarvis_notch_window.NotchVisualMode.THINKING,
+                status_text=bubble_status[:26],
+            )
+        if self._speak_current_turn and step_speech:
+            self._sentences_enqueued_in_turn += 1
+            self.overlay_window.set_cursor_visual_state(listening=False, thinking=False, speaking=True)
+            self.tts_service.enqueue_sentence(step_speech, turn_generation=self._active_tts_generation)
+
+    def _on_agent_sequence_completed(self, final_summary: str) -> None:
+        if self._quitting:
+            return
+        self.memory_service.record_assistant_response(final_summary, "multitask-agent")
+        self.main_window.finish_streaming_assistant_message(final_summary)
+        if self.notch_window.current_mode() == jarvis_notch_window.NotchVisualMode.TEXT_RESPONSE:
+            self.notch_window.set_streaming_response(final_summary, is_generating=False)
+
+        if self._speak_current_turn:
+            if self._sentences_enqueued_in_turn == 0 and final_summary:
+                self._sentences_enqueued_in_turn += 1
+                self.tts_service.enqueue_sentence(final_summary, turn_generation=self._active_tts_generation)
+            self.tts_service.mark_turn_complete(turn_generation=self._active_tts_generation)
+        else:
+            self.overlay_window.set_cursor_visual_state(False, False, False)
+            if self.notch_window.current_mode() in (
+                jarvis_notch_window.NotchVisualMode.THINKING,
+                jarvis_notch_window.NotchVisualMode.SPEAKING,
+            ):
+                self.notch_window.collapse_to_idle()
 
     def _on_brain_partial_text(self, partial_text: str) -> None:
         self.main_window.update_streaming_assistant_message(partial_text, is_generating=True)
@@ -617,6 +766,30 @@ class JarvisApplicationController(QObject):
                 self.notch_window.set_mode(jarvis_notch_window.NotchVisualMode.SPEAKING, status_text="Speaking")
             self.tts_service.enqueue_sentence(sentence_text, turn_generation=self._active_tts_generation)
 
+    def _execute_visual_drawing_command(self, snapped_command: jarvis_response_parser.DrawingCommand) -> None:
+        self.overlay_window.add_drawing_command(snapped_command)
+        if snapped_command.kind == "point":
+            self.overlay_window.fly_cursor_to(
+                snapped_command.x,
+                snapped_command.y,
+                label=snapped_command.label,
+                hold_seconds=3.2,
+            )
+
+    def _flush_pending_voice_synced_commands(self, max_sentence_index: Optional[int] = None) -> None:
+        pending_keys = sorted(self._pending_voice_synced_commands.keys())
+        for sentence_key in pending_keys:
+            if max_sentence_index is not None and sentence_key > max_sentence_index:
+                continue
+            queued_list = self._pending_voice_synced_commands.pop(sentence_key, [])
+            for queued_cmd in queued_list:
+                self._execute_visual_drawing_command(queued_cmd)
+
+    def _on_tts_sentence_started(self, sentence_index: int, sentence_text: str) -> None:
+        del sentence_text
+        self._current_spoken_sentence_index = max(self._current_spoken_sentence_index, int(sentence_index))
+        self._flush_pending_voice_synced_commands(max_sentence_index=self._current_spoken_sentence_index)
+
     def _on_brain_drawing_command(self, command: jarvis_response_parser.DrawingCommand) -> None:
         if command.kind == "scroll":
             return
@@ -625,11 +798,33 @@ class JarvisApplicationController(QObject):
                 action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command(command)
                 self._executed_agent_command_in_turn = True
                 self._pending_direct_agent_commands = []
+                self.memory_service.record_action(
+                    action_kind=command.kind,
+                    target_summary=command.label or command.body,
+                    status_text=status_msg,
+                    succeeded=action_ok,
+                )
                 self.sound_player.play_earcon("jarvis-text-send" if action_ok else "jarvis-error", volume=0.45)
                 self.overlay_window.set_bubble_message(status_msg, word_by_word=False, hold_seconds=2.8)
             return
+
         snapped_command = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(command)
-        self.overlay_window.add_drawing_command(snapped_command)
+        target_desc = snapped_command.label or snapped_command.header or f"({snapped_command.x:.0f},{snapped_command.y:.0f})"
+        self.memory_service.record_action(
+            action_kind=snapped_command.kind,
+            target_summary=target_desc,
+            status_text=f"synced@{max(0, int(snapped_command.sentence_index))}",
+            succeeded=True,
+        )
+        if not self._speak_current_turn:
+            self._execute_visual_drawing_command(snapped_command)
+            return
+
+        target_sentence_idx = max(0, int(snapped_command.sentence_index))
+        if self._current_spoken_sentence_index >= target_sentence_idx:
+            self._execute_visual_drawing_command(snapped_command)
+        else:
+            self._pending_voice_synced_commands.setdefault(target_sentence_idx, []).append(snapped_command)
 
     def _on_stroke_animation_started(self, stroke_kind: str, duration_ms: int) -> None:
         if stroke_kind == "paper":
@@ -667,6 +862,8 @@ class JarvisApplicationController(QObject):
         self._pending_direct_agent_commands = []
 
         final_text = parsed_response.spoken_text or "Done."
+        visual_summary = ", ".join(cmd_item.kind for cmd_item in parsed_response.commands[:6])
+        self.memory_service.record_assistant_response(final_text, visual_summary)
         self.main_window.finish_streaming_assistant_message(final_text)
 
         if self.notch_window.current_mode() == jarvis_notch_window.NotchVisualMode.TEXT_RESPONSE:
@@ -715,6 +912,9 @@ class JarvisApplicationController(QObject):
                 self.overlay_window.set_caption_text(parsed_response.spoken_text, force_visible=True)
                 QTimer.singleShot(5500, self.overlay_window.clear_caption)
 
+        if not has_pending_tts_speech:
+            self._flush_pending_voice_synced_commands(max_sentence_index=None)
+
         if scroll_task is not None:
             if has_pending_tts_speech:
                 self._pending_scroll_after_speech = scroll_task
@@ -754,6 +954,7 @@ class JarvisApplicationController(QObject):
             )
 
     def _on_tts_finished(self) -> None:
+        self._flush_pending_voice_synced_commands(max_sentence_index=None)
         self.overlay_window.set_cursor_visual_state(False, False, False)
         if not self._force_captions_for_turn:
             self.overlay_window.clear_caption()

@@ -426,17 +426,72 @@ def run_strict_selftest() -> int:
             and direct_browser_intent.kind == "open_browser"
         )
 
-        # Verify precise_lines normalizes compact box -> underline and blocks giant boxes
+        # Verify precise_lines normalizes compact box -> underline, blocks giant boxes,
+        # ignores 1-point clicks on end_highlight_stroke, and separates multiple paper notes.
         temp_overlay = jarvis_overlay_windows.OverlayCanvasWindow(settings_store)
+        temp_overlay.resize(1536, 864)
         temp_overlay._drawing_mode = "precise_lines"
         compact_box_cmd = jarvis_response_parser.DrawingCommand(kind="box", x=100.0, y=120.0, width=220.0, height=34.0, label="Tag")
         normalized_compact = temp_overlay._normalize_command_for_drawing_mode(compact_box_cmd)
         oversized_box_cmd = jarvis_response_parser.DrawingCommand(kind="box", x=20.0, y=20.0, width=1600.0, height=760.0, label="Huge")
         normalized_huge = temp_overlay._normalize_command_for_drawing_mode(oversized_box_cmd)
+        temp_overlay.begin_highlight_stroke()
+        click_only_lasso = temp_overlay.end_highlight_stroke()
+        temp_overlay._highlight_points = [
+            (100.0 + float(pt_idx * 18), 100.0 + float(pt_idx * 12))
+            for pt_idx in range(8)
+        ]
+        real_drag_lasso = temp_overlay.end_highlight_stroke()
+        multi_paper_cmds = jarvis_services.VisionBrainService._build_visual_note_cards_for_response(
+            spoken_sentences=[
+                "First, planning forecasts hiring demand across departments.",
+                "Second, recruitment sources candidates cleanly through referrals.",
+                "Third, appraisal reviews employee growth and goal alignment.",
+            ],
+            spoken_text=(
+                "First, planning forecasts hiring demand across departments. "
+                "Second, recruitment sources candidates cleanly through referrals. "
+                "Third, appraisal reviews employee growth and goal alignment."
+            ),
+            screen_width=1536,
+            screen_height=864,
+            underline_labels=["Planning", "Recruitment", "Appraisal"],
+        )
+        temp_overlay.clear_all_drawings()
+        for card_idx in range(3):
+            temp_overlay.add_drawing_command(
+                jarvis_response_parser.DrawingCommand(
+                    kind="paper",
+                    x=24.0,
+                    y=92.0,
+                    width=304.0,
+                    height=240.0,
+                    label=f"Topic {card_idx + 1}",
+                    header="Summary",
+                    body="Step A -> Step B | section:Core | Point C -> Point D",
+                    sentence_index=card_idx,
+                )
+            )
+        placed_paper_items = [
+            item.command for item in temp_overlay._drawings if item.command.kind == "paper"
+        ]
+        placed_positions = {
+            (round(item.x, 1), round(item.y, 1)) for item in placed_paper_items
+        }
+        multi_notes_ok = (
+            len(click_only_lasso) == 0
+            and len(real_drag_lasso) == 8
+            and len(multi_paper_cmds) >= 2
+            and len({cmd_item.sentence_index for cmd_item in multi_paper_cmds}) >= 2
+            and len(placed_paper_items) == 3
+            and len(placed_positions) == 3
+            and [cmd_item.sentence_index for cmd_item in placed_paper_items] == [0, 1, 2]
+        )
         precise_norm_ok = (
             normalized_compact is not None
             and normalized_compact.kind == "underline"
             and normalized_huge is None
+            and multi_notes_ok
         )
         temp_overlay.close()
 
@@ -499,6 +554,19 @@ def run_strict_selftest() -> int:
         storage_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
             "what is my storage left"
         )
+        natural_storage_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
+            "All right. How much storage I have got?"
+        )
+        side_those_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
+            "keep those tabs side by side. And show me."
+        )
+        side_two_sites_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
+            "Open Chrome. Then keep Fast.com and Nvidia stock price side by side."
+        )
+        multitab_raw_cmds = jarvis_services.DesktopAgentService.detect_direct_user_agent_commands(
+            "Open Chrome. And search fast.com. And another tab, open Nvidia stock"
+        )
+        multitab_coalesced_cmds = jarvis_services.DesktopAgentService.coalesce_agent_commands(multitab_raw_cmds)
         admin_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
             "delete all system files"
         )
@@ -506,6 +574,21 @@ def run_strict_selftest() -> int:
             web_intent.intent_kind == "web_lookup_and_answer"
             and ("nvidia" in web_intent.search_query.lower())
             and storage_intent.intent_kind == "system_telemetry_and_settings"
+            and natural_storage_intent.intent_kind == "system_telemetry_and_settings"
+            and ("GB" in natural_storage_intent.telemetry_response)
+            and side_those_intent.intent_kind == "multitask_agent"
+            and len(side_those_intent.agent_commands) == 1
+            and side_those_intent.agent_commands[0].kind == "open_side_by_side"
+            and side_those_intent.agent_commands[0].body == ""
+            and side_those_intent.agent_commands[0].header == ""
+            and side_two_sites_intent.intent_kind == "multitask_agent"
+            and len(side_two_sites_intent.agent_commands) == 1
+            and side_two_sites_intent.agent_commands[0].kind == "open_side_by_side"
+            and ("fast.com" in side_two_sites_intent.agent_commands[0].body.lower())
+            and ("nvidia" in side_two_sites_intent.agent_commands[0].header.lower())
+            and ([cmd_item.kind for cmd_item in multitab_raw_cmds] == ["open_app", "open_url", "search_web"])
+            and ([cmd_item.kind for cmd_item in multitab_coalesced_cmds] == ["open_url", "search_web"])
+            and (multitab_coalesced_cmds[0].header == "new_window")
             and ("GB" in jarvis_services.SystemTelemetryService.get_storage_summary())
             and admin_intent.intent_kind == "admin_permission_gate"
             and (admin_intent.admin_request is not None)

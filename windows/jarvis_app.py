@@ -697,7 +697,7 @@ class JarvisApplicationController(QObject):
                 return
             self._pending_admin_request = None
 
-        if not preserve_scroll_session and not highlight_points:
+        if not preserve_scroll_session:
             intent_plan = jarvis_services.DesktopAgentService.classify_contextual_intent(prompt_text)
             if intent_plan.intent_kind == "admin_permission_gate" and intent_plan.admin_request is not None:
                 self._request_admin_confirmation(intent_plan.admin_request)
@@ -705,6 +705,24 @@ class JarvisApplicationController(QObject):
 
             if intent_plan.intent_kind == "system_telemetry_and_settings":
                 self._executed_agent_command_in_turn = True
+                telemetry_lines = [
+                    segment.strip().rstrip(".")
+                    for segment in re.split(r"[;.\n]+", intent_plan.telemetry_response or "")
+                    if segment.strip()
+                ]
+                telemetry_body_parts = telemetry_lines[:3] or ["Telemetry Ready"]
+                telemetry_card = jarvis_response_parser.DrawingCommand(
+                    kind="paper",
+                    x=24.0,
+                    y=88.0,
+                    width=330.0,
+                    height=265.0,
+                    label="Live System",
+                    header=intent_plan.spoken_step_intro.rstrip(".")[:34] or "System Status",
+                    body=" -> ".join(telemetry_body_parts),
+                    sentence_index=0,
+                )
+                self.overlay_window.add_drawing_command(telemetry_card)
                 if agent_actions_enabled and intent_plan.agent_commands:
                     captured_worker_gen = self._agent_worker_generation
                     threading.Thread(
@@ -748,7 +766,7 @@ class JarvisApplicationController(QObject):
                     max_scroll_steps=0,
                     memory_context=self.memory_service.build_memory_context_for_prompt(),
                     live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
-                    suppress_visual_notes=True,
+                    suppress_visual_notes=False,
                 )
                 return
 
@@ -891,7 +909,7 @@ class JarvisApplicationController(QObject):
             max_scroll_steps=0,
             memory_context=self.memory_service.build_memory_context_for_prompt(),
             live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
-            suppress_visual_notes=True,
+            suppress_visual_notes=False,
         )
 
     def _run_multitask_agent_worker(
@@ -1124,6 +1142,7 @@ class JarvisApplicationController(QObject):
         if command.kind in (
             "open_browser",
             "open_url",
+            "open_side_by_side",
             "search_web",
             "open_app",
             "press_keys",

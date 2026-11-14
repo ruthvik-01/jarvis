@@ -1941,6 +1941,12 @@ class VisionBrainService(QObject):
             )
         )
 
+        system_telemetry_snapshot = ""
+        try:
+            system_telemetry_snapshot = SystemTelemetryService.get_full_system_snapshot()
+        except Exception:
+            system_telemetry_snapshot = ""
+
         system_prompt = jarvis_response_parser.build_vision_system_prompt(
             screen_width=img_w,
             screen_height=img_h,
@@ -1959,6 +1965,7 @@ class VisionBrainService(QObject):
             memory_context=memory_context,
             live_screen_context=live_screen_context,
             suppress_visual_notes=(not allow_visual_notes),
+            system_telemetry_summary=system_telemetry_snapshot,
         )
 
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -2063,12 +2070,13 @@ class VisionBrainService(QObject):
                 "open_app",
                 "press_keys",
                 "type_text",
+                "open_side_by_side",
                 "request_admin_permission",
                 "scroll",
             }
             has_agent_command = any(cmd_item.kind in agent_command_kinds for cmd_item in parsed_response.commands)
             has_underline = any(cmd_item.kind == "underline" for cmd_item in parsed_response.commands)
-            has_paper_card = any(cmd_item.kind == "paper" for cmd_item in parsed_response.commands)
+            existing_paper_count = sum(1 for cmd_item in parsed_response.commands if cmd_item.kind == "paper")
             underline_labels = [
                 cmd_item.label.strip()
                 for cmd_item in parsed_response.commands
@@ -2082,16 +2090,17 @@ class VisionBrainService(QObject):
                 and parsed_response.spoken_text
                 and len(parsed_response.spoken_text) >= 24
             ):
-                if not has_paper_card:
-                    synthesized_card = self._build_fallback_paper_card(
-                        spoken_sentences=parsed_response.sentences,
-                        spoken_text=parsed_response.spoken_text,
-                        screen_height=img_h,
-                        underline_labels=underline_labels,
-                    )
-                    if synthesized_card is not None:
-                        parsed_response.commands.append(synthesized_card)
-                        self.drawingCommandReady.emit(synthesized_card)
+                synthesized_cards = self._build_visual_note_cards_for_response(
+                    spoken_sentences=parsed_response.sentences,
+                    spoken_text=parsed_response.spoken_text,
+                    screen_width=img_w,
+                    screen_height=img_h,
+                    underline_labels=underline_labels,
+                    existing_paper_count=existing_paper_count,
+                )
+                for synthesized_card in synthesized_cards:
+                    parsed_response.commands.append(synthesized_card)
+                    self.drawingCommandReady.emit(synthesized_card)
                 if not has_underline:
                     anchors = ScreenCaptureService.detect_visual_text_anchors(img_w, img_h, count=2)
                     for underline_idx, (anchor_x, baseline_y, span_width) in enumerate(anchors):
@@ -2119,53 +2128,142 @@ class VisionBrainService(QObject):
                 self.turnFailed.emit(f"Could not reach River AI: {err}")
 
     @staticmethod
+    def _build_visual_note_cards_for_response(
+        spoken_sentences: List[str],
+        spoken_text: str,
+        screen_width: int = 1536,
+        screen_height: int = 864,
+        underline_labels: Optional[List[str]] = None,
+        existing_paper_count: int = 0,
+    ) -> List[jarvis_response_parser.DrawingCommand]:
+        """
+        Synthesizes structured visual diagram note cards so every visual answer has 2 to 3
+        complementary topic maps covering overview, breakdown/details, and outcome.
+        """
+        cleaned_sentences = [sentence.strip() for sentence in spoken_sentences if sentence and sentence.strip()]
+        if not cleaned_sentences and spoken_text:
+            cleaned_sentences = [spoken_text.strip()]
+        if not cleaned_sentences:
+            return []
+
+        label_topics: List[str] = []
+        for raw_label in underline_labels or []:
+            topic_label = jarvis_response_parser.extract_key_topic_phrase(raw_label, max_words=3)
+            if topic_label and topic_label not in label_topics:
+                label_topics.append(topic_label)
+
+        sentence_topics: List[str] = []
+        for sentence_text in cleaned_sentences:
+            topic_label = jarvis_response_parser.extract_key_topic_phrase(sentence_text, max_words=3)
+            if topic_label and topic_label not in sentence_topics:
+                sentence_topics.append(topic_label)
+
+        desired_card_count = 1
+        if len(cleaned_sentences) >= 2 or len(label_topics) >= 2:
+            desired_card_count = 2
+        if len(cleaned_sentences) >= 5 or len(label_topics) >= 4:
+            desired_card_count = 3
+
+        needed_cards = max(0, desired_card_count - max(0, int(existing_paper_count)))
+        if needed_cards <= 0:
+            return []
+
+        merged_topics: List[str] = []
+        for topic_item in label_topics + sentence_topics:
+            if topic_item and topic_item not in merged_topics:
+                merged_topics.append(topic_item)
+        while len(merged_topics) < 6:
+            fallback_defaults = ["Overview", "Core Idea", "Mechanism", "Key Step", "Comparison", "Outcome"]
+            next_default = fallback_defaults[len(merged_topics) % len(fallback_defaults)]
+            if next_default not in merged_topics:
+                merged_topics.append(next_default)
+            else:
+                merged_topics.append(f"Point {len(merged_topics) + 1}")
+
+        card_width = 304.0
+        card_height = 264.0
+        right_col_x = float(max(360, int(screen_width) - int(card_width) - 24))
+        bottom_row_y = float(max(376, int(screen_height) - int(card_height) - 72))
+        margin_slots = [
+            (24.0, 92.0, card_width, card_height),
+            (right_col_x, 92.0, card_width, card_height),
+            (24.0, bottom_row_y, card_width, min(246.0, card_height)),
+        ]
+
+        cards_to_build: List[jarvis_response_parser.DrawingCommand] = []
+        total_sentences = max(1, len(cleaned_sentences))
+        for card_offset in range(needed_cards):
+            slot_idx = (max(0, int(existing_paper_count)) + card_offset) % len(margin_slots)
+            slot_x, slot_y, slot_w, slot_h = margin_slots[slot_idx]
+            if slot_idx == 0:
+                card_title = merged_topics[0]
+                card_header = "Overview Map"
+                card_body = (
+                    f"{merged_topics[0]} -> {merged_topics[1]} | "
+                    f"section:Core Flow | "
+                    f"doc:{merged_topics[1]} -> {merged_topics[2]}"
+                )
+                target_sentence_idx = 0
+            elif slot_idx == 1:
+                pair_start = 2 if len(merged_topics) >= 4 else 1
+                node_a = merged_topics[pair_start]
+                node_b = merged_topics[(pair_start + 1) % len(merged_topics)]
+                node_c = merged_topics[(pair_start + 2) % len(merged_topics)]
+                card_title = f"{node_a} Flow"
+                card_header = "Breakdown"
+                card_body = (
+                    f"{node_a} -> {node_b} | "
+                    f"section:Key Details | "
+                    f"doc:{node_b} -> {node_c}"
+                )
+                target_sentence_idx = min(total_sentences - 1, max(1, total_sentences // 2))
+            else:
+                tail_a = merged_topics[-3]
+                tail_b = merged_topics[-2]
+                tail_c = merged_topics[-1]
+                card_title = "Key Takeaways"
+                card_header = "Summary"
+                card_body = (
+                    f"{tail_a} -> {tail_b} | "
+                    f"section:Conclusion | "
+                    f"doc:{tail_b} -> {tail_c}"
+                )
+                target_sentence_idx = total_sentences - 1
+
+            cards_to_build.append(
+                jarvis_response_parser.DrawingCommand(
+                    kind="paper",
+                    x=slot_x,
+                    y=slot_y,
+                    width=slot_w,
+                    height=slot_h,
+                    label=card_title,
+                    header=card_header,
+                    body=card_body,
+                    tone="blue",
+                    sentence_index=target_sentence_idx,
+                )
+            )
+
+        return cards_to_build
+
+    @staticmethod
     def _build_fallback_paper_card(
         spoken_sentences: List[str],
         spoken_text: str,
         screen_height: int,
         underline_labels: Optional[List[str]] = None,
     ) -> Optional[jarvis_response_parser.DrawingCommand]:
-        """Builds a structured visual topic diagram card summarizing spoken concepts without prose snippets."""
-        cleaned_sentences = [sentence.strip() for sentence in spoken_sentences if sentence.strip()]
-        if not cleaned_sentences and spoken_text:
-            cleaned_sentences = [spoken_text.strip()]
-        if not cleaned_sentences:
-            return None
-
-        extracted_topics: List[str] = []
-        for raw_label in underline_labels or []:
-            topic_label = jarvis_response_parser.extract_key_topic_phrase(raw_label, max_words=3)
-            if topic_label and topic_label not in extracted_topics:
-                extracted_topics.append(topic_label)
-        for sentence_text in cleaned_sentences:
-            topic_label = jarvis_response_parser.extract_key_topic_phrase(sentence_text, max_words=3)
-            if topic_label and topic_label not in extracted_topics:
-                extracted_topics.append(topic_label)
-
-        topic_one = extracted_topics[0] if len(extracted_topics) >= 1 else "Overview"
-        topic_two = extracted_topics[1] if len(extracted_topics) >= 2 else "Mechanism"
-        topic_three = extracted_topics[2] if len(extracted_topics) >= 3 else topic_one
-        topic_four = extracted_topics[3] if len(extracted_topics) >= 4 else "Outcome"
-
-        body_diagram = (
-            f"{topic_one} -> {topic_two} | "
-            f"section:Core Flow | "
-            f"doc:{topic_three} -> {topic_four}"
+        """Backward-compatible accessor returning the primary visual diagram card."""
+        cards = VisionBrainService._build_visual_note_cards_for_response(
+            spoken_sentences=spoken_sentences,
+            spoken_text=spoken_text,
+            screen_width=1536,
+            screen_height=screen_height,
+            underline_labels=underline_labels,
+            existing_paper_count=0,
         )
-
-        card_top_y = float(min(max(130, int(screen_height * 0.16)), max(150, screen_height - 370)))
-        return jarvis_response_parser.DrawingCommand(
-            kind="paper",
-            x=24.0,
-            y=card_top_y,
-            width=316.0,
-            height=330.0,
-            label=topic_one,
-            header="Visual Map",
-            body=body_diagram,
-            tone="blue",
-            sentence_index=0,
-        )
+        return cards[0] if cards else None
 
 
 # ---------------------------------------------------------------------------
@@ -2478,6 +2576,15 @@ class SystemTelemetryService:
             pass
         return "Could not read battery status right now."
 
+    @classmethod
+    def get_full_system_snapshot(cls) -> str:
+        """Returns combined live storage, RAM, and battery telemetry for J.A.R.V.I.S. awareness."""
+        return (
+            f"{cls.get_storage_summary()}\n"
+            f"{cls.get_memory_summary()}\n"
+            f"{cls.get_battery_summary()}"
+        )
+
 
 class LiveWebLookupService:
     """Fetches real-time stock quotes and concise factual web context alongside Chrome search."""
@@ -2740,13 +2847,21 @@ class DesktopAgentService:
     _last_app_launch_timestamp: float = 0.0
     _last_launched_target: str = ""
     _pre_launch_hwnd: int = 0
+    _recent_browser_targets: List[str] = []
 
     VK_CONTROL = 0x11
     VK_RETURN = 0x0D
+    VK_1 = 0x31
+    VK_2 = 0x32
+    VK_C = 0x43
     VK_F = 0x46
     VK_L = 0x4C
     VK_V = 0x56
+    VK_W = 0x57
     KEYEVENTF_KEYUP = 0x0002
+    SW_RESTORE = 9
+    SWP_SHOWWINDOW = 0x0040
+    SPI_GETWORKAREA = 0x0030
 
     MS_SETTINGS_URI_MAP: Dict[str, Tuple[str, str]] = {
         "storage": ("ms-settings:storagesense", "Windows Storage Settings"),
@@ -2938,12 +3053,326 @@ class DesktopAgentService:
             return False
 
     @classmethod
+    def _record_browser_target(cls, target_url: str) -> None:
+        cleaned_url = (target_url or "").strip()
+        if not cleaned_url:
+            return
+        if cleaned_url in cls._recent_browser_targets:
+            cls._recent_browser_targets.remove(cleaned_url)
+        cls._recent_browser_targets.append(cleaned_url)
+        if len(cls._recent_browser_targets) > 8:
+            cls._recent_browser_targets = cls._recent_browser_targets[-8:]
+
+    @classmethod
+    def _get_work_area_rect(cls) -> Tuple[int, int, int, int]:
+        if sys.platform != "win32":
+            return (0, 0, 1920, 1040)
+        try:
+            work_rect = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(cls.SPI_GETWORKAREA, 0, ctypes.byref(work_rect), 0):
+                left_val = int(work_rect.left)
+                top_val = int(work_rect.top)
+                right_val = int(work_rect.right)
+                bottom_val = int(work_rect.bottom)
+                if right_val - left_val >= 400 and bottom_val - top_val >= 300:
+                    return (left_val, top_val, right_val, bottom_val)
+        except Exception:
+            pass
+        return (0, 0, 1920, 1040)
+
+    @classmethod
+    def _list_visible_chrome_hwnds(cls) -> List[int]:
+        if sys.platform != "win32":
+            return []
+        found_hwnds: List[int] = []
+        try:
+            user32 = ctypes.windll.user32
+            enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+            def _on_window(candidate_hwnd: int, lparam_val: int) -> bool:
+                if not user32.IsWindowVisible(candidate_hwnd):
+                    return True
+                class_buffer = ctypes.create_unicode_buffer(128)
+                user32.GetClassNameW(candidate_hwnd, class_buffer, 128)
+                if class_buffer.value != "Chrome_WidgetWin_1":
+                    return True
+                title_length = user32.GetWindowTextLengthW(candidate_hwnd)
+                if title_length <= 0:
+                    return True
+                title_buffer = ctypes.create_unicode_buffer(title_length + 1)
+                user32.GetWindowTextW(candidate_hwnd, title_buffer, title_length + 1)
+                window_title = (title_buffer.value or "").strip()
+                if not window_title or "jarvis" in window_title.lower():
+                    return True
+                win_rect = wintypes.RECT()
+                if user32.GetWindowRect(candidate_hwnd, ctypes.byref(win_rect)):
+                    win_width = int(win_rect.right) - int(win_rect.left)
+                    win_height = int(win_rect.bottom) - int(win_rect.top)
+                    if win_width >= 240 and win_height >= 180:
+                        found_hwnds.append(int(candidate_hwnd))
+                return True
+
+            callback_ref = enum_proc_type(_on_window)
+            user32.EnumWindows(callback_ref, 0)
+        except Exception:
+            pass
+        return found_hwnds
+
+    @classmethod
+    def _snap_hwnd_to_rect(
+        cls,
+        target_hwnd: int,
+        left_px: int,
+        top_px: int,
+        width_px: int,
+        height_px: int,
+    ) -> bool:
+        if sys.platform != "win32" or not target_hwnd:
+            return False
+        try:
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(int(target_hwnd), cls.SW_RESTORE)
+            time.sleep(0.06)
+            moved_ok = user32.SetWindowPos(
+                int(target_hwnd),
+                0,
+                int(left_px),
+                int(top_px),
+                max(360, int(width_px)),
+                max(260, int(height_px)),
+                cls.SWP_SHOWWINDOW,
+            )
+            return bool(moved_ok)
+        except Exception:
+            return False
+
+    @classmethod
+    def _focus_hwnd(cls, target_hwnd: int) -> None:
+        if sys.platform != "win32" or not target_hwnd:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(int(target_hwnd), cls.SW_RESTORE)
+            user32.SetForegroundWindow(int(target_hwnd))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _get_clipboard_unicode() -> str:
+        if sys.platform != "win32":
+            return ""
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        if not user32.OpenClipboard(None):
+            return ""
+        try:
+            clip_handle = user32.GetClipboardData(SmartDictationInjector.CF_UNICODETEXT)
+            if not clip_handle:
+                return ""
+            raw_ptr = kernel32.GlobalLock(clip_handle)
+            if not raw_ptr:
+                return ""
+            try:
+                return str(ctypes.wstring_at(raw_ptr) or "").strip()
+            finally:
+                kernel32.GlobalUnlock(clip_handle)
+        except Exception:
+            return ""
+        finally:
+            user32.CloseClipboard()
+
+    @classmethod
+    def _extract_tab_url_by_index(cls, chrome_hwnd: int, tab_index: Optional[int] = None) -> str:
+        if sys.platform != "win32" or not chrome_hwnd:
+            return ""
+        cls._focus_hwnd(chrome_hwnd)
+        time.sleep(0.14)
+        if tab_index in (1, 2):
+            tab_vk = cls.VK_1 if tab_index == 1 else cls.VK_2
+            cls._press_win32_combo([cls.VK_CONTROL, tab_vk])
+            time.sleep(0.12)
+        SmartDictationInjector._set_clipboard_unicode("")
+        time.sleep(0.04)
+        cls._press_win32_combo([cls.VK_CONTROL, cls.VK_L])
+        time.sleep(0.09)
+        cls._press_win32_combo([cls.VK_CONTROL, cls.VK_C])
+        time.sleep(0.12)
+        copied_value = cls._get_clipboard_unicode()
+        if copied_value.lower().startswith(("http://", "https://")):
+            return copied_value
+        return ""
+
+    @classmethod
+    def _target_to_chrome_url(cls, raw_target: str) -> str:
+        cleaned = (raw_target or "").strip().strip("\"'")
+        if not cleaned:
+            return "https://www.google.com"
+        direct_url = cls.normalize_target_url(cleaned)
+        if direct_url is not None:
+            return direct_url
+        return f"https://www.google.com/search?q={urllib.parse.quote_plus(cleaned)}"
+
+    @classmethod
+    def _launch_chrome_new_window_hwnd(
+        cls,
+        target_url: str,
+        timeout_seconds: float = 3.2,
+    ) -> Optional[int]:
+        existing_hwnds = set(cls._list_visible_chrome_hwnds())
+        cls._record_browser_target(target_url)
+        chrome_exe = cls._resolve_chrome_executable()
+        cls._pre_launch_hwnd = cls._current_foreground_hwnd()
+        cls._last_app_launch_timestamp = time.monotonic()
+        cls._last_launched_target = "chrome"
+        if chrome_exe:
+            subprocess.Popen(
+                [chrome_exe, "--new-window", target_url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+            )
+        else:
+            webbrowser.open_new(target_url)
+            return None
+
+        deadline = time.monotonic() + max(0.8, timeout_seconds)
+        while time.monotonic() < deadline:
+            current_hwnds = cls._list_visible_chrome_hwnds()
+            for candidate_hwnd in current_hwnds:
+                if candidate_hwnd not in existing_hwnds:
+                    return candidate_hwnd
+            time.sleep(0.12)
+        return None
+
+    @classmethod
+    def open_and_tile_side_by_side(
+        cls,
+        left_target: str = "",
+        right_target: str = "",
+    ) -> Tuple[bool, str]:
+        """Opens or splits Chrome tabs/windows and tiles two windows side by side across the work area."""
+        work_left, work_top, work_right, work_bottom = cls._get_work_area_rect()
+        total_width = max(800, work_right - work_left)
+        work_height = max(480, work_bottom - work_top)
+        left_width = total_width // 2
+        right_width = total_width - left_width
+        left_rect = (work_left, work_top, left_width, work_height)
+        right_rect = (work_left + left_width, work_top, right_width, work_height)
+
+        cleaned_left = (left_target or "").strip()
+        cleaned_right = (right_target or "").strip()
+        try:
+            if cleaned_left and cleaned_right:
+                left_url = cls._target_to_chrome_url(cleaned_left)
+                right_url = cls._target_to_chrome_url(cleaned_right)
+                left_hwnd = cls._launch_chrome_new_window_hwnd(left_url)
+                if left_hwnd:
+                    cls._snap_hwnd_to_rect(left_hwnd, *left_rect)
+                right_hwnd = cls._launch_chrome_new_window_hwnd(right_url)
+                if right_hwnd:
+                    cls._snap_hwnd_to_rect(right_hwnd, *right_rect)
+                if not left_hwnd or not right_hwnd:
+                    visible_hwnds = cls._list_visible_chrome_hwnds()
+                    if len(visible_hwnds) >= 2:
+                        cls._snap_hwnd_to_rect(visible_hwnds[1], *left_rect)
+                        cls._snap_hwnd_to_rect(visible_hwnds[0], *right_rect)
+                else:
+                    cls._snap_hwnd_to_rect(left_hwnd, *left_rect)
+                    cls._snap_hwnd_to_rect(right_hwnd, *right_rect)
+                return (
+                    True,
+                    f"Tiled Chrome side by side: {cleaned_left} on the left and {cleaned_right} on the right.",
+                )
+
+            if cleaned_left or cleaned_right:
+                single_target = cleaned_left or cleaned_right
+                single_url = cls._target_to_chrome_url(single_target)
+                existing_hwnds = cls._list_visible_chrome_hwnds()
+                if existing_hwnds:
+                    cls._snap_hwnd_to_rect(existing_hwnds[0], *left_rect)
+                    new_right_hwnd = cls._launch_chrome_new_window_hwnd(single_url)
+                    if new_right_hwnd:
+                        cls._snap_hwnd_to_rect(new_right_hwnd, *right_rect)
+                    return True, f"Tiled Chrome with {single_target} on the right."
+                left_fallback_url = (
+                    cls._recent_browser_targets[-1]
+                    if cls._recent_browser_targets
+                    else "https://www.google.com"
+                )
+                left_hwnd = cls._launch_chrome_new_window_hwnd(left_fallback_url)
+                right_hwnd = cls._launch_chrome_new_window_hwnd(single_url)
+                if left_hwnd:
+                    cls._snap_hwnd_to_rect(left_hwnd, *left_rect)
+                if right_hwnd:
+                    cls._snap_hwnd_to_rect(right_hwnd, *right_rect)
+                return True, f"Opened {single_target} side by side in Chrome."
+
+            chrome_hwnds = cls._list_visible_chrome_hwnds()
+            if len(chrome_hwnds) >= 2:
+                cls._snap_hwnd_to_rect(chrome_hwnds[0], *left_rect)
+                cls._snap_hwnd_to_rect(chrome_hwnds[1], *right_rect)
+                return True, "Tiled your two Chrome windows side by side."
+
+            if len(chrome_hwnds) == 1:
+                only_hwnd = chrome_hwnds[0]
+                tab1_url = cls._extract_tab_url_by_index(only_hwnd, tab_index=1)
+                tab2_url = cls._extract_tab_url_by_index(only_hwnd, tab_index=2) if tab1_url else ""
+                if tab1_url and tab2_url and tab2_url != tab1_url:
+                    # Two distinct tabs are open: detach Tab 2 cleanly into its own right-half window.
+                    cls._press_win32_combo([cls.VK_CONTROL, cls.VK_W])
+                    time.sleep(0.14)
+                    cls._snap_hwnd_to_rect(only_hwnd, *left_rect)
+                    right_hwnd = cls._launch_chrome_new_window_hwnd(tab2_url)
+                    if right_hwnd:
+                        cls._snap_hwnd_to_rect(right_hwnd, *right_rect)
+                    return True, "Split your two Chrome tabs side by side."
+
+                if len(cls._recent_browser_targets) >= 2:
+                    cls._snap_hwnd_to_rect(only_hwnd, *left_rect)
+                    right_hwnd = cls._launch_chrome_new_window_hwnd(cls._recent_browser_targets[-1])
+                    if right_hwnd:
+                        cls._snap_hwnd_to_rect(right_hwnd, *right_rect)
+                    return True, "Arranged your recent Chrome targets side by side."
+
+                fallback_right_url = tab1_url or "https://www.google.com"
+                cls._snap_hwnd_to_rect(only_hwnd, *left_rect)
+                right_hwnd = cls._launch_chrome_new_window_hwnd(fallback_right_url)
+                if right_hwnd:
+                    cls._snap_hwnd_to_rect(right_hwnd, *right_rect)
+                return True, "Split Chrome into two side-by-side windows."
+
+            if len(cls._recent_browser_targets) >= 2:
+                left_url = cls._recent_browser_targets[-2]
+                right_url = cls._recent_browser_targets[-1]
+                left_hwnd = cls._launch_chrome_new_window_hwnd(left_url)
+                right_hwnd = cls._launch_chrome_new_window_hwnd(right_url)
+                if left_hwnd:
+                    cls._snap_hwnd_to_rect(left_hwnd, *left_rect)
+                if right_hwnd:
+                    cls._snap_hwnd_to_rect(right_hwnd, *right_rect)
+                return True, "Opened your two recent Chrome pages side by side."
+
+            return False, "No open Chrome tabs or target pages found to tile side by side."
+        except Exception as exc:
+            return False, str(exc)
+
+    @classmethod
     def open_chrome_search(cls, query_text: str) -> Tuple[bool, str]:
-        """Opens Chrome directly to the Google search results page for `query_text`."""
+        """Opens Chrome directly to the target site (if URL/domain) or Google search results for `query_text`."""
         cleaned_query = (query_text or "").strip()
         if not cleaned_query:
             return False, "Empty search query"
-        search_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(cleaned_query)}"
+        direct_url = cls.normalize_target_url(cleaned_query)
+        target_url = (
+            direct_url
+            if direct_url is not None
+            and ("." in cleaned_query or cleaned_query.lower() in cls.KNOWN_URL_ALIASES)
+            else f"https://www.google.com/search?q={urllib.parse.quote_plus(cleaned_query)}"
+        )
+        cls._record_browser_target(target_url)
         try:
             cls._pre_launch_hwnd = cls._current_foreground_hwnd()
             cls._last_app_launch_timestamp = time.monotonic()
@@ -2951,14 +3380,14 @@ class DesktopAgentService:
             chrome_exe = cls._resolve_chrome_executable()
             if chrome_exe:
                 subprocess.Popen(
-                    [chrome_exe, search_url],
+                    [chrome_exe, target_url],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     shell=False,
                 )
-                return True, f"Opened Chrome search for {cleaned_query}"
-            opened = webbrowser.open(search_url, new=2)
-            return bool(opened), f"Searched Google for {cleaned_query}"
+                return True, f"Opened {target_url} in Chrome"
+            opened = webbrowser.open(target_url, new=2)
+            return bool(opened), f"Opened {target_url} in browser"
         except Exception as exc:
             return False, str(exc)
 
@@ -2992,6 +3421,8 @@ class DesktopAgentService:
             if short_label.startswith(("http://", "https://")):
                 return "Opening site in browser."
             return f"Opening {short_label}."
+        if command.kind == "open_side_by_side":
+            return "Tiling Chrome side by side."
         if command.kind == "search_web":
             return f"Searching for {argument_text[:34]}."
         if command.kind == "type_text":
@@ -3031,14 +3462,20 @@ class DesktopAgentService:
             resolved_url = cls.normalize_target_url(argument_text)
             if resolved_url is None:
                 return False, f"Invalid URL: {argument_text}"
+            cls._record_browser_target(resolved_url)
             try:
                 cls._pre_launch_hwnd = cls._current_foreground_hwnd()
                 cls._last_app_launch_timestamp = time.monotonic()
                 cls._last_launched_target = "browser"
                 chrome_exe = cls._resolve_chrome_executable()
                 if chrome_exe:
+                    launch_cmd = (
+                        [chrome_exe, "--new-window", resolved_url]
+                        if (command.header or "").strip().lower() == "new_window"
+                        else [chrome_exe, resolved_url]
+                    )
                     subprocess.Popen(
-                        [chrome_exe, resolved_url],
+                        launch_cmd,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         shell=False,
@@ -3048,6 +3485,9 @@ class DesktopAgentService:
                 return bool(opened), f"Opened {resolved_url}"
             except Exception as exc:
                 return False, str(exc)
+
+        if command_kind == "open_side_by_side":
+            return cls.open_and_tile_side_by_side(command.body, command.header)
 
         if command_kind == "search_web":
             return cls.open_chrome_search(argument_text)
@@ -3212,9 +3652,24 @@ class DesktopAgentService:
     def _detect_single_clause_commands(
         cls,
         clause_text: str,
+        allow_tab_search: bool = False,
     ) -> List[jarvis_response_parser.DrawingCommand]:
         """Parses one standalone or compound single clause (`open <app> and type <text>`)."""
         cleaned = re.sub(r"\s+", " ", (clause_text or "").strip())
+        if not cleaned:
+            return []
+        cleaned = re.sub(
+            r"^(?:and\s+)?(?:(?:in|on)\s+)?(?:(?:another|a\s+new|new|second|next)\s+tab\s*[,:\-]?\s*|and\s+)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(
+            r"\s+(?:in|on)\s+(?:another|a\s+new|new|second)\s+tab$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
         if not cleaned:
             return []
         lowered = cleaned.lower().strip(" .,!?")
@@ -3320,12 +3775,23 @@ class DesktopAgentService:
             ]
 
         search_match = re.match(
-            r"^(?:please\s+)?(?:google|search(?:\s+the\s+web)?\s+for)\s+(.+)$",
+            r"^(?:please\s+)?(?:google|search(?:\s+(?:the\s+web|google|chrome))?(?:\s+for)?)\s+(.+)$",
             lowered,
         )
         if search_match:
             query_text = cleaned[search_match.start(1) :].strip(" .!?")
             if query_text:
+                direct_url = cls.normalize_target_url(query_text)
+                if direct_url is not None and (
+                    "." in query_text or query_text.lower() in cls.KNOWN_URL_ALIASES
+                ):
+                    return [
+                        jarvis_response_parser.DrawingCommand(
+                            kind="open_url",
+                            body=direct_url,
+                            label=query_text,
+                        )
+                    ]
                 return [
                     jarvis_response_parser.DrawingCommand(
                         kind="search_web",
@@ -3365,6 +3831,32 @@ class DesktopAgentService:
                 )
             ]
 
+        tab_open_match = re.match(
+            r"^(?:please\s+)?(?:open|launch|show|find|look\s+up|check)\s+(?:a\s+tab\s+(?:for|of)\s+)?(.+)$",
+            lowered,
+        )
+        if tab_open_match and (allow_tab_search or "stock" in lowered or "price" in lowered):
+            target_payload = cleaned[tab_open_match.start(1) :].strip(" .!?")
+            if target_payload:
+                direct_url = cls.normalize_target_url(target_payload)
+                if direct_url is not None and (
+                    "." in target_payload or target_payload.lower() in cls.KNOWN_URL_ALIASES
+                ):
+                    return [
+                        jarvis_response_parser.DrawingCommand(
+                            kind="open_url",
+                            body=direct_url,
+                            label=target_payload,
+                        )
+                    ]
+                return [
+                    jarvis_response_parser.DrawingCommand(
+                        kind="search_web",
+                        body=target_payload,
+                        label=target_payload,
+                    )
+                ]
+
         return []
 
     @classmethod
@@ -3380,7 +3872,7 @@ class DesktopAgentService:
         primary_clauses = [
             clause_item.strip()
             for clause_item in re.split(
-                r"\s*(?:,\s*then|;\s*then|\band\s+then|\bthen|\band\s+also|;|,\s*and)\s+",
+                r"\s*(?:\.\s+|;\s*|,\s*then\b|;\s*then\b|\band\s+then\b|\bthen\b|\band\s+also\b|,\s*and\b)\s*",
                 cleaned,
                 flags=re.IGNORECASE,
             )
@@ -3390,16 +3882,30 @@ class DesktopAgentService:
             primary_clauses = [cleaned]
 
         collected_commands: List[jarvis_response_parser.DrawingCommand] = []
+        browser_context_seen = False
         for primary_clause in primary_clauses:
-            direct_cmds = cls._detect_single_clause_commands(primary_clause)
+            clause_lower = primary_clause.lower()
+            has_tab_cue = bool(
+                re.search(r"\b(?:another|new|second|next)\s+tab\b", clause_lower)
+            )
+            direct_cmds = cls._detect_single_clause_commands(
+                primary_clause,
+                allow_tab_search=browser_context_seen or has_tab_cue,
+            )
             if direct_cmds:
                 collected_commands.extend(direct_cmds)
+                if any(
+                    cmd_item.kind in ("open_browser", "open_url", "search_web")
+                    or (cmd_item.kind == "open_app" and (cmd_item.body or "").strip().lower() in ("chrome", "edge", "firefox", "browser"))
+                    for cmd_item in direct_cmds
+                ):
+                    browser_context_seen = True
                 continue
 
             subclauses = [
                 sub_item.strip()
                 for sub_item in re.split(
-                    r"\s+\band\b\s+(?=(?:please\s+)?(?:open|launch|start|go\s+to|visit|search|google|press)\b)",
+                    r"\s+\band\b\s+(?=(?:(?:in|on)\s+)?(?:(?:another|a\s+new|new|second)\s+tab\b|(?:please\s+)?(?:open|launch|start|go\s+to|visit|search|google|press)\b))",
                     primary_clause,
                     flags=re.IGNORECASE,
                 )
@@ -3407,7 +3913,21 @@ class DesktopAgentService:
             ]
             if len(subclauses) >= 2:
                 for subclause in subclauses:
-                    collected_commands.extend(cls._detect_single_clause_commands(subclause))
+                    sub_has_tab_cue = bool(
+                        re.search(r"\b(?:another|new|second|next)\s+tab\b", subclause.lower())
+                    )
+                    sub_cmds = cls._detect_single_clause_commands(
+                        subclause,
+                        allow_tab_search=browser_context_seen or sub_has_tab_cue,
+                    )
+                    if sub_cmds:
+                        collected_commands.extend(sub_cmds)
+                        if any(
+                            cmd_item.kind in ("open_browser", "open_url", "search_web")
+                            or (cmd_item.kind == "open_app" and (cmd_item.body or "").strip().lower() in ("chrome", "edge", "firefox", "browser"))
+                            for cmd_item in sub_cmds
+                        ):
+                            browser_context_seen = True
 
         return collected_commands
 
@@ -3431,6 +3951,33 @@ class DesktopAgentService:
         total_cmds = len(commands)
         while scan_idx < total_cmds:
             current_cmd = commands[scan_idx]
+            if (
+                scan_idx + 1 < total_cmds
+                and current_cmd.kind == "open_app"
+                and (current_cmd.body or "").strip().lower() in ("chrome", "googlechrome")
+                and commands[scan_idx + 1].kind in ("open_url", "open_browser", "search_web")
+            ):
+                target_next = commands[scan_idx + 1]
+                if target_next.kind == "search_web":
+                    coalesced.append(
+                        jarvis_response_parser.DrawingCommand(
+                            kind="open_url",
+                            body=cls._target_to_chrome_url(target_next.body or target_next.label),
+                            label=target_next.label or target_next.body,
+                            header="new_window",
+                        )
+                    )
+                else:
+                    coalesced.append(
+                        jarvis_response_parser.DrawingCommand(
+                            kind=target_next.kind,
+                            body=target_next.body,
+                            label=target_next.label,
+                            header="new_window",
+                        )
+                    )
+                scan_idx += 2
+                continue
             if scan_idx + 1 < total_cmds and commands[scan_idx + 1].kind == "type_text":
                 next_cmd = commands[scan_idx + 1]
                 next_text = (next_cmd.body or next_cmd.label or "").strip()
@@ -3614,15 +4161,86 @@ class DesktopAgentService:
         ).strip(" ?!.")
         return cleaned or (user_prompt or "").strip()
 
+    @staticmethod
+    def _extract_side_by_side_targets(user_prompt: str) -> Tuple[str, str]:
+        """Extracts optional left/right URLs or topics from a side-by-side arrangement command."""
+        cleaned = re.sub(r"\s+", " ", (user_prompt or "").strip())
+        if not cleaned:
+            return ("", "")
+
+        side_clauses = [
+            part.strip()
+            for part in re.split(r"\s*(?:\.\s+|;\s*)\s*", cleaned)
+            if part and "side" in part.lower()
+        ]
+        candidate_clause = side_clauses[-1] if side_clauses else cleaned
+        candidate_clause = re.sub(
+            r"^(?:please\s+)?(?:(?:open|launch|start)\s+(?:my\s+)?(?:chrome|google\s+chrome|browser)\s*(?:[.,;]\s*|\s+then\s+|\s+and\s+)?)?"
+            r"(?:(?:and\s+)?then\s+)?(?:keep|put|open|place|show|tile|split|arrange)\s+(?:my\s+|both\s+|the\s+)?",
+            "",
+            candidate_clause,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        pair_match = re.match(
+            r"^(.+?)\s+(?:and|with|next\s+to|beside)\s+(.+?)\s+side[\s\-]+by[\s\-]+side\b",
+            candidate_clause,
+            flags=re.IGNORECASE,
+        )
+        if not pair_match:
+            return ("", "")
+
+        left_clean = re.sub(
+            r"^(?:the\s+|both\s+|tabs?\s+(?:for|of)\s+)+|\s+(?:tabs?|windows?|in\s+chrome)$",
+            "",
+            pair_match.group(1).strip(" .,!?\"'"),
+            flags=re.IGNORECASE,
+        ).strip()
+        right_clean = re.sub(
+            r"^(?:the\s+|both\s+|tabs?\s+(?:for|of)\s+)+|\s+(?:tabs?|windows?|in\s+chrome)$",
+            "",
+            pair_match.group(2).strip(" .,!?\"'"),
+            flags=re.IGNORECASE,
+        ).strip()
+        generic_placeholders = {
+            "",
+            "those",
+            "these",
+            "them",
+            "the",
+            "both",
+            "two",
+            "2",
+            "tabs",
+            "tab",
+            "those tabs",
+            "these tabs",
+            "the tabs",
+            "my tabs",
+            "chrome tabs",
+            "two tabs",
+            "both tabs",
+            "windows",
+            "those windows",
+            "these windows",
+            "chrome windows",
+            "the windows",
+            "screens",
+        }
+        if left_clean.lower() in generic_placeholders or right_clean.lower() in generic_placeholders:
+            return ("", "")
+        return (left_clean, right_clean)
+
     @classmethod
     def classify_contextual_intent(cls, user_prompt: str) -> ContextualIntentPlan:
         """
         Routes natural user prompts with practical intelligence:
         1. Admin confirmation gate for destructive operations
         2. Live Windows telemetry + deep-linked Settings pages (Storage, RAM, Battery)
-        3. Live web / stock / market lookup -> open Chrome search + read exact answer back
-        4. Compound / multitask desktop & browser agent chains (coalesced cleanly)
-        5. Standard visual screen tutor & drawing explanation
+        3. Autonomous Chrome tab / window side-by-side tiling
+        4. Compound / multi-tab multitask desktop & browser agent chains (coalesced cleanly)
+        5. Live web / stock / market lookup -> open Chrome search + read exact answer back
+        6. Standard visual screen tutor & drawing explanation
         """
         cleaned_prompt = re.sub(r"\s+", " ", (user_prompt or "").strip())
         lowered = cleaned_prompt.lower()
@@ -3634,19 +4252,35 @@ class DesktopAgentService:
                 admin_request=admin_request,
             )
 
-        if any(
-            phrase in lowered
-            for phrase in (
-                "storage left",
-                "disk space",
-                "free space",
-                "how much storage",
-                "check my storage",
-                "drive space",
-                "storage space",
-                "how much space",
+        storage_phrases = (
+            "storage left",
+            "disk space",
+            "free space",
+            "how much storage",
+            "check my storage",
+            "drive space",
+            "storage space",
+            "how much space",
+            "available storage",
+            "remaining storage",
+            "storage remaining",
+        )
+        is_storage_question = (
+            any(phrase in lowered for phrase in storage_phrases)
+            or bool(
+                re.search(
+                    r"\b(?:storage|disk|hard\s*drive|ssd)\b.*\b(?:left|have|got|free|available|remaining|used|full|size|capacity|check|status)\b",
+                    lowered,
+                )
             )
-        ):
+            or bool(
+                re.search(
+                    r"\b(?:how\s+much|what(?:'s|\s+is)?(?:\s+my)?|check(?:\s+my)?|show(?:\s+my)?)\b.*\b(?:storage|disk\s+space|drive\s+space)\b",
+                    lowered,
+                )
+            )
+        )
+        if is_storage_question:
             storage_text = SystemTelemetryService.get_storage_summary()
             return ContextualIntentPlan(
                 intent_kind="system_telemetry_and_settings",
@@ -3663,7 +4297,7 @@ class DesktopAgentService:
 
         if any(
             phrase in lowered
-            for phrase in ("how much ram", "ram left", "memory left", "ram usage", "memory usage", "check my ram")
+            for phrase in ("how much ram", "ram left", "memory left", "ram usage", "memory usage", "check my ram", "how much memory")
         ):
             ram_text = SystemTelemetryService.get_memory_summary()
             return ContextualIntentPlan(
@@ -3697,22 +4331,61 @@ class DesktopAgentService:
                 ],
             )
 
-        is_web_lookup_question = any(
-            phrase in lowered
-            for phrase in (
-                "stock price",
-                "share price",
-                "price of ",
-                "bitcoin price",
-                "crypto price",
-                "weather in ",
-                "latest news on ",
-                "who won ",
-            )
-        ) or bool(
+        is_side_by_side_request = bool(
             re.search(
-                r"\b(?:search|check|look\s+up|find)\b.*\b(?:chrome|google)\b.*\b(?:tell\s+me|what\s+is|price|answer)\b",
+                r"\b(?:side[\s\-]+by[\s\-]+side|split[\s\-]+screen|tile\s+(?:the\s+|these\s+|those\s+|my\s+)?(?:tabs?|windows?|chrome))\b",
                 lowered,
+            )
+        )
+        if is_side_by_side_request:
+            left_target, right_target = cls._extract_side_by_side_targets(cleaned_prompt)
+            pair_label = (
+                f"{left_target} | {right_target}"
+                if left_target and right_target
+                else "Chrome side by side"
+            )
+            step_intro = (
+                f"Opening {left_target} and {right_target} side by side."
+                if left_target and right_target
+                else "Arranging Chrome windows side by side."
+            )
+            return ContextualIntentPlan(
+                intent_kind="multitask_agent",
+                spoken_step_intro=step_intro,
+                agent_commands=[
+                    jarvis_response_parser.DrawingCommand(
+                        kind="open_side_by_side",
+                        body=left_target,
+                        header=right_target,
+                        label=pair_label,
+                    )
+                ],
+            )
+
+        direct_commands = cls.detect_direct_user_agent_commands(cleaned_prompt)
+        has_explicit_multitab_chain = len(direct_commands) >= 2 or bool(
+            re.search(r"\b(?:another|new|second|next)\s+tab\b", lowered)
+        )
+
+        is_web_lookup_question = (not has_explicit_multitab_chain) and (
+            any(
+                phrase in lowered
+                for phrase in (
+                    "stock price",
+                    "share price",
+                    "price of ",
+                    "bitcoin price",
+                    "crypto price",
+                    "weather in ",
+                    "latest news on ",
+                    "who won ",
+                )
+            )
+            or bool(
+                re.search(
+                    r"\b(?:search|check|look\s+up|find)\b.*\b(?:chrome|google)\b.*\b(?:tell\s+me|what\s+is|price|answer)\b",
+                    lowered,
+                )
             )
         )
         if is_web_lookup_question:
@@ -3723,7 +4396,6 @@ class DesktopAgentService:
                 search_query=lookup_query,
             )
 
-        direct_commands = cls.detect_direct_user_agent_commands(cleaned_prompt)
         if direct_commands:
             coalesced_commands = cls.coalesce_agent_commands(direct_commands)
             return ContextualIntentPlan(

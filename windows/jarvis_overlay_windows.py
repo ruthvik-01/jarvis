@@ -1568,15 +1568,35 @@ class OverlayCanvasWindow(QWidget):
     def end_highlight_stroke(self) -> List[Tuple[float, float]]:
         self._is_highlighting = False
         captured_points = list(self._highlight_points)
-        if len(captured_points) >= 2:
+        has_genuine_motion = False
+        if len(captured_points) >= 6:
+            x_coords = [float(point_item[0]) for point_item in captured_points]
+            y_coords = [float(point_item[1]) for point_item in captured_points]
+            bbox_span_x = max(x_coords) - min(x_coords)
+            bbox_span_y = max(y_coords) - min(y_coords)
+            total_path_length = 0.0
+            for point_idx in range(1, len(captured_points)):
+                prev_pt = captured_points[point_idx - 1]
+                curr_pt = captured_points[point_idx]
+                total_path_length += math.hypot(
+                    float(curr_pt[0]) - float(prev_pt[0]),
+                    float(curr_pt[1]) - float(prev_pt[1]),
+                )
+            has_genuine_motion = (total_path_length >= 65.0) and (max(bbox_span_x, bbox_span_y) >= 36.0)
+
+        if has_genuine_motion:
             now_seconds = time.monotonic()
             self._highlight_fade_start = now_seconds
             self._highlight_fade_end = now_seconds + HIGHLIGHT_FADE_DURATION_SECONDS
             self._ensure_timer_running()
-        else:
-            self._highlight_points.clear()
-            self._highlight_cached_path = None
-        return captured_points
+            return captured_points
+
+        self._highlight_points.clear()
+        self._highlight_cached_path = None
+        self._highlight_fade_start = 0.0
+        self._highlight_fade_end = 0.0
+        self.update()
+        return []
 
     def _normalize_command_for_drawing_mode(
         self,
@@ -2087,24 +2107,57 @@ class OverlayCanvasWindow(QWidget):
             clamped_x = _clamp_float(command.x, 18.0, screen_width - clamped_width - 18.0)
             clamped_y = _clamp_float(command.y, 72.0, screen_height - clamped_height - 56.0)
 
-            # Smart non-overlapping margin placement so paper notes never block the annotated region
-            content_x_samples: List[float] = []
+            existing_paper_rects: List[Tuple[float, float, float, float]] = []
+            content_rects: List[Tuple[float, float, float, float]] = []
             for active_item in self._drawings:
-                if active_item.command.kind != "paper":
-                    content_x_samples.append(
-                        active_item.command.x + max(0.0, active_item.command.width) * 0.5
-                    )
-            for lasso_x, _ in self._highlight_points:
-                content_x_samples.append(lasso_x)
-            if content_x_samples:
-                average_content_x = sum(content_x_samples) / float(len(content_x_samples))
-                paper_center_x = clamped_x + clamped_width * 0.5
-                if abs(paper_center_x - average_content_x) < (clamped_width * 0.62):
-                    if average_content_x < screen_width * 0.54:
-                        clamped_x = screen_width - clamped_width - 24.0
-                    else:
-                        clamped_x = 24.0
+                item_cmd = active_item.command
+                if item_cmd.kind == "paper":
+                    paper_right = item_cmd.x + max(200.0, item_cmd.width) + 14.0
+                    paper_bottom = item_cmd.y + max(180.0, item_cmd.height) + 14.0
+                    existing_paper_rects.append((item_cmd.x - 14.0, item_cmd.y - 14.0, paper_right, paper_bottom))
+                else:
+                    content_right = item_cmd.x + max(64.0, item_cmd.width)
+                    content_bottom = item_cmd.y + max(28.0, item_cmd.height)
+                    content_rects.append((item_cmd.x, item_cmd.y, content_right, content_bottom))
 
+            for lasso_x, lasso_y in self._highlight_points:
+                content_rects.append((lasso_x - 24.0, lasso_y - 24.0, lasso_x + 24.0, lasso_y + 24.0))
+
+            def _overlap_area(rect_a: Tuple[float, float, float, float], rect_b: Tuple[float, float, float, float]) -> float:
+                inter_w = min(rect_a[2], rect_b[2]) - max(rect_a[0], rect_b[0])
+                inter_h = min(rect_a[3], rect_b[3]) - max(rect_a[1], rect_b[1])
+                if inter_w <= 0.0 or inter_h <= 0.0:
+                    return 0.0
+                return inter_w * inter_h
+
+            margin_left = 22.0
+            margin_right = max(margin_left, screen_width - clamped_width - 22.0)
+            margin_top = 78.0
+            margin_bottom = max(margin_top, screen_height - clamped_height - 56.0)
+            margin_mid_y = max(margin_top, (margin_top + margin_bottom) * 0.5)
+
+            candidate_slots: List[Tuple[float, float]] = [
+                (clamped_x, clamped_y),
+                (margin_left, margin_top),
+                (margin_right, margin_top),
+                (margin_left, margin_bottom),
+                (margin_right, margin_bottom),
+                (margin_left, margin_mid_y),
+                (margin_right, margin_mid_y),
+            ]
+            best_slot = (clamped_x, clamped_y)
+            best_score = float("inf")
+            for cand_x, cand_y in candidate_slots:
+                cand_rect = (cand_x, cand_y, cand_x + clamped_width, cand_y + clamped_height)
+                paper_overlap = sum(_overlap_area(cand_rect, other_rect) for other_rect in existing_paper_rects)
+                content_overlap = sum(_overlap_area(cand_rect, content_rect) for content_rect in content_rects)
+                shift_distance = math.hypot(cand_x - clamped_x, cand_y - clamped_y)
+                slot_score = (paper_overlap * 12.0) + (content_overlap * 2.5) + (shift_distance * 0.01)
+                if slot_score < best_score:
+                    best_score = slot_score
+                    best_slot = (cand_x, cand_y)
+
+            clamped_x, clamped_y = best_slot
             return jarvis_response_parser.DrawingCommand(
                 kind=command.kind,
                 x=clamped_x,
@@ -2116,6 +2169,7 @@ class OverlayCanvasWindow(QWidget):
                 header=command.header,
                 body=command.body,
                 tone=command.tone,
+                sentence_index=command.sentence_index,
             )
         return command
 

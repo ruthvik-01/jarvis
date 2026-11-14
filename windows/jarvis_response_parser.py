@@ -49,7 +49,8 @@ _POINT_TAG_PATTERN = re.compile(
 
 _COMMAND_NAMES_PATTERN = (
     r"(underline|ring|point|box|frame|paper|highlight|scroll|"
-    r"open_browser|open_url|search_web|open_app|press_keys|type_text|request_admin_permission)"
+    r"open_browser|open_url|search_web|open_app|press_keys|type_text|"
+    r"open_side_by_side|request_admin_permission)"
 )
 
 _CALL_LINE_PATTERN = re.compile(
@@ -458,36 +459,7 @@ def should_use_visual_explanation_notes(
     if non_visual_word_pattern.search(normalized):
         return False
 
-    explanation_cues = (
-        "explain",
-        "summarize",
-        "summary",
-        "teach",
-        "walk me through",
-        "walk through",
-        "what does",
-        "how does",
-        "break down",
-        "diagram",
-        "notes",
-        "understand",
-        "meaning of",
-        "scope of",
-        "difference between",
-        "section",
-        "code",
-        "equation",
-        "formula",
-        "article",
-        "page",
-        "screen",
-        "chatgpt",
-        "this",
-    )
-    if any(cue in normalized for cue in explanation_cues):
-        return True
-
-    return False
+    return len(normalized) >= 3
 
 
 def build_vision_system_prompt(
@@ -503,6 +475,7 @@ def build_vision_system_prompt(
     memory_context: str = "",
     live_screen_context: str = "",
     suppress_visual_notes: bool = False,
+    system_telemetry_summary: str = "",
 ) -> str:
     """
     Constructs the system prompt for Jarvis's single-brain screen companion.
@@ -513,16 +486,17 @@ def build_vision_system_prompt(
     """
     normalized_mode = (drawing_mode or "lines_and_card").strip().lower()
     prompt_sections: List[str] = [
-        "You are Jarvis, a warm, crystal-clear visual tutor and desktop companion on Windows.",
+        "You are J.A.R.V.I.S., an intelligent, proactive real-life Iron Man desktop AI and visual tutor on Windows.",
+        "AUTONOMOUS EXECUTION RULE: NEVER tell the user to open Settings, click menus, check disk storage themselves, open tabs themselves, or drag/snap windows side by side themselves. YOU must execute actions yourself using commands (`open_side_by_side`, `open_app(\"settings:storage\")`, `search_web`, `open_url`, `press_keys`, etc.) and report exact live facts directly.",
         f"The attached screenshot is {screen_width}x{screen_height} pixels (1:1 logical screen coordinates, top-left is 0,0).",
         "A coordinate ruler runs along the top and left edges (ticks every 100px, faint grid every 200px). Read exact X and Y pixel values from those rulers so every underline lands directly under the intended text without drifting into whitespace.",
-        "Keep spoken replies warm, direct, and easy to follow (2 to 4 natural sentences).",
+        "Keep spoken replies warm, decisive, crisp, and easy to follow (2 to 5 natural sentences).",
         "Always inspect the current screenshot freshly; never repeat steps or sections you already explained earlier.",
         "CRITICAL FORMATTING & VOICE-SYNCED DRAWING RULES:",
         "1. VOICE-SYNCHRONIZED TIMING: Put each visual command (`paper(...)` or `underline(...)`) on its OWN standalone line IMMEDIATELY BEFORE the spoken sentence that explains that exact line or concept! If you open with an introductory sentence before Point 1, emit Point 1's underline RIGHT BEFORE Point 1's sentence (NOT before the intro sentence). ALWAYS pass the exact visible numbered title/phrase as the 4th argument of `underline(x, y, width, \"exact point title\")` so Jarvis locks the stroke to the matching sentence.",
-        "2. Example synced sequence:\npaper(36, 140, 320, 340, \"Topic Title\", \"Visual Map\", \"Topic 1 -> Topic 2 | section:Core Mechanism | doc:Input -> Outcome\")\nIntroductory sentence summarizing the main question before starting point 1.\nunderline(420, 210, 360, \"1. First Point Title\")\nSpoken sentence explaining point 1 right after its underline command.\nunderline(420, 245, 340, \"2. Second Point Title\")\nSpoken sentence explaining point 2 right after its underline command.",
+        "2. Example synced sequence (MULTI-NOTE + LINE SYNCED):\npaper(24, 92, 310, 270, \"Overview\", \"Visual Map\", \"Input -> Process -> Output | section:Core | doc:Key Goal\")\nIntroductory sentence summarizing the main question cleanly before point 1.\nunderline(420, 210, 360, \"1. First Point Title\")\nSpoken sentence explaining point 1 right after its underline command.\npaper(1180, 92, 310, 270, \"Details\", \"Flow Step\", \"Stage 1 -> Stage 2 | doc:Result\")\nunderline(420, 245, 340, \"2. Second Point Title\")\nSpoken sentence explaining point 2 right after its underline command.",
         "3. NO markdown bullets (- or *), NO numbering, NO backticks, NO trailing arrow comments on command lines.",
-        "4. NEVER speak or write command names like 'underline', 'paper', 'point', 'ring', 'box', or coordinates inside your spoken sentences.",
+        "4. NEVER speak or write command names like 'underline', 'paper', 'point', 'ring', 'box', 'open_side_by_side', or coordinates inside your spoken sentences.",
         "5. Never use markdown asterisks (**bold** or *italic*), bullet symbols, emojis, or code blocks in your spoken text.",
         "",
         "VISUAL EXPLANATION & SCREEN DRAWING COMMANDS:",
@@ -531,8 +505,8 @@ def build_vision_system_prompt(
     if suppress_visual_notes:
         prompt_sections.extend(
             [
-                "DIRECT CONTEXTUAL ANSWER MODE: Do NOT emit paper(...) or underline(...) commands for this request.",
-                "Answer the user's question directly and concisely in 1 to 3 spoken sentences using the live screen and fetched context.",
+                "DIRECT CONTEXTUAL ANSWER MODE: Do NOT emit underline(...) commands unless pointing out something visual; focus on direct action commands or 1 concise summary note.",
+                "Answer the user's question directly and concisely in 1 to 3 spoken sentences using the live screen, live Windows telemetry, and fetched context.",
             ]
         )
     elif normalized_mode == "cursor_only":
@@ -545,10 +519,12 @@ def build_vision_system_prompt(
     elif normalized_mode in ("precise_lines", "lines_and_card"):
         prompt_sections.extend(
             [
-                "Whenever you explain concepts, code, equations, or ChatGPT answers on screen, ALWAYS include BOTH:",
-                "First (before sentence 1), one visual topic flow diagram card placed in an empty left or right margin (avoiding main text). It MUST be a visual topic flow diagram with 1 to 3 word node labels summarizing the topics you speak aloud, and NEVER a prose summary paragraph:",
-                "paper(24, 160, 320, 340, \"Topic Title\", \"Visual Map\", \"Topic 1 -> Topic 2 | section:Core Mechanism | doc:Input -> Outcome\")",
-                f"Second, 2 to 4 crisp horizontal underlines, each emitted right BEFORE the spoken sentence discussing that line (y = text baseline + 4px, x = left edge of phrase, width = exact phrase pixel width in 0..{screen_width} x 0..{screen_height}, 4th arg = exact 2 to 6 words on screen):",
+                "AGGRESSIVE MULTI-NOTE VISUALIZATION: Whenever explaining concepts, code, equations, or ChatGPT answers, emit 2 to 3 visual topic-flow `paper(...)` diagram cards placed in empty margin corners (`top-left (24,92)`, `top-right (1180,92)`, `bottom-left (24,380)`) so the user can grasp your entire spoken explanation visually at a glance!",
+                "Each `paper(...)` card MUST contain concise 1 to 4 word diagram flow nodes separated by `->`, `|`, and `section:`/`doc:` dividers — NEVER prose sentences or paragraphs:",
+                "Card 1 (before intro/sentence 1): paper(24, 92, 310, 270, \"Topic Map\", \"Part 1\", \"Node A -> Node B | section:Mechanism | doc:Core Idea\")",
+                "Card 2 (before middle section): paper(1180, 92, 310, 270, \"Breakdown\", \"Part 2\", \"Step 1 -> Step 2 | doc:Outcome\")",
+                "Card 3 (optional for 4+ points): paper(24, 382, 310, 250, \"Takeaway\", \"Summary\", \"Benefit -> Impact | doc:Conclusion\")",
+                f"Also emit 2 to 5 crisp horizontal underlines, each right BEFORE the spoken sentence discussing that line (y = text baseline + 4px, x = left edge of phrase, width = exact phrase pixel width in 0..{screen_width} x 0..{screen_height}, 4th arg = exact 2 to 6 words on screen):",
                 "underline(420, 310, 260, \"exact phrase on screen\")",
                 "Optionally glide the cursor to a key term or button with:",
                 "point(420, 310, \"\")",
@@ -558,9 +534,9 @@ def build_vision_system_prompt(
     else:
         prompt_sections.extend(
             [
-                "While explaining ChatGPT responses, code, formulas, or articles, emit BOTH one paper(...) visual topic flow diagram card (1 to 3 word node labels, NEVER prose paragraphs) AND 2 to 4 underline(...) commands placed directly BEFORE each matching spoken sentence:",
+                "AGGRESSIVE MULTI-NOTE VISUALIZATION: Emit 2 to 3 `paper(...)` visual topic flow diagram cards in empty screen margins AND 2 to 5 `underline(...)` commands placed directly BEFORE each matching spoken sentence so the user sees the entire answer visualized!",
                 f"underline(x, y, width, \"exact screen words\")  (clean underline directly beneath a key heading/phrase; x, y in 0..{screen_width} x 0..{screen_height})",
-                "paper(24, 160, 320, 340, \"Topic Title\", \"Visual Map\", \"Topic 1 -> Topic 2 | section:Core Mechanism | doc:Input -> Outcome\")",
+                "paper(24, 92, 310, 270, \"Topic Title\", \"Visual Map\", \"Topic 1 -> Topic 2 | section:Core Mechanism | doc:Input -> Outcome\")",
                 "ring(x, y, radius, \"label\")  (neat circle around a compact icon or term; radius <= 55)",
                 "point(x, y, \"label\")         (glides the Jarvis cursor to (x, y) and points cleanly)",
                 "box(x, y, width, height, \"label\") (small frame around a compact formula or UI button only)",
@@ -573,21 +549,22 @@ def build_vision_system_prompt(
             [
                 "",
                 "DESKTOP & BROWSER AGENT COMMANDS:",
-                "When the user asks you to open a browser/app, visit a site, search the web, press a shortcut, or type text, emit ALL required commands on consecutive standalone lines in the SAME response, then give a short spoken confirmation.",
-                "NEVER say 'I will type/search/open it after it loads' — Jarvis automatically waits for the window to open and focus before typing!",
+                "NEVER ask the user to perform a desktop action themselves (like opening Settings, checking storage, or manually dragging Chrome tabs side-by-side). Execute it directly with these commands:",
+                "NEVER say 'I will type/search/open it after it loads' or 'you can drag tabs side by side' — Jarvis executes everything automatically!",
                 "For any destructive or admin-level action (deleting files, uninstalling apps, shutting down/restarting, killing processes, editing registry/security settings), NEVER execute destructively — emit `request_admin_permission(\"action title\", \"risk reason\")` first and ask the admin for confirmation.",
                 "Available commands (each on its own line):",
+                "open_side_by_side(\"left site or search\", \"right site or search\")  -> opens two sites/searches side by side in tiled left/right Chrome windows (or use open_side_by_side(\"\", \"\") to split existing Chrome tabs side by side!)",
+                "open_app(\"settings:storage\")  -> opens Windows Storage Settings directly",
                 "open_browser(\"https://www.google.com\")",
-                "open_url(\"https://example.com\")",
-                "search_web(\"search query\")",
+                "open_url(\"https://fast.com\")",
+                "search_web(\"Nvidia stock price\")",
                 "open_app(\"chrome\")",
                 "press_keys(\"ctrl+t\")",
                 "type_text(\"hello\")",
                 "request_admin_permission(\"Delete temporary files\", \"Removes files from disk\")",
-                "Example when user says 'open Chrome and type latest AI news':",
-                "open_app(\"chrome\")",
-                "type_text(\"latest AI news\")",
-                "Opening Chrome and typing that for you.",
+                "Example when user says 'keep those tabs side by side':",
+                "open_side_by_side(\"\", \"\")",
+                "Putting your Chrome windows side by side now.",
             ]
         )
 
@@ -640,6 +617,11 @@ def build_vision_system_prompt(
         prompt_sections.append("")
         prompt_sections.append("LIVE SCREEN MONITOR STATE:")
         prompt_sections.append(live_screen_context.strip())
+
+    if system_telemetry_summary and system_telemetry_summary.strip():
+        prompt_sections.append("")
+        prompt_sections.append("LIVE WINDOWS SYSTEM TELEMETRY (USE EXACT NUMBERS):")
+        prompt_sections.append(system_telemetry_summary.strip())
 
     if memory_context and memory_context.strip():
         prompt_sections.append("")
@@ -990,6 +972,16 @@ def parse_command_line(
             kind="request_admin_permission",
             label=action_title,
             body=risk_reason,
+        )
+
+    if command_name == "open_side_by_side":
+        left_target = _parse_string(arguments[0], "").strip() if arguments else ""
+        right_target = _parse_string(arguments[1], "").strip() if len(arguments) >= 2 else ""
+        return DrawingCommand(
+            kind="open_side_by_side",
+            label=right_target or left_target or "side_by_side",
+            body=left_target,
+            header=right_target,
         )
 
     if command_name in ("open_browser", "open_url", "search_web", "open_app", "press_keys", "type_text"):

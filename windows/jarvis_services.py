@@ -251,8 +251,29 @@ class JarvisMemoryService(QObject):
             session_path = self._session_file_path
         self.memoryUpdated.emit(session_path)
 
+    _POLLUTED_MEMORY_MARKERS = (
+        "<system_warning>",
+        "</system_warning>",
+        "<\uff5cdsml",
+        "<|dsml",
+        "prompt injection",
+        "system prompt has changed",
+        "system prompt was injected",
+        "delete all system files",
+        "window=diff:",
+    )
+
+    @classmethod
+    def is_polluted_memory_text(cls, text_value: str) -> bool:
+        """Returns True when text contains leaked prompt-warning XML, DSML, or noisy diff telemetry."""
+        lowered = (text_value or "").lower()
+        return any(marker_item in lowered for marker_item in cls._POLLUTED_MEMORY_MARKERS)
+
     def record_assistant_response(self, spoken_text: str, drawing_summary: str = "") -> None:
-        cleaned_reply = self._sanitize_markdown_cell(spoken_text, 380)
+        sanitized_spoken = jarvis_response_parser.clean_spoken_text(spoken_text or "")
+        if self.is_polluted_memory_text(sanitized_spoken):
+            return
+        cleaned_reply = self._sanitize_markdown_cell(sanitized_spoken, 380)
         if not cleaned_reply:
             return
         visuals = self._sanitize_markdown_cell(drawing_summary, 140)
@@ -310,7 +331,7 @@ class JarvisMemoryService(QObject):
                     summary_lines = [
                         line_item.strip()
                         for line_item in summary_handle.read().splitlines()
-                        if line_item.strip()
+                        if line_item.strip() and not self.is_polluted_memory_text(line_item)
                     ]
                 if summary_lines:
                     sections.append("Today's Summary:\n" + "\n".join(summary_lines[-6:]))
@@ -334,7 +355,7 @@ class JarvisMemoryService(QObject):
                             prior_lines = [
                                 line_item.strip()
                                 for line_item in prior_handle.read().splitlines()
-                                if line_item.strip()
+                                if line_item.strip() and not self.is_polluted_memory_text(line_item)
                             ]
                         if prior_lines:
                             sections.append(
@@ -349,7 +370,10 @@ class JarvisMemoryService(QObject):
                     log_lines = [
                         line_item.rstrip()
                         for line_item in session_handle.read().splitlines()
-                        if line_item.strip() and not line_item.startswith("#") and not line_item.startswith("Session ID:")
+                        if line_item.strip()
+                        and not line_item.startswith("#")
+                        and not line_item.startswith("Session ID:")
+                        and not self.is_polluted_memory_text(line_item)
                     ]
                 if log_lines:
                     sections.append("Recent Session Actions & Messages:\n" + "\n".join(log_lines[-18:]))
@@ -2124,20 +2148,51 @@ class VisionBrainService(QObject):
                 )
             ),
             agent_actions_enabled=bool(self._settings_store.get("agent_actions_enabled", True)),
-            memory_context=memory_context,
-            live_screen_context=live_screen_context,
+            memory_context="",
+            live_screen_context="",
             suppress_visual_notes=(not allow_visual_notes),
             system_telemetry_summary=system_telemetry_snapshot,
         )
 
+        # Keep system message completely static across turns; place compact sanitized desktop/session
+        # context in the user turn so the model never treats IDE titles or memory logs as system injection.
+        context_notes: List[str] = []
+        if live_screen_context:
+            clean_live_lines = [
+                line_text.strip()
+                for line_text in live_screen_context.splitlines()
+                if line_text.strip()
+                and not JarvisMemoryService.is_polluted_memory_text(line_text)
+                and "Diff:" not in line_text
+            ]
+            if clean_live_lines:
+                context_notes.append("Desktop Context: " + " | ".join(clean_live_lines[:3]))
+        if memory_context:
+            clean_memory_lines = [
+                line_text.strip()
+                for line_text in memory_context.splitlines()
+                if line_text.strip()
+                and not JarvisMemoryService.is_polluted_memory_text(line_text)
+                and "Screen Monitor" not in line_text
+            ]
+            if clean_memory_lines:
+                context_notes.append("Session Notes:\n" + "\n".join(clean_memory_lines[-4:]))
+
+        request_user_text = user_prompt
+        if context_notes:
+            request_user_text = f"{user_prompt}\n\n[Context]\n" + "\n".join(context_notes)
+
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         for past_message in self._history[-6:]:
+            past_content = past_message.get("content", "")
+            if isinstance(past_content, str) and JarvisMemoryService.is_polluted_memory_text(past_content):
+                continue
             messages.append(past_message)
 
         user_content: Any
         if jpeg_b64:
             user_content = [
-                {"type": "text", "text": user_prompt},
+                {"type": "text", "text": request_user_text},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{jpeg_b64}"}},
             ]
             if lasso_crop_b64:
@@ -2145,7 +2200,7 @@ class VisionBrainService(QObject):
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{lasso_crop_b64}"}}
                 )
         else:
-            user_content = user_prompt
+            user_content = request_user_text
         messages.append({"role": "user", "content": user_content})
 
         model_id = str(self._settings_store.get("chat_model", "deepseek-ai/DeepSeek-V4.1-Flash"))
@@ -2241,7 +2296,35 @@ class VisionBrainService(QObject):
                 "request_admin_permission",
                 "scroll",
             }
+            agent_actions_enabled = bool(self._settings_store.get("agent_actions_enabled", True))
             has_agent_command = any(cmd_item.kind in agent_command_kinds for cmd_item in parsed_response.commands)
+            if agent_actions_enabled and not has_agent_command:
+                fallback_agent_cmds = DesktopAgentService.coalesce_agent_commands(
+                    DesktopAgentService.detect_direct_user_agent_commands(user_prompt)
+                )
+                if fallback_agent_cmds:
+                    for fallback_cmd in fallback_agent_cmds:
+                        parsed_response.commands.append(fallback_cmd)
+                        self.drawingCommandReady.emit(fallback_cmd)
+                    has_agent_command = True
+
+            if not parsed_response.spoken_text:
+                first_agent_cmd = next(
+                    (cmd_item for cmd_item in parsed_response.commands if cmd_item.kind in agent_command_kinds),
+                    None,
+                )
+                if first_agent_cmd is not None:
+                    synthesized_speech = (
+                        DesktopAgentService.describe_step_for_speech(first_agent_cmd)
+                        or "Done."
+                    )
+                else:
+                    synthesized_speech = "I'm ready. Go ahead and tell me what you'd like to do."
+                parsed_response.spoken_text = synthesized_speech
+                parsed_response.sentences = [synthesized_speech]
+                self.partialTextUpdated.emit(synthesized_speech)
+                self.sentenceReady.emit(synthesized_speech)
+
             has_underline = any(cmd_item.kind == "underline" for cmd_item in parsed_response.commands)
             existing_paper_count = sum(1 for cmd_item in parsed_response.commands if cmd_item.kind == "paper")
             underline_labels = [
@@ -3069,6 +3152,45 @@ class DesktopAgentService:
         "drive": "https://drive.google.com",
         "claude": "https://claude.ai",
         "notion": "https://www.notion.so",
+        "twitter": "https://x.com",
+        "x": "https://x.com",
+        "x.com": "https://x.com",
+        "twitter.com": "https://x.com",
+        "reddit": "https://www.reddit.com",
+        "linkedin": "https://www.linkedin.com",
+        "instagram": "https://www.instagram.com",
+        "facebook": "https://www.facebook.com",
+        "whatsapp": "https://web.whatsapp.com",
+        "spotify": "https://open.spotify.com",
+        "netflix": "https://www.netflix.com",
+        "perplexity": "https://www.perplexity.ai",
+        "wikipedia": "https://en.wikipedia.org",
+        "amazon": "https://www.amazon.com",
+        "flipkart": "https://www.flipkart.com",
+        "leetcode": "https://leetcode.com",
+        "stackoverflow": "https://stackoverflow.com",
+    }
+
+    _DEICTIC_SCREEN_REFERENCES = {
+        "him",
+        "her",
+        "them",
+        "this",
+        "that",
+        "it",
+        "he",
+        "she",
+        "they",
+        "this guy",
+        "this person",
+        "this man",
+        "this woman",
+        "this actor",
+        "this topic",
+        "this post",
+        "this tweet",
+        "this page",
+        "this article",
     }
 
     SAFE_APP_LAUNCHERS: Dict[str, List[str]] = {
@@ -4294,8 +4416,23 @@ class DesktopAgentService:
             cleaned,
             flags=re.IGNORECASE,
         ).strip()
+        lead_in_pattern = re.compile(
+            r"^(?:hey\s+jarvis|jarvis|okay|ok|all\s+right|alright|please|can\s+you|could\s+you|would\s+you|i\s+want\s+to|i\s+would\s+like\s+to|let['’]?s|go\s+ahead\s+and|to)\b\s*[,:\-]?\s*",
+            flags=re.IGNORECASE,
+        )
+        while cleaned:
+            stripped_lead = lead_in_pattern.sub("", cleaned, count=1).strip()
+            if stripped_lead == cleaned:
+                break
+            cleaned = stripped_lead
         cleaned = re.sub(
-            r"\s+(?:in|on)\s+(?:another|a\s+new|new|second)\s+tab$",
+            r"\s+(?:in|on)\s+(?:one|a|the\s+first|another|a\s+new|new|second|next)\s+tab(?:\s+(?:in|on)\s+(?:chrome|google\s+chrome|edge|firefox|browser))?$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(
+            r"\s+(?:in|on)\s+(?:chrome|google\s+chrome|edge|firefox|browser)$",
             "",
             cleaned,
             flags=re.IGNORECASE,
@@ -4390,16 +4527,21 @@ class DesktopAgentService:
                 )
             ]
 
+        alias_alternation = "|".join(
+            re.escape(alias_key)
+            for alias_key in sorted(cls.KNOWN_URL_ALIASES.keys(), key=len, reverse=True)
+        )
         url_match = re.match(
-            r"^(?:please\s+)?(?:open|go to|launch|visit)\s+([a-z0-9.\-]+(?:\.[a-z]{2,}|chatgpt|youtube|github|gmail|claude|notion))(?:\s+for\s+me)?$",
+            rf"^(?:please\s+)?(?:open|go to|launch|visit)\s+(?:(?:the|my)\s+)?([a-z0-9.\-]+\.[a-z]{{2,}}|{alias_alternation})(?:\s+for\s+me)?$",
             lowered,
         )
         if url_match:
-            target = url_match.group(1)
+            target = url_match.group(1).strip().lower()
+            resolved_url = cls.KNOWN_URL_ALIASES.get(target) or cls.normalize_target_url(target) or target
             return [
                 jarvis_response_parser.DrawingCommand(
                     kind="open_url",
-                    body=target,
+                    body=resolved_url,
                     label=target,
                 )
             ]
@@ -4410,6 +4552,13 @@ class DesktopAgentService:
         )
         if search_match:
             query_text = cleaned[search_match.start(1) :].strip(" .!?")
+            deictic_check = re.sub(
+                r"\s+(?:on\s+(?:google|chrome|the\s+web)|in\s+chrome)$",
+                "",
+                query_text.lower(),
+            ).strip()
+            if deictic_check in cls._DEICTIC_SCREEN_REFERENCES:
+                return []
             if query_text:
                 direct_url = cls.normalize_target_url(query_text)
                 if direct_url is not None and (
@@ -4467,6 +4616,8 @@ class DesktopAgentService:
         )
         if tab_open_match and (allow_tab_search or "stock" in lowered or "price" in lowered):
             target_payload = cleaned[tab_open_match.start(1) :].strip(" .!?")
+            if target_payload.lower() in cls._DEICTIC_SCREEN_REFERENCES:
+                return []
             if target_payload:
                 direct_url = cls.normalize_target_url(target_payload)
                 if direct_url is not None and (
@@ -4518,6 +4669,41 @@ class DesktopAgentService:
             has_tab_cue = bool(
                 re.search(r"\b(?:another|new|second|next)\s+tab\b", clause_lower)
             )
+            starts_compound_app = bool(
+                re.match(
+                    r"^(?:please\s+)?(?:open|launch|start|go\s+to)\s+(?:my\s+)?(?:windows\s+)?(?:settings|chrome|google\s+chrome|edge|firefox|browser|web\s+browser|notepad|terminal|powershell|cmd|vs\s?code|vscode)\s+(?:and|then)\b",
+                    primary_clause,
+                    flags=re.IGNORECASE,
+                )
+            )
+            subclauses = [
+                sub_item.strip()
+                for sub_item in re.split(
+                    r"\s+\band\b\s+(?=(?:(?:in|on)\s+)?(?:(?:another|a\s+new|new|second|next)\s+tab\b|(?:please\s+)?(?:open|launch|start|go\s+to|visit|search|google|press)\b))",
+                    primary_clause,
+                    flags=re.IGNORECASE,
+                )
+                if sub_item and sub_item.strip()
+            ]
+            if len(subclauses) >= 2 and not starts_compound_app:
+                for subclause in subclauses:
+                    sub_has_tab_cue = bool(
+                        re.search(r"\b(?:another|new|second|next)\s+tab\b", subclause.lower())
+                    )
+                    sub_cmds = cls._detect_single_clause_commands(
+                        subclause,
+                        allow_tab_search=browser_context_seen or sub_has_tab_cue,
+                    )
+                    if sub_cmds:
+                        collected_commands.extend(sub_cmds)
+                        if any(
+                            cmd_item.kind in ("open_browser", "open_url", "search_web")
+                            or (cmd_item.kind == "open_app" and (cmd_item.body or "").strip().lower() in ("chrome", "edge", "firefox", "browser"))
+                            for cmd_item in sub_cmds
+                        ):
+                            browser_context_seen = True
+                continue
+
             direct_cmds = cls._detect_single_clause_commands(
                 primary_clause,
                 allow_tab_search=browser_context_seen or has_tab_cue,
@@ -4532,15 +4718,6 @@ class DesktopAgentService:
                     browser_context_seen = True
                 continue
 
-            subclauses = [
-                sub_item.strip()
-                for sub_item in re.split(
-                    r"\s+\band\b\s+(?=(?:(?:in|on)\s+)?(?:(?:another|a\s+new|new|second)\s+tab\b|(?:please\s+)?(?:open|launch|start|go\s+to|visit|search|google|press)\b))",
-                    primary_clause,
-                    flags=re.IGNORECASE,
-                )
-                if sub_item and sub_item.strip()
-            ]
             if len(subclauses) >= 2:
                 for subclause in subclauses:
                     sub_has_tab_cue = bool(
@@ -4791,8 +4968,8 @@ class DesktopAgentService:
         ).strip(" ?!.")
         return cleaned or (user_prompt or "").strip()
 
-    @staticmethod
-    def _extract_side_by_side_targets(user_prompt: str) -> Tuple[str, str]:
+    @classmethod
+    def _extract_side_by_side_targets(cls, user_prompt: str) -> Tuple[str, str]:
         """Extracts optional left/right URLs or topics from a side-by-side arrangement command."""
         cleaned = re.sub(r"\s+", " ", (user_prompt or "").strip())
         if not cleaned:
@@ -4817,21 +4994,6 @@ class DesktopAgentService:
             candidate_clause,
             flags=re.IGNORECASE,
         )
-        if not pair_match:
-            return ("", "")
-
-        left_clean = re.sub(
-            r"^(?:the\s+|both\s+|tabs?\s+(?:for|of)\s+)+|\s+(?:tabs?|windows?|in\s+chrome)$",
-            "",
-            pair_match.group(1).strip(" .,!?\"'"),
-            flags=re.IGNORECASE,
-        ).strip()
-        right_clean = re.sub(
-            r"^(?:the\s+|both\s+|tabs?\s+(?:for|of)\s+)+|\s+(?:tabs?|windows?|in\s+chrome)$",
-            "",
-            pair_match.group(2).strip(" .,!?\"'"),
-            flags=re.IGNORECASE,
-        ).strip()
         generic_placeholders = {
             "",
             "those",
@@ -4841,10 +5003,16 @@ class DesktopAgentService:
             "both",
             "two",
             "2",
+            "those 2",
+            "these 2",
+            "those two",
+            "these two",
             "tabs",
             "tab",
             "those tabs",
             "these tabs",
+            "those 2 tabs",
+            "these 2 tabs",
             "the tabs",
             "my tabs",
             "chrome tabs",
@@ -4857,9 +5025,47 @@ class DesktopAgentService:
             "the windows",
             "screens",
         }
-        if left_clean.lower() in generic_placeholders or right_clean.lower() in generic_placeholders:
-            return ("", "")
-        return (left_clean, right_clean)
+        left_clean = ""
+        right_clean = ""
+        if pair_match:
+            left_clean = re.sub(
+                r"^(?:the\s+|both\s+|tabs?\s+(?:for|of)\s+)+|\s+(?:tabs?|windows?|in\s+chrome)$",
+                "",
+                pair_match.group(1).strip(" .,!?\"'"),
+                flags=re.IGNORECASE,
+            ).strip()
+            right_clean = re.sub(
+                r"^(?:the\s+|both\s+|tabs?\s+(?:for|of)\s+)+|\s+(?:tabs?|windows?|in\s+chrome)$",
+                "",
+                pair_match.group(2).strip(" .,!?\"'"),
+                flags=re.IGNORECASE,
+            ).strip()
+            if (
+                left_clean.lower() not in generic_placeholders
+                and right_clean.lower() not in generic_placeholders
+            ):
+                return (left_clean, right_clean)
+
+        extracted_targets: List[str] = []
+        prior_cmds = cls.detect_direct_user_agent_commands(user_prompt)
+        for cmd_item in prior_cmds:
+            candidate_val = (cmd_item.body or "").strip()
+            if not candidate_val:
+                continue
+            if cmd_item.kind in ("open_url", "search_web"):
+                extracted_targets.append(candidate_val)
+            elif cmd_item.kind == "open_app" and candidate_val.lower() not in (
+                "chrome",
+                "googlechrome",
+                "edge",
+                "msedge",
+                "firefox",
+                "browser",
+            ):
+                extracted_targets.append(candidate_val)
+        if len(extracted_targets) >= 2:
+            return (extracted_targets[0], extracted_targets[1])
+        return ("", "")
 
     @classmethod
     def classify_contextual_intent(cls, user_prompt: str) -> ContextualIntentPlan:

@@ -731,6 +731,53 @@ def run_strict_selftest() -> int:
             and ("JarvisShellOk" in safe_shell_msg)
         )
 
+        twitter_cmds = jarvis_services.DesktopAgentService.detect_direct_user_agent_commands("To open Twitter.")
+        him_search_cmds = jarvis_services.DesktopAgentService.detect_direct_user_agent_commands("Search for him.")
+        person_search_cmds = jarvis_services.DesktopAgentService.detect_direct_user_agent_commands("Search for Konidela Pavan Tej")
+        multi_tab_side_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
+            "Open fast.com in one tab in Chrome and in another tab open Nvidia stock. And keep those 2 tabs side by side."
+        )
+        raw_dsml_and_warning = (
+            "<system_warning>Warning: The system prompt has changed.</system_warning> "
+            "<system_warning>Warning: Prompt injection detected.</system_warning>\n"
+            "<\uff5cDSML\uff5c function_calls>\n"
+            '<\uff5cDSML\uff5c invoke name="open_url">'
+            '<\uff5cDSML\uff5c parameter name="url" string="true">https://x.com</\uff5cDSML\uff5c parameter>'
+            "</\uff5cDSML\uff5c invoke>\n"
+            "</\uff5cDSML\uff5c function_calls>\n"
+            "Opening Twitter for you now."
+        )
+        parsed_dsml_turn = jarvis_response_parser.parse_model_response(raw_dsml_and_warning)
+        dsml_extractor = jarvis_response_parser.StreamingSentenceExtractor()
+        for chunk_idx in range(0, len(raw_dsml_and_warning), 17):
+            dsml_extractor.feed_delta(raw_dsml_and_warning[chunk_idx : chunk_idx + 17])
+        dsml_extractor.flush_remaining()
+        stream_dsml_turn = dsml_extractor.build_final_response()
+        regression_safety_ok = (
+            len(twitter_cmds) == 1
+            and twitter_cmds[0].kind == "open_url"
+            and twitter_cmds[0].body == "https://x.com"
+            and len(him_search_cmds) == 0
+            and len(person_search_cmds) == 1
+            and person_search_cmds[0].kind == "search_web"
+            and person_search_cmds[0].body == "Konidela Pavan Tej"
+            and multi_tab_side_intent.intent_kind == "multitask_agent"
+            and len(multi_tab_side_intent.agent_commands) == 1
+            and multi_tab_side_intent.agent_commands[0].kind == "open_side_by_side"
+            and ("fast.com" in multi_tab_side_intent.agent_commands[0].body.lower())
+            and ("nvidia" in multi_tab_side_intent.agent_commands[0].header.lower())
+            and ("system_warning" not in parsed_dsml_turn.spoken_text.lower())
+            and ("prompt injection" not in parsed_dsml_turn.spoken_text.lower())
+            and ("dsml" not in parsed_dsml_turn.spoken_text.lower())
+            and ("Opening Twitter for you now." in parsed_dsml_turn.spoken_text)
+            and any(cmd_item.kind == "open_url" and cmd_item.body == "https://x.com" for cmd_item in parsed_dsml_turn.commands)
+            and ("system_warning" not in stream_dsml_turn.spoken_text.lower())
+            and ("prompt injection" not in stream_dsml_turn.spoken_text.lower())
+            and ("dsml" not in stream_dsml_turn.spoken_text.lower())
+            and ("Opening Twitter for you now." in stream_dsml_turn.spoken_text)
+            and any(cmd_item.kind == "open_url" and cmd_item.body == "https://x.com" for cmd_item in stream_dsml_turn.commands)
+        )
+
         parser_ok = (
             "internal reasoning hidden" not in parsed_turn.spoken_text
             and len(collected_commands) >= 4
@@ -751,6 +798,7 @@ def run_strict_selftest() -> int:
             and pdf_margin_snap_ok
             and labeled_point_norm_ok
             and universal_agent_ok
+            and regression_safety_ok
         )
         suite4_ok = (
             (main_mean_ms < 10.0)
@@ -772,7 +820,7 @@ def run_strict_selftest() -> int:
                 f"memory_ok={memory_ok}, diagram_ok={diagram_notes_ok}, "
                 f"intent_ok={intent_router_ok}, precise_ok={precise_norm_ok}, "
                 f"pdf_margin_ok={pdf_margin_snap_ok}, pt_norm_ok={labeled_point_norm_ok}, "
-                f"univ_agent_ok={universal_agent_ok}, "
+                f"univ_agent_ok={universal_agent_ok}, regr_safety_ok={regression_safety_ok}, "
                 f"single_char={single_char_violations[:8]}"
             ),
         )

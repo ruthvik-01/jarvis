@@ -1623,42 +1623,17 @@ class OverlayCanvasWindow(QWidget):
         ):
             return None
 
-        if drawing_mode in ("precise_lines", "lines_and_card"):
-            if command.kind == "paper":
-                return command
-            if command.kind == "point":
-                return jarvis_response_parser.DrawingCommand(
-                    kind="point",
-                    x=command.x,
+        if command.kind == "paper":
+            return command
+        if command.kind == "point":
+            cleaned_label = (command.label or "").strip()
+            if cleaned_label:
+                converted = jarvis_response_parser.DrawingCommand(
+                    kind="underline",
+                    x=max(24.0, command.x - 90.0),
                     y=command.y,
-                    label="",
-                    tone=command.tone,
-                )
-            if command.kind in ("box", "highlight"):
-                baseline_y = command.y + min(command.height, 28.0) + 2.0
-                converted = jarvis_response_parser.DrawingCommand(
-                    kind="underline",
-                    x=command.x,
-                    y=baseline_y,
-                    width=max(36.0, min(command.width, 460.0)),
-                    label="",
-                    tone=command.tone,
-                )
-                try:
-                    import jarvis_services
-
-                    converted = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(converted)
-                except Exception:
-                    pass
-                return converted
-            if command.kind == "ring":
-                span_radius = max(24.0, min(command.radius, 120.0))
-                converted = jarvis_response_parser.DrawingCommand(
-                    kind="underline",
-                    x=max(12.0, command.x - span_radius),
-                    y=command.y + span_radius * 0.55,
-                    width=max(48.0, min(span_radius * 2.0, 260.0)),
-                    label=command.label,
+                    width=220.0,
+                    label=cleaned_label,
                     tone=command.tone,
                     sentence_index=command.sentence_index,
                 )
@@ -1669,16 +1644,60 @@ class OverlayCanvasWindow(QWidget):
                 except Exception:
                     pass
                 return converted
-            if command.kind == "underline":
-                return jarvis_response_parser.DrawingCommand(
-                    kind="underline",
-                    x=command.x,
-                    y=command.y,
-                    width=command.width,
-                    label=command.label,
-                    tone=command.tone,
-                    sentence_index=command.sentence_index,
-                )
+            return jarvis_response_parser.DrawingCommand(
+                kind="point",
+                x=command.x,
+                y=command.y,
+                label="",
+                tone=command.tone,
+                sentence_index=command.sentence_index,
+            )
+        if command.kind in ("box", "highlight"):
+            baseline_y = command.y + min(command.height, 28.0) + 2.0
+            converted = jarvis_response_parser.DrawingCommand(
+                kind="underline",
+                x=command.x,
+                y=baseline_y,
+                width=max(36.0, min(command.width, 460.0)),
+                label=(command.label or "").strip(),
+                tone=command.tone,
+                sentence_index=command.sentence_index,
+            )
+            try:
+                import jarvis_services
+
+                converted = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(converted)
+            except Exception:
+                pass
+            return converted
+        if command.kind == "ring":
+            span_radius = max(24.0, min(command.radius, 120.0))
+            converted = jarvis_response_parser.DrawingCommand(
+                kind="underline",
+                x=max(12.0, command.x - span_radius),
+                y=command.y + span_radius * 0.55,
+                width=max(48.0, min(span_radius * 2.0, 260.0)),
+                label=command.label,
+                tone=command.tone,
+                sentence_index=command.sentence_index,
+            )
+            try:
+                import jarvis_services
+
+                converted = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(converted)
+            except Exception:
+                pass
+            return converted
+        if command.kind == "underline":
+            return jarvis_response_parser.DrawingCommand(
+                kind="underline",
+                x=command.x,
+                y=command.y,
+                width=command.width,
+                label=command.label,
+                tone=command.tone,
+                sentence_index=command.sentence_index,
+            )
 
         return command
 

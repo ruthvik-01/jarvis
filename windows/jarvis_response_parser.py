@@ -50,7 +50,8 @@ _POINT_TAG_PATTERN = re.compile(
 _COMMAND_NAMES_PATTERN = (
     r"(underline|ring|point|box|frame|paper|highlight|scroll|"
     r"open_browser|open_url|search_web|open_app|press_keys|type_text|"
-    r"open_side_by_side|request_admin_permission)"
+    r"open_side_by_side|window_action|set_clipboard|write_file|system_control|"
+    r"run_shell_read|request_admin_permission)"
 )
 
 _CALL_LINE_PATTERN = re.compile(
@@ -516,31 +517,18 @@ def build_vision_system_prompt(
                 f"Optionally emit up to 2 point(x, y, \"\") commands (x, y in 0..{screen_width} x 0..{screen_height}) on their own lines right before the sentence referencing them.",
             ]
         )
-    elif normalized_mode in ("precise_lines", "lines_and_card"):
+    elif normalized_mode in ("precise_lines", "lines_and_card", "full_sketch"):
         prompt_sections.extend(
             [
-                "AGGRESSIVE MULTI-NOTE VISUALIZATION: Whenever explaining concepts, code, equations, or ChatGPT answers, emit 2 to 3 visual topic-flow `paper(...)` diagram cards placed in empty margin corners (`top-left (24,92)`, `top-right (1180,92)`, `bottom-left (24,380)`) so the user can grasp your entire spoken explanation visually at a glance!",
+                "AGGRESSIVE MULTI-NOTE VISUALIZATION: Whenever explaining concepts, code, equations, PDFs, or ChatGPT answers, emit 2 to 3 visual topic-flow `paper(...)` diagram cards placed in empty margin corners (`top-left (24,92)`, `top-right (1180,92)`, `bottom-left (24,380)`) so the user can grasp your entire spoken explanation visually at a glance!",
                 "Each `paper(...)` card MUST contain concise 1 to 4 word diagram flow nodes separated by `->`, `|`, and `section:`/`doc:` dividers — NEVER prose sentences or paragraphs:",
                 "Card 1 (before intro/sentence 1): paper(24, 92, 310, 270, \"Topic Map\", \"Part 1\", \"Node A -> Node B | section:Mechanism | doc:Core Idea\")",
                 "Card 2 (before middle section): paper(1180, 92, 310, 270, \"Breakdown\", \"Part 2\", \"Step 1 -> Step 2 | doc:Outcome\")",
                 "Card 3 (optional for 4+ points): paper(24, 382, 310, 250, \"Takeaway\", \"Summary\", \"Benefit -> Impact | doc:Conclusion\")",
-                f"Also emit 2 to 5 crisp horizontal underlines, each right BEFORE the spoken sentence discussing that line (y = text baseline + 4px, x = left edge of phrase, width = exact phrase pixel width in 0..{screen_width} x 0..{screen_height}, 4th arg = exact 2 to 6 words on screen):",
+                f"Also emit 2 to 5 crisp horizontal underlines, each right BEFORE the spoken sentence discussing that line (y = text baseline + 4px, x = exact left edge of the text word on the page, width = exact phrase pixel width inside the page text — NEVER into empty margins — in 0..{screen_width} x 0..{screen_height}, 4th arg = exact 2 to 6 words on screen):",
                 "underline(420, 310, 260, \"exact phrase on screen\")",
-                "Optionally glide the cursor to a key term or button with:",
-                "point(420, 310, \"\")",
-                "STRICTLY AVOID: Do NOT emit box(...), frame(...), highlight(...), or ring(...). Never draw giant boxes around whole paragraphs.",
-            ]
-        )
-    else:
-        prompt_sections.extend(
-            [
-                "AGGRESSIVE MULTI-NOTE VISUALIZATION: Emit 2 to 3 `paper(...)` visual topic flow diagram cards in empty screen margins AND 2 to 5 `underline(...)` commands placed directly BEFORE each matching spoken sentence so the user sees the entire answer visualized!",
-                f"underline(x, y, width, \"exact screen words\")  (clean underline directly beneath a key heading/phrase; x, y in 0..{screen_width} x 0..{screen_height})",
-                "paper(24, 92, 310, 270, \"Topic Title\", \"Visual Map\", \"Topic 1 -> Topic 2 | section:Core Mechanism | doc:Input -> Outcome\")",
-                "ring(x, y, radius, \"label\")  (neat circle around a compact icon or term; radius <= 55)",
-                "point(x, y, \"label\")         (glides the Jarvis cursor to (x, y) and points cleanly)",
-                "box(x, y, width, height, \"label\") (small frame around a compact formula or UI button only)",
-                "highlight(x, y, width, height, \"label\") (subtle wash across one short line only)",
+                "Optionally glide the cursor subtly without a label using `point(420, 310, \"\")` — NEVER put text labels inside `point(...)`.",
+                "STRICTLY FORBIDDEN: Do NOT emit `ring(...)`, `box(...)`, `frame(...)`, `highlight(...)`, or labeled `point(x, y, \"label\")` callouts. Always use crisp `underline(...)` strokes + `paper(...)` diagram cards.",
             ]
         )
 
@@ -548,23 +536,27 @@ def build_vision_system_prompt(
         prompt_sections.extend(
             [
                 "",
-                "DESKTOP & BROWSER AGENT COMMANDS:",
-                "NEVER ask the user to perform a desktop action themselves (like opening Settings, checking storage, or manually dragging Chrome tabs side-by-side). Execute it directly with these commands:",
+                "UNIVERSAL DESKTOP & BROWSER AGENT COMMANDS:",
+                "You can execute ANY arbitrary user desktop, app, window, browser, file, clipboard, media, or read-only system request by composing these primitives — even if the user asks for something completely new!",
+                "NEVER ask the user to perform a desktop action themselves (like opening an app, running a command, copying text, tiling windows, or checking settings). Execute it directly with these commands and report exact facts:",
                 "NEVER say 'I will type/search/open it after it loads' or 'you can drag tabs side by side' — Jarvis executes everything automatically!",
-                "For any destructive or admin-level action (deleting files, uninstalling apps, shutting down/restarting, killing processes, editing registry/security settings), NEVER execute destructively — emit `request_admin_permission(\"action title\", \"risk reason\")` first and ask the admin for confirmation.",
-                "Available commands (each on its own line):",
-                "open_side_by_side(\"left site or search\", \"right site or search\")  -> opens two sites/searches side by side in tiled left/right Chrome windows (or use open_side_by_side(\"\", \"\") to split existing Chrome tabs side by side!)",
-                "open_app(\"settings:storage\")  -> opens Windows Storage Settings directly",
-                "open_browser(\"https://www.google.com\")",
-                "open_url(\"https://fast.com\")",
-                "search_web(\"Nvidia stock price\")",
-                "open_app(\"chrome\")",
-                "press_keys(\"ctrl+t\")",
-                "type_text(\"hello\")",
-                "request_admin_permission(\"Delete temporary files\", \"Removes files from disk\")",
-                "Example when user says 'keep those tabs side by side':",
-                "open_side_by_side(\"\", \"\")",
-                "Putting your Chrome windows side by side now.",
+                "For ANY destructive or admin-level action (deleting files, uninstalling apps, shutting down/restarting, killing processes, editing registry/security settings, force-closing unsaved apps), NEVER execute destructively — emit `request_admin_permission(\"action title\", \"risk reason\")` first and wait for admin confirmation.",
+                "Available agent commands (emit one or more, each on its own standalone line BEFORE speaking):",
+                "open_app(\"app name, Start Menu app, system tool like taskmgr/control/snippingtool/devmgmt.msc, or settings:<topic>\")",
+                "open_url(\"https://...\")",
+                "search_web(\"search query\")",
+                "open_side_by_side(\"left window title/app or site/search\", \"right window title/app or site/search\")  -> tiles ANY two open desktop windows or Chrome tabs/sites left & right (or \"\", \"\" to tile existing Chrome tabs)",
+                "window_action(\"focus|minimize|maximize|restore|snap_left|snap_right|close|minimize_all\", \"window title or app name\")",
+                "type_text(\"text to type into focused field\", \"submit\")",
+                "press_keys(\"shortcut like ctrl+c, ctrl+t, alt+tab, win+e\")",
+                "set_clipboard(\"text to copy to clipboard\")",
+                "write_file(\"Desktop/notes.md\", \"file content to save safely under Desktop or Documents\")",
+                "system_control(\"mute|unmute|volume_up|volume_down|play_pause|next_track|prev_track|show_desktop|screenshot\")",
+                "run_shell_read(\"non-destructive PowerShell query (e.g. Get-Process | Sort CPU -Desc | Select -First 5 Name,CPU)\", \"Top CPU processes\")",
+                "request_admin_permission(\"action title\", \"risk explanation\")",
+                "Example when user says 'put VS Code and Edge side by side':",
+                "open_side_by_side(\"Visual Studio Code\", \"Microsoft Edge\")",
+                "Tiling VS Code and Edge side by side now.",
             ]
         )
 
@@ -982,6 +974,28 @@ def parse_command_line(
             label=right_target or left_target or "side_by_side",
             body=left_target,
             header=right_target,
+        )
+
+    if command_name in ("window_action", "write_file", "system_control", "run_shell_read"):
+        primary_arg = _parse_string(arguments[0], "").strip() if arguments else ""
+        if not primary_arg:
+            return None
+        secondary_arg = _parse_string(arguments[1], "").strip() if len(arguments) >= 2 else ""
+        return DrawingCommand(
+            kind=command_name,
+            label=secondary_arg or primary_arg,
+            body=primary_arg,
+            header=secondary_arg,
+        )
+
+    if command_name == "set_clipboard":
+        clipboard_value = _parse_string(arguments[0], "").strip() if arguments else ""
+        if not clipboard_value:
+            return None
+        return DrawingCommand(
+            kind="set_clipboard",
+            label="clipboard",
+            body=clipboard_value,
         )
 
     if command_name in ("open_browser", "open_url", "search_web", "open_app", "press_keys", "type_text"):

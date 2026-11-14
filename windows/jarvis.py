@@ -626,6 +626,111 @@ def run_strict_selftest() -> int:
             )
         )
 
+        from PIL import Image as PilImage, ImageDraw as PilImageDraw
+
+        pdf_shot = PilImage.new("RGB", (1536, 864), (48, 48, 50))
+        pdf_draw = PilImageDraw.Draw(pdf_shot)
+        pdf_draw.rectangle([40, 40, 1050, 820], fill=(252, 252, 252))
+        pdf_draw.line([(1050, 40), (1050, 820)], fill=(80, 80, 80), width=1)
+        for col_cursor in range(120, 380, 7):
+            pdf_draw.rectangle([col_cursor, 302, col_cursor + 2, 314], fill=(20, 20, 22))
+        for col_cursor in range(420, 890, 7):
+            pdf_draw.rectangle([col_cursor, 302, col_cursor + 2, 314], fill=(20, 20, 22))
+
+        prev_logical_img = jarvis_services.ScreenCaptureService._last_raw_logical_image
+        try:
+            jarvis_services.ScreenCaptureService._last_raw_logical_image = pdf_shot
+            jarvis_services.ScreenCaptureService.reset_underline_baselines()
+            margin_cmd = jarvis_response_parser.DrawingCommand(
+                kind="underline",
+                x=1060.0,
+                y=318.0,
+                width=280.0,
+                label="Job Design and Recruitment",
+            )
+            overlap_cmd = jarvis_response_parser.DrawingCommand(
+                kind="underline",
+                x=750.0,
+                y=318.0,
+                width=480.0,
+                label="Recruitment",
+            )
+            margin_snapped = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(margin_cmd)
+            jarvis_services.ScreenCaptureService.reset_underline_baselines()
+            overlap_snapped = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(overlap_cmd)
+            pdf_margin_snap_ok = (
+                margin_snapped.x >= 110.0
+                and (margin_snapped.x + margin_snapped.width) < 1040.0
+                and overlap_snapped.x >= 110.0
+                and (overlap_snapped.x + overlap_snapped.width) < 1040.0
+            )
+        finally:
+            jarvis_services.ScreenCaptureService._last_raw_logical_image = prev_logical_img
+            jarvis_services.ScreenCaptureService.reset_underline_baselines()
+
+        temp_norm_overlay = jarvis_overlay_windows.OverlayCanvasWindow(settings_store)
+        norm_pt = temp_norm_overlay._normalize_command_for_drawing_mode(
+            jarvis_response_parser.DrawingCommand(
+                kind="point",
+                x=300.0,
+                y=320.0,
+                label="Job Design and Recruitment",
+                sentence_index=1,
+            )
+        )
+        norm_ring = temp_norm_overlay._normalize_command_for_drawing_mode(
+            jarvis_response_parser.DrawingCommand(
+                kind="ring",
+                x=200.0,
+                y=260.0,
+                width=90.0,
+                height=90.0,
+                label="Unit I Topic",
+                sentence_index=0,
+            )
+        )
+        temp_norm_overlay.close()
+        labeled_point_norm_ok = (
+            norm_pt is not None
+            and norm_pt.kind == "underline"
+            and norm_pt.label == "Job Design and Recruitment"
+            and norm_pt.sentence_index == 1
+            and norm_ring is not None
+            and norm_ring.kind == "underline"
+            and norm_ring.label == "Unit I Topic"
+            and norm_ring.sentence_index == 0
+        )
+
+        parsed_win_cmd = jarvis_response_parser.parse_command_line('window_action("focus", "Visual Studio Code")')
+        parsed_clip_cmd = jarvis_response_parser.parse_command_line('set_clipboard("Hello Jarvis")')
+        parsed_file_cmd = jarvis_response_parser.parse_command_line('write_file("Desktop/test_note.md", "body text")')
+        parsed_sys_cmd = jarvis_response_parser.parse_command_line('system_control("volume_up")')
+        parsed_shell_cmd = jarvis_response_parser.parse_command_line('run_shell_read("(Get-PSDrive C).Free", "Disk")')
+        blocked_shell_ok, _blocked_shell_msg = jarvis_services.DesktopAgentService.execute_agent_command(
+            jarvis_response_parser.DrawingCommand(kind="run_shell_read", body="Remove-Item C:\\Windows\\test.txt", header="Unsafe")
+        )
+        blocked_path_ok, _blocked_path_msg = jarvis_services.DesktopAgentService.execute_agent_command(
+            jarvis_response_parser.DrawingCommand(kind="write_file", body="C:\\Windows\\bad.bat", header="echo hi")
+        )
+        blocked_ext_ok, _blocked_ext_msg = jarvis_services.DesktopAgentService.execute_agent_command(
+            jarvis_response_parser.DrawingCommand(kind="write_file", body="Desktop/evil.ps1", header="dir")
+        )
+        safe_shell_ok, safe_shell_msg = jarvis_services.DesktopAgentService.execute_agent_command(
+            jarvis_response_parser.DrawingCommand(kind="run_shell_read", body="Write-Output 'JarvisShellOk'", header="SelfCheck")
+        )
+        universal_agent_ok = (
+            parsed_win_cmd is not None and parsed_win_cmd.kind == "window_action" and parsed_win_cmd.body == "focus" and parsed_win_cmd.header == "Visual Studio Code"
+            and parsed_clip_cmd is not None and parsed_clip_cmd.kind == "set_clipboard" and parsed_clip_cmd.body == "Hello Jarvis"
+            and parsed_file_cmd is not None and parsed_file_cmd.kind == "write_file" and parsed_file_cmd.body == "Desktop/test_note.md"
+            and parsed_sys_cmd is not None and parsed_sys_cmd.kind == "system_control" and parsed_sys_cmd.body == "volume_up"
+            and parsed_shell_cmd is not None and parsed_shell_cmd.kind == "run_shell_read" and "Get-PSDrive" in parsed_shell_cmd.body
+            and (not blocked_shell_ok)
+            and (not blocked_path_ok)
+            and (not blocked_ext_ok)
+            and safe_shell_ok
+            and ("JarvisShellOk" in safe_shell_msg)
+        )
+
         parser_ok = (
             "internal reasoning hidden" not in parsed_turn.spoken_text
             and len(collected_commands) >= 4
@@ -643,6 +748,9 @@ def run_strict_selftest() -> int:
             and diagram_notes_ok
             and intent_router_ok
             and precise_norm_ok
+            and pdf_margin_snap_ok
+            and labeled_point_norm_ok
+            and universal_agent_ok
         )
         suite4_ok = (
             (main_mean_ms < 10.0)
@@ -663,6 +771,8 @@ def run_strict_selftest() -> int:
                 f"stacked_snap={stacked_list_snap_ok}, adaptive_scroll={adaptive_scroll_ok}, "
                 f"memory_ok={memory_ok}, diagram_ok={diagram_notes_ok}, "
                 f"intent_ok={intent_router_ok}, precise_ok={precise_norm_ok}, "
+                f"pdf_margin_ok={pdf_margin_snap_ok}, pt_norm_ok={labeled_point_norm_ok}, "
+                f"univ_agent_ok={universal_agent_ok}, "
                 f"single_char={single_char_violations[:8]}"
             ),
         )

@@ -34,6 +34,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import urllib.parse
 from urllib.parse import quote, quote_plus, urlparse
 
+try:
+    import winreg
+except Exception:
+    winreg = None  # type: ignore
+
 import mss
 import subprocess
 import wave
@@ -571,12 +576,59 @@ class ScreenCaptureService:
 
     _last_raw_logical_image: Optional[Image.Image] = None
     _last_lasso_crop_b64: str = ""
+    _last_lasso_bbox: Optional[Tuple[int, int, int, int]] = None
     _used_underline_regions: List[Tuple[float, float, float]] = []
 
     @classmethod
     def reset_underline_baselines(cls) -> None:
         """Clear tracked per-turn underline baselines when starting a new turn or screenshot."""
         cls._used_underline_regions = []
+        cls._last_lasso_bbox = None
+
+    @classmethod
+    def _compute_glyph_column_mask(cls, band_rows_slice: np.ndarray) -> np.ndarray:
+        """Return a boolean mask over columns that contain actual multi-edge text glyphs rather than flat margins."""
+        num_cols = int(band_rows_slice.shape[1]) if band_rows_slice.ndim == 2 else 0
+        if num_cols < 4:
+            return np.zeros((max(0, num_cols),), dtype=bool)
+        row_count = int(band_rows_slice.shape[0])
+        horiz_diff_1 = np.abs(np.diff(band_rows_slice, axis=1)) > 14.0
+        horiz_edges = np.zeros((row_count, num_cols), dtype=bool)
+        horiz_edges[:, :-1] |= horiz_diff_1
+        horiz_edges[:, 1:] |= horiz_diff_1
+        if num_cols >= 3:
+            horiz_diff_2 = np.abs(band_rows_slice[:, 2:] - band_rows_slice[:, :-2]) > 20.0
+            horiz_edges[:, :-2] |= horiz_diff_2
+            horiz_edges[:, 2:] |= horiz_diff_2
+        edge_rows_per_col = np.sum(horiz_edges, axis=0)
+        raw_edge_cols = edge_rows_per_col >= 2
+
+        # Count neighboring edge columns in [col_idx - 10, col_idx + 10] using prefix sums to reject isolated 1px borders.
+        prefix_edges = np.concatenate(([0], np.cumsum(raw_edge_cols.astype(np.int32))))
+        col_indices = np.arange(num_cols, dtype=np.int32)
+        left_bounds = np.maximum(0, col_indices - 10)
+        right_bounds = np.minimum(num_cols, col_indices + 11)
+        neighbor_edge_counts = prefix_edges[right_bounds] - prefix_edges[left_bounds]
+
+        # Keep columns within +/-2 px of an edge inside a multi-edge glyph cluster and non-flat 2D local texture.
+        near_edge = raw_edge_cols.copy()
+        for shift_px in (1, 2):
+            near_edge[shift_px:] |= raw_edge_cols[:-shift_px]
+            near_edge[:-shift_px] |= raw_edge_cols[shift_px:]
+
+        band_col_mean = np.mean(band_rows_slice, axis=0)
+        band_col_sq_mean = np.mean(band_rows_slice * band_rows_slice, axis=0)
+        prefix_sum = np.concatenate(([0.0], np.cumsum(band_col_mean)))
+        prefix_sq = np.concatenate(([0.0], np.cumsum(band_col_sq_mean)))
+        std_left = np.maximum(0, col_indices - 8)
+        std_right = np.minimum(num_cols, col_indices + 9)
+        window_counts = np.maximum(1.0, (std_right - std_left).astype(np.float64))
+        local_mean = (prefix_sum[std_right] - prefix_sum[std_left]) / window_counts
+        local_sq_mean = (prefix_sq[std_right] - prefix_sq[std_left]) / window_counts
+        local_variance = np.maximum(0.0, local_sq_mean - (local_mean * local_mean))
+        local_std = np.sqrt(local_variance)
+
+        return near_edge & (neighbor_edge_counts >= 4) & (local_std >= 10.0)
 
     @classmethod
     def get_last_lasso_crop_b64(cls) -> str:
@@ -650,7 +702,16 @@ class ScreenCaptureService:
 
         annotated_shot = _paint_coordinate_ruler_on_screenshot(logical_shot)
 
+        cls._last_lasso_bbox = None
         if highlight_points and len(highlight_points) >= 2:
+            lasso_xs = [float(pt_x) for pt_x, _pt_y in highlight_points]
+            lasso_ys = [float(pt_y) for _pt_x, pt_y in highlight_points]
+            cls._last_lasso_bbox = (
+                max(0, int(round(min(lasso_xs)))),
+                max(0, int(round(min(lasso_ys)))),
+                min(int(logical_width), int(round(max(lasso_xs)))),
+                min(int(logical_height), int(round(max(lasso_ys)))),
+            )
             annotated_shot = _composite_highlight_stroke(
                 screenshot=annotated_shot,
                 highlight_points=highlight_points,
@@ -703,7 +764,10 @@ class ScreenCaptureService:
         Detect horizontal text bands in a grayscale strip and recursively split any merged
         multi-line band taller than 24px at its internal minimum-ink valley.
         """
-        pixel_deltas = np.abs(strip_gray - bg_luminance) > 18.0
+        if strip_gray.shape[1] >= 2:
+            pixel_deltas = np.abs(np.diff(strip_gray, axis=1)) > 15.0
+        else:
+            pixel_deltas = np.abs(strip_gray - bg_luminance) > 18.0
         row_counts = np.sum(pixel_deltas, axis=1).astype(np.float32)
         active_rows = row_counts >= float(max(6, min_active_pixels))
         if not np.any(active_rows):
@@ -771,12 +835,35 @@ class ScreenCaptureService:
             req_width = max(24.0, float(command.width))
             req_left_px = max(0, int(round(command.x)))
             req_right_px = min(img_width, int(round(command.x + req_width)))
-            scan_left_px = max(0, req_left_px - 32)
+            center_y_px = int(round(command.y))
+
+            lasso_active = False
+            lasso_x0, lasso_y0, lasso_x1, lasso_y1 = 0, 0, img_width, img_height
+            if cls._last_lasso_bbox is not None and command.kind == "underline":
+                lasso_x0, lasso_y0, lasso_x1, lasso_y1 = cls._last_lasso_bbox
+                if (lasso_x1 - lasso_x0) >= 60 and (lasso_y1 - lasso_y0) >= 24:
+                    lasso_active = True
+                    padded_left = max(0, lasso_x0 - 16)
+                    padded_right = min(img_width, lasso_x1 + 16)
+                    req_left_px = min(max(req_left_px, padded_left), max(padded_left, padded_right - 36))
+                    req_right_px = min(padded_right, max(req_left_px + 24, req_right_px))
+                    center_y_px = min(
+                        max(center_y_px, max(0, lasso_y0 - 16)),
+                        min(img_height - 1, lasso_y1 + 20),
+                    )
+                    req_width = max(24.0, float(req_right_px - req_left_px))
+
+            scan_left_px = max(0, req_left_px - 160)
             right_expand_cap = int(round(min(96.0, req_width * 0.40)))
             scan_right_px = min(img_width, req_right_px + right_expand_cap)
-            center_y_px = int(round(command.y))
+            if lasso_active:
+                scan_left_px = max(max(0, lasso_x0 - 24), scan_left_px)
+                scan_right_px = min(min(img_width, lasso_x1 + 24), max(scan_left_px + 24, scan_right_px))
             if (scan_right_px - scan_left_px) < 16:
                 return command
+
+            rescue_left_px = max(0, lasso_x0 - 20) if lasso_active else 24
+            rescue_right_px = min(img_width, lasso_x1 + 20) if lasso_active else max(48, img_width - 24)
 
             def _is_region_already_underlined(cand_y: float, x_left: float, x_right: float) -> bool:
                 for used_y, used_left, used_right in cls._used_underline_regions:
@@ -787,15 +874,20 @@ class ScreenCaptureService:
                 return False
 
             def _find_snapped_band(
+                search_left_px: int,
+                search_right_px: int,
                 search_margin_px: int,
                 skip_used: bool,
-            ) -> Optional[Tuple[int, float, np.ndarray, float]]:
+                require_glyphs: bool,
+            ) -> Optional[Tuple[int, float, np.ndarray, float, int]]:
+                if (search_right_px - search_left_px) < 16:
+                    return None
                 top_px = max(0, center_y_px - search_margin_px)
                 bottom_px = min(img_height, center_y_px + search_margin_px)
                 if (bottom_px - top_px) < 10:
                     return None
                 strip_gray = np.asarray(
-                    source_image.crop((scan_left_px, top_px, scan_right_px, bottom_px)).convert("L"),
+                    source_image.crop((search_left_px, top_px, search_right_px, bottom_px)).convert("L"),
                     dtype=np.float32,
                 )
                 bg_luminance = float(np.median(strip_gray))
@@ -807,44 +899,60 @@ class ScreenCaptureService:
                 if not text_bands:
                     return None
 
-                eligible_bands: List[Tuple[Tuple[int, int], float]] = []
+                eligible_bands: List[Tuple[Tuple[int, int], float, np.ndarray]] = []
                 for cand_band in text_bands:
                     cand_y = float(top_px + cand_band[1] + 4.0)
-                    if abs(cand_y - command.y) > float(search_margin_px):
+                    if abs(cand_y - float(center_y_px)) > float(search_margin_px):
                         continue
+                    band_slice = strip_gray[cand_band[0] : cand_band[1] + 1, :]
+                    if require_glyphs:
+                        band_glyph_mask = cls._compute_glyph_column_mask(band_slice)
+                        if int(np.sum(band_glyph_mask)) < 6:
+                            continue
                     if skip_used and _is_region_already_underlined(cand_y, float(req_left_px), float(req_right_px)):
                         continue
-                    eligible_bands.append((cand_band, cand_y))
+                    eligible_bands.append((cand_band, cand_y, band_slice))
 
                 if not eligible_bands:
                     return None
 
-                chosen_band, chosen_y = min(
+                chosen_band, chosen_y, chosen_slice = min(
                     eligible_bands,
-                    key=lambda item: abs(item[1] - command.y),
+                    key=lambda item: abs(item[1] - float(center_y_px)),
                 )
                 return (
                     chosen_band[0],
                     chosen_y,
-                    strip_gray[chosen_band[0] : chosen_band[1] + 1, :],
+                    chosen_slice,
                     bg_luminance,
+                    search_left_px,
                 )
 
             band_hit = (
-                _find_snapped_band(20, skip_used=True)
-                or _find_snapped_band(44, skip_used=True)
-                or _find_snapped_band(20, skip_used=False)
-                or _find_snapped_band(44, skip_used=False)
+                _find_snapped_band(scan_left_px, scan_right_px, 20, skip_used=True, require_glyphs=(command.kind == "underline"))
+                or _find_snapped_band(scan_left_px, scan_right_px, 44, skip_used=True, require_glyphs=(command.kind == "underline"))
+                or (
+                    _find_snapped_band(rescue_left_px, rescue_right_px, 48, skip_used=True, require_glyphs=True)
+                    if command.kind == "underline"
+                    else None
+                )
+                or _find_snapped_band(scan_left_px, scan_right_px, 20, skip_used=False, require_glyphs=(command.kind == "underline"))
+                or _find_snapped_band(scan_left_px, scan_right_px, 44, skip_used=False, require_glyphs=(command.kind == "underline"))
+                or (
+                    _find_snapped_band(rescue_left_px, rescue_right_px, 48, skip_used=False, require_glyphs=True)
+                    if command.kind == "underline"
+                    else None
+                )
             )
             if band_hit is None:
                 return command
-            _band_top_offset, snapped_y, band_rows_slice, bg_luminance = band_hit
+            _band_top_offset, snapped_y, band_rows_slice, _bg_luminance, active_scan_left_px = band_hit
 
             snapped_x = command.x
             snapped_width = command.width
             if command.kind == "underline":
-                col_foreground = np.sum(np.abs(band_rows_slice - bg_luminance) > 20.0, axis=0) >= 2
-                if np.sum(col_foreground) >= 6:
+                col_foreground = cls._compute_glyph_column_mask(band_rows_slice)
+                if int(np.sum(col_foreground)) >= 6:
                     # Bridge inter-word spaces (<= 24px) without bridging blank margins (> 24px)
                     bridged_ink = col_foreground.copy()
                     false_run_start: Optional[int] = None
@@ -870,36 +978,52 @@ class ScreenCaptureService:
                     if seg_start is not None:
                         segments.append((seg_start, len(bridged_ink) - 1))
 
-                    req_rel_left = max(0, req_left_px - scan_left_px)
-                    req_rel_right = max(req_rel_left + 12, req_right_px - scan_left_px)
-                    valid_segments = [seg for seg in segments if (seg[1] - seg[0] + 1) >= 12]
+                    req_rel_left = max(0, req_left_px - active_scan_left_px)
+                    req_rel_right = max(req_rel_left + 12, req_right_px - active_scan_left_px)
+                    valid_segments = [seg_item for seg_item in segments if (seg_item[1] - seg_item[0] + 1) >= 12]
                     if valid_segments:
                         overlapping = [
-                            seg
-                            for seg in valid_segments
-                            if min(seg[1] + 1, req_rel_right) - max(seg[0], req_rel_left) > 0
+                            seg_item
+                            for seg_item in valid_segments
+                            if min(seg_item[1] + 1, req_rel_right) - max(seg_item[0], req_rel_left) > 0
                         ]
                         if overlapping:
                             chosen_seg = max(
                                 overlapping,
-                                key=lambda seg: min(seg[1] + 1, req_rel_right) - max(seg[0], req_rel_left),
+                                key=lambda seg_item: min(seg_item[1] + 1, req_rel_right) - max(seg_item[0], req_rel_left),
                             )
                         else:
                             chosen_seg = min(
                                 valid_segments,
-                                key=lambda seg: abs(((seg[0] + seg[1]) * 0.5) - ((req_rel_left + req_rel_right) * 0.5)),
+                                key=lambda seg_item: abs(
+                                    ((seg_item[0] + seg_item[1]) * 0.5) - ((req_rel_left + req_rel_right) * 0.5)
+                                ),
                             )
                         true_cols_in_seg = np.where(col_foreground[chosen_seg[0] : chosen_seg[1] + 1])[0]
                         if true_cols_in_seg.size >= 6:
                             seg_first_ink = chosen_seg[0] + int(true_cols_in_seg[0])
                             seg_last_ink = chosen_seg[0] + int(true_cols_in_seg[-1])
-                            # Do not stretch a short phrase highlight past a reasonable expansion cap,
-                            # while always allowing full inward trimming when LLM width overshot.
                             max_allowed_right_rel = req_rel_right + right_expand_cap
                             clipped_last_ink = min(seg_last_ink, max_allowed_right_rel)
-                            trimmed_left = scan_left_px + seg_first_ink
-                            trimmed_right = scan_left_px + clipped_last_ink + 1
+                            trimmed_left = active_scan_left_px + seg_first_ink
+                            trimmed_right = active_scan_left_px + clipped_last_ink + 1
                             trimmed_span = float(trimmed_right - trimmed_left)
+                            if not overlapping and trimmed_span > 420.0:
+                                req_mid_px = 0.5 * float(req_left_px + req_right_px)
+                                keep_span = int(round(max(240.0, req_width)))
+                                if abs(req_mid_px - float(trimmed_right)) <= abs(req_mid_px - float(trimmed_left)):
+                                    window_left = max(trimmed_left, trimmed_right - keep_span)
+                                    window_right = trimmed_right
+                                else:
+                                    window_left = trimmed_left
+                                    window_right = min(trimmed_right, trimmed_left + keep_span)
+                                rel_win_l = max(0, window_left - active_scan_left_px)
+                                rel_win_r = min(col_foreground.shape[0], window_right - active_scan_left_px)
+                                window_cols = np.where(col_foreground[rel_win_l:rel_win_r])[0]
+                                if window_cols.size >= 6:
+                                    trimmed_left = active_scan_left_px + rel_win_l + int(window_cols[0])
+                                    trimmed_right = active_scan_left_px + rel_win_l + int(window_cols[-1]) + 1
+                                    trimmed_span = float(trimmed_right - trimmed_left)
                             if trimmed_span >= 18.0:
                                 snapped_x = max(0.0, float(trimmed_left - 2))
                                 snapped_width = trimmed_span + 4.0
@@ -1183,6 +1307,44 @@ def _extract_zoomed_lasso_crop_b64(
         target_w = max(160, int(round(target_w * shrink_ratio)))
     zoomed = cropped.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
+    # Stamp 1:1 full-screen logical coordinates along the zoomed crop rulers so coordinates match Image 1 directly.
+    logical_crop_left = float(crop_left) / phys_scale_x
+    logical_crop_top = float(crop_top) / phys_scale_y
+    logical_crop_right = float(crop_right) / phys_scale_x
+    logical_crop_bottom = float(crop_bottom) / phys_scale_y
+    logical_crop_w = max(1.0, logical_crop_right - logical_crop_left)
+    logical_crop_h = max(1.0, logical_crop_bottom - logical_crop_top)
+
+    zoomed_rgba = zoomed.convert("RGBA")
+    ruler_layer = Image.new("RGBA", zoomed_rgba.size, (0, 0, 0, 0))
+    ruler_draw = ImageDraw.Draw(ruler_layer)
+    small_font = ImageFont.load_default()
+    ruler_draw.rectangle([0, 0, target_w, 16], fill=(12, 16, 24, 175))
+    ruler_draw.rectangle([0, 0, 38, target_h], fill=(12, 16, 24, 175))
+
+    step_x = 50 if logical_crop_w < 450.0 else 100
+    first_tick_x = (int(math.ceil(logical_crop_left / float(step_x))) * step_x)
+    tick_x = max(step_x, first_tick_x)
+    while float(tick_x) < logical_crop_right:
+        draw_x = int(round(((float(tick_x) - logical_crop_left) / logical_crop_w) * float(target_w)))
+        if 42 <= draw_x < (target_w - 24):
+            ruler_draw.line([(draw_x, 0), (draw_x, target_h)], fill=(51, 136, 255, 24), width=1)
+            ruler_draw.line([(draw_x, 0), (draw_x, 15)], fill=(120, 210, 255, 225), width=1)
+            ruler_draw.text((draw_x + 3, 2), str(tick_x), fill=(220, 242, 255, 245), font=small_font)
+        tick_x += step_x
+
+    step_y = 50 if logical_crop_h < 350.0 else 100
+    first_tick_y = (int(math.ceil(logical_crop_top / float(step_y))) * step_y)
+    tick_y = max(step_y, first_tick_y)
+    while float(tick_y) < logical_crop_bottom:
+        draw_y = int(round(((float(tick_y) - logical_crop_top) / logical_crop_h) * float(target_h)))
+        if 20 <= draw_y < (target_h - 12):
+            ruler_draw.line([(0, draw_y), (target_w, draw_y)], fill=(51, 136, 255, 24), width=1)
+            ruler_draw.line([(0, draw_y), (36, draw_y)], fill=(120, 210, 255, 225), width=1)
+            ruler_draw.text((2, draw_y + 2), str(tick_y), fill=(220, 242, 255, 245), font=small_font)
+        tick_y += step_y
+
+    zoomed = Image.alpha_composite(zoomed_rgba, ruler_layer).convert("RGB")
     output_buffer = io.BytesIO()
     zoomed.save(output_buffer, format="JPEG", quality=92)
     return base64.b64encode(output_buffer.getvalue()).decode("ascii")
@@ -2071,6 +2233,11 @@ class VisionBrainService(QObject):
                 "press_keys",
                 "type_text",
                 "open_side_by_side",
+                "window_action",
+                "set_clipboard",
+                "write_file",
+                "system_control",
+                "run_shell_read",
                 "request_admin_permission",
                 "scroll",
             }
@@ -2834,8 +3001,14 @@ class AgentScreenMonitorService(QObject):
             active_title = self._current_window_title or "Desktop"
             transitions_text = "; ".join(self._recent_transitions[-4:]) or "None yet"
             last_diff = self._last_diff_ratio
+        try:
+            open_titles = DesktopAgentService.list_open_window_titles()[:8]
+            open_windows_text = " | ".join(open_titles) if open_titles else "None"
+        except Exception:
+            open_windows_text = "Unavailable"
         return (
             f"Current foreground window: {active_title}\n"
+            f"Open desktop windows: {open_windows_text}\n"
             f"Recent window transitions: {transitions_text}\n"
             f"Last screen change ratio: {last_diff:.3f}"
         )
@@ -3119,6 +3292,226 @@ class DesktopAgentService:
         return found_hwnds
 
     @classmethod
+    def _list_all_windows(cls) -> List[Tuple[int, str]]:
+        """Enumerate visible (including minimized) top-level desktop windows as (hwnd, title)."""
+        found_windows: List[Tuple[int, str]] = []
+        if sys.platform != "win32":
+            return found_windows
+        try:
+            user32 = ctypes.windll.user32
+            enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            ignored_titles = {"program manager", "windows input experience", "settings"}
+
+            def _on_window(candidate_hwnd: int, _lparam: int) -> bool:
+                if not user32.IsWindowVisible(candidate_hwnd):
+                    return True
+                title_length = user32.GetWindowTextLengthW(candidate_hwnd)
+                if title_length <= 0:
+                    return True
+                title_buffer = ctypes.create_unicode_buffer(title_length + 1)
+                user32.GetWindowTextW(candidate_hwnd, title_buffer, title_length + 1)
+                window_title = (title_buffer.value or "").strip()
+                if not window_title:
+                    return True
+                lowered_title = window_title.lower()
+                if "jarvis" in lowered_title or lowered_title in ignored_titles:
+                    return True
+                is_minimized = bool(user32.IsIconic(candidate_hwnd))
+                if is_minimized:
+                    found_windows.append((int(candidate_hwnd), window_title))
+                    return True
+                win_rect = wintypes.RECT()
+                if user32.GetWindowRect(candidate_hwnd, ctypes.byref(win_rect)):
+                    win_width = int(win_rect.right) - int(win_rect.left)
+                    win_height = int(win_rect.bottom) - int(win_rect.top)
+                    if win_width >= 180 and win_height >= 120:
+                        found_windows.append((int(candidate_hwnd), window_title))
+                return True
+
+            callback_ref = enum_proc_type(_on_window)
+            user32.EnumWindows(callback_ref, 0)
+        except Exception:
+            pass
+        return found_windows
+
+    @classmethod
+    def list_open_window_titles(cls) -> List[str]:
+        """Return unique titles of visible/minimized open desktop windows."""
+        titles: List[str] = []
+        seen_lower: set[str] = set()
+        for _hwnd_val, win_title in cls._list_all_windows():
+            title_key = win_title.lower()
+            if title_key not in seen_lower:
+                seen_lower.add(title_key)
+                titles.append(win_title)
+        return titles
+
+    @classmethod
+    def _find_matching_window_hwnd(
+        cls,
+        window_query: str,
+        excluded_hwnd: Optional[int] = None,
+    ) -> Optional[int]:
+        """Find an open window HWND matching a title or common app alias."""
+        cleaned_query = (window_query or "").strip().lower()
+        if not cleaned_query:
+            return None
+        alias_map = {
+            "vscode": "visual studio code",
+            "vs code": "visual studio code",
+            "code": "visual studio code",
+            "edge": "microsoft edge",
+            "chrome": "google chrome",
+            "explorer": "file explorer",
+            "terminal": "windows terminal",
+            "powershell": "powershell",
+            "cmd": "command prompt",
+            "word": "word",
+            "excel": "excel",
+            "powerpoint": "powerpoint",
+        }
+        candidate_queries = [cleaned_query]
+        if cleaned_query in alias_map and alias_map[cleaned_query] not in candidate_queries:
+            candidate_queries.append(alias_map[cleaned_query])
+
+        open_windows = cls._list_all_windows()
+        for query_term in candidate_queries:
+            for hwnd_val, win_title in open_windows:
+                if excluded_hwnd is not None and hwnd_val == excluded_hwnd:
+                    continue
+                if query_term in win_title.lower():
+                    return hwnd_val
+        return None
+
+    @classmethod
+    def _looks_like_web_target(cls, target_text: str) -> bool:
+        """Heuristic to distinguish web domains/search queries from local desktop app/window names."""
+        lowered = (target_text or "").strip().lower()
+        if not lowered:
+            return False
+        if lowered.startswith(("http://", "https://", "www.")):
+            return True
+        if "." in lowered and not lowered.endswith(".exe"):
+            return True
+        web_keywords = ("stock", "price", "search", "news", "weather", "wiki", "youtube", "chatgpt", "github")
+        return any(word in lowered for word in web_keywords)
+
+    @classmethod
+    def _find_installed_app_target(cls, app_query: str) -> Optional[str]:
+        """Resolve any installed Windows app via aliases, PATH, Registry App Paths, or Start Menu shortcuts."""
+        cleaned = (app_query or "").strip().strip("\"'")
+        if not cleaned:
+            return None
+        lowered = cleaned.lower()
+        compact = re.sub(r"[\s_\-]+", "", lowered)
+
+        utility_aliases = {
+            "calculator": "calc.exe",
+            "calc": "calc.exe",
+            "notepad": "notepad.exe",
+            "paint": "mspaint.exe",
+            "mspaint": "mspaint.exe",
+            "cmd": "cmd.exe",
+            "commandprompt": "cmd.exe",
+            "powershell": "powershell.exe",
+            "terminal": "wt.exe",
+            "windowsterminal": "wt.exe",
+            "explorer": "explorer.exe",
+            "fileexplorer": "explorer.exe",
+            "taskmanager": "taskmgr.exe",
+            "taskmgr": "taskmgr.exe",
+            "controlpanel": "control.exe",
+            "snippingtool": "snippingtool.exe",
+            "devicemanager": "devmgmt.msc",
+            "vscode": "code",
+            "visualstudiocode": "code",
+            "word": "winword.exe",
+            "excel": "excel.exe",
+            "powerpoint": "powerpnt.exe",
+            "outlook": "outlook.exe",
+        }
+        mapped_cmd = utility_aliases.get(compact)
+        if mapped_cmd:
+            which_hit = shutil.which(mapped_cmd)
+            if which_hit:
+                return which_hit
+            if mapped_cmd.endswith(".msc"):
+                return mapped_cmd
+
+        direct_which = shutil.which(cleaned) or shutil.which(f"{cleaned}.exe")
+        if direct_which:
+            return direct_which
+
+        if winreg is not None:
+            app_paths_subkey = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+            for hive_root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive_root, app_paths_subkey) as parent_key:
+                        subkey_count, _val_count, _mod_time = winreg.QueryInfoKey(parent_key)
+                        for sub_idx in range(subkey_count):
+                            subkey_name = winreg.EnumKey(parent_key, sub_idx)
+                            subkey_stem = os.path.splitext(subkey_name)[0].lower()
+                            subkey_compact = re.sub(r"[\s_\-]+", "", subkey_stem)
+                            if (
+                                lowered in subkey_stem
+                                or compact in subkey_compact
+                                or subkey_compact in compact
+                            ):
+                                try:
+                                    with winreg.OpenKey(parent_key, subkey_name) as exe_key:
+                                        default_path, _reg_type = winreg.QueryValueEx(exe_key, "")
+                                        candidate_path = str(default_path or "").strip().strip("\"'")
+                                        if candidate_path and os.path.exists(candidate_path):
+                                            return candidate_path
+                                except OSError:
+                                    continue
+                except OSError:
+                    continue
+
+        shortcut_roots = [
+            os.path.join(os.environ.get("ProgramData", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
+            os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
+        ]
+        best_shortcut: Optional[Tuple[int, str]] = None
+        for root_dir in shortcut_roots:
+            if not root_dir or not os.path.isdir(root_dir):
+                continue
+            for walk_root, _dir_names, file_names in os.walk(root_dir):
+                for file_name in file_names:
+                    if not file_name.lower().endswith((".lnk", ".appref-ms", ".url")):
+                        continue
+                    file_stem = os.path.splitext(file_name)[0].lower()
+                    file_compact = re.sub(r"[\s_\-]+", "", file_stem)
+                    if compact == file_compact:
+                        return os.path.join(walk_root, file_name)
+                    if (lowered in file_stem or compact in file_compact) and best_shortcut is None:
+                        best_shortcut = (len(file_stem), os.path.join(walk_root, file_name))
+        if best_shortcut is not None:
+            return best_shortcut[1]
+        return None
+
+    @classmethod
+    def _launch_installed_app_target(cls, app_name: str, resolved_target: str) -> Tuple[bool, str]:
+        """Launch a resolved executable, shortcut, or system MMC target."""
+        try:
+            cls._pre_launch_hwnd = cls._current_foreground_hwnd()
+            cls._last_app_launch_timestamp = time.monotonic()
+            cls._last_launched_target = re.sub(r"[\s_\-]+", "", app_name.lower())
+            lower_target = resolved_target.lower()
+            if lower_target.endswith(".exe") and os.path.exists(resolved_target):
+                subprocess.Popen(
+                    [resolved_target],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                )
+            else:
+                os.startfile(resolved_target)
+            return True, f"Launched {app_name}"
+        except Exception as exc:
+            return False, str(exc)
+
+    @classmethod
     def _snap_hwnd_to_rect(
         cls,
         target_hwnd: int,
@@ -3266,12 +3659,62 @@ class DesktopAgentService:
         cleaned_right = (right_target or "").strip()
         try:
             if cleaned_left and cleaned_right:
-                left_url = cls._target_to_chrome_url(cleaned_left)
-                right_url = cls._target_to_chrome_url(cleaned_right)
-                left_hwnd = cls._launch_chrome_new_window_hwnd(left_url)
+                existing_all_hwnds = {hwnd_item for hwnd_item, _title in cls._list_all_windows()}
+
+                def _resolve_or_launch_side_hwnd(
+                    target_name: str,
+                    excluded_hwnd: Optional[int] = None,
+                ) -> Optional[int]:
+                    lowered_target = target_name.lower()
+                    is_web = cls._looks_like_web_target(target_name)
+                    # Check open desktop windows first (always allow if non-web or if exact title already open).
+                    open_match = cls._find_matching_window_hwnd(target_name, excluded_hwnd=excluded_hwnd)
+                    if open_match is not None and not is_web:
+                        return open_match
+                    if is_web:
+                        for hwnd_item, win_title in cls._list_all_windows():
+                            if excluded_hwnd is not None and hwnd_item == excluded_hwnd:
+                                continue
+                            if lowered_target in win_title.lower():
+                                return hwnd_item
+                    if not is_web:
+                        norm_name = re.sub(r"[\s_\-]+", "", lowered_target)
+                        launcher = cls.SAFE_APP_LAUNCHERS.get(norm_name)
+                        launched_target = False
+                        if norm_name == "chrome":
+                            chrome_exe = cls._resolve_chrome_executable()
+                            if chrome_exe:
+                                launcher = [chrome_exe, "--new-window"]
+                        if launcher is not None:
+                            cls._pre_launch_hwnd = cls._current_foreground_hwnd()
+                            subprocess.Popen(
+                                launcher,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                shell=False,
+                            )
+                            launched_target = True
+                        else:
+                            resolved_target = cls._find_installed_app_target(target_name)
+                            if resolved_target:
+                                launched_target, _msg = cls._launch_installed_app_target(target_name, resolved_target)
+                        if launched_target:
+                            deadline = time.monotonic() + 2.4
+                            while time.monotonic() < deadline:
+                                matched_now = cls._find_matching_window_hwnd(target_name, excluded_hwnd=excluded_hwnd)
+                                if matched_now is not None and matched_now not in existing_all_hwnds:
+                                    existing_all_hwnds.add(matched_now)
+                                    return matched_now
+                                if matched_now is not None:
+                                    return matched_now
+                                time.sleep(0.12)
+                    target_url = cls._target_to_chrome_url(target_name)
+                    return cls._launch_chrome_new_window_hwnd(target_url)
+
+                left_hwnd = _resolve_or_launch_side_hwnd(cleaned_left, excluded_hwnd=None)
+                right_hwnd = _resolve_or_launch_side_hwnd(cleaned_right, excluded_hwnd=left_hwnd)
                 if left_hwnd:
                     cls._snap_hwnd_to_rect(left_hwnd, *left_rect)
-                right_hwnd = cls._launch_chrome_new_window_hwnd(right_url)
                 if right_hwnd:
                     cls._snap_hwnd_to_rect(right_hwnd, *right_rect)
                 if not left_hwnd or not right_hwnd:
@@ -3279,12 +3722,9 @@ class DesktopAgentService:
                     if len(visible_hwnds) >= 2:
                         cls._snap_hwnd_to_rect(visible_hwnds[1], *left_rect)
                         cls._snap_hwnd_to_rect(visible_hwnds[0], *right_rect)
-                else:
-                    cls._snap_hwnd_to_rect(left_hwnd, *left_rect)
-                    cls._snap_hwnd_to_rect(right_hwnd, *right_rect)
                 return (
                     True,
-                    f"Tiled Chrome side by side: {cleaned_left} on the left and {cleaned_right} on the right.",
+                    f"Tiled side by side: {cleaned_left} on the left and {cleaned_right} on the right.",
                 )
 
             if cleaned_left or cleaned_right:
@@ -3422,7 +3862,19 @@ class DesktopAgentService:
                 return "Opening site in browser."
             return f"Opening {short_label}."
         if command.kind == "open_side_by_side":
-            return "Tiling Chrome side by side."
+            return "Arranging windows side by side."
+        if command.kind == "window_action":
+            action_label = (command.header or argument_text or "window")[:30]
+            return f"Updating {action_label}."
+        if command.kind == "set_clipboard":
+            return "Copied text to clipboard."
+        if command.kind == "write_file":
+            file_label = os.path.basename(argument_text) or "notes file"
+            return f"Saving {file_label[:28]}."
+        if command.kind == "system_control":
+            return f"Running {argument_text.replace('_', ' ')}."
+        if command.kind == "run_shell_read":
+            return f"Checking {(command.header or 'system info')[:28]}."
         if command.kind == "search_web":
             return f"Searching for {argument_text[:34]}."
         if command.kind == "type_text":
@@ -3548,7 +4000,10 @@ class DesktopAgentService:
                 if chrome_exe:
                     launch_args = [chrome_exe, "--new-window"]
             if launch_args is None:
-                return False, f"App not in safe launcher allowlist: {argument_text}"
+                resolved_target = cls._find_installed_app_target(argument_text)
+                if resolved_target:
+                    return cls._launch_installed_app_target(argument_text, resolved_target)
+                return False, f"Could not find installed app: {argument_text}"
             try:
                 cls._pre_launch_hwnd = cls._current_foreground_hwnd()
                 cls._last_app_launch_timestamp = time.monotonic()
@@ -3645,6 +4100,181 @@ class DesktopAgentService:
             if typed_ok:
                 return True, f"Typed {len(argument_text[:280])} characters"
             return False, "Could not focus active field for typing"
+
+        if command_kind == "window_action":
+            action_verb = argument_text.lower().replace("-", "_").replace(" ", "_")
+            target_query = (command.header or "").strip()
+            if action_verb in ("minimize_all", "desktop"):
+                cls._press_win32_combo([0x5B, 0x4D])
+                return True, "Minimized open windows"
+            target_hwnd = cls._find_matching_window_hwnd(target_query) if target_query else cls._current_foreground_hwnd()
+            if not target_hwnd:
+                return False, f"Could not find open window matching: {target_query or 'active window'}"
+            if sys.platform != "win32":
+                return False, "Window actions require Windows"
+            user32 = ctypes.windll.user32
+            if action_verb in ("focus", "activate", "switch"):
+                cls._focus_hwnd(target_hwnd)
+                return True, f"Focused {target_query or 'window'}"
+            if action_verb == "minimize":
+                user32.ShowWindow(int(target_hwnd), 6)
+                return True, f"Minimized {target_query or 'window'}"
+            if action_verb == "maximize":
+                user32.ShowWindow(int(target_hwnd), 3)
+                return True, f"Maximized {target_query or 'window'}"
+            if action_verb == "restore":
+                user32.ShowWindow(int(target_hwnd), 9)
+                return True, f"Restored {target_query or 'window'}"
+            if action_verb in ("snap_left", "snap_right", "left", "right"):
+                work_left, work_top, work_right, work_bottom = cls._get_work_area_rect()
+                half_w = max(400, (work_right - work_left) // 2)
+                work_h = max(360, work_bottom - work_top)
+                is_left = action_verb in ("snap_left", "left")
+                snap_x = work_left if is_left else (work_left + half_w)
+                snap_w = half_w if is_left else max(400, (work_right - work_left) - half_w)
+                cls._snap_hwnd_to_rect(target_hwnd, snap_x, work_top, snap_w, work_h)
+                return True, f"Snapped {target_query or 'window'} {'left' if is_left else 'right'}"
+            if action_verb == "close":
+                user32.PostMessageW(int(target_hwnd), 0x0010, 0, 0)
+                return True, f"Sent close request to {target_query or 'window'}"
+            return False, f"Unsupported window action: {action_verb}"
+
+        if command_kind == "set_clipboard":
+            if not argument_text:
+                return False, "No clipboard text provided"
+            copied_ok = SmartDictationInjector._set_clipboard_unicode(argument_text)
+            if copied_ok:
+                return True, f"Copied {len(argument_text)} characters to clipboard"
+            return False, "Could not write text to clipboard"
+
+        if command_kind == "write_file":
+            rel_path_raw = argument_text.replace("\\", "/").strip()
+            file_content = command.header or ""
+            if not rel_path_raw:
+                return False, "No output file path specified"
+            user_home = os.path.expanduser("~")
+            desktop_dir = os.path.realpath(os.path.join(user_home, "Desktop"))
+            documents_dir = os.path.realpath(os.path.join(user_home, "Documents"))
+            lower_rel = rel_path_raw.lower()
+            if lower_rel.startswith("desktop/"):
+                base_dir = desktop_dir
+                inner_rel = rel_path_raw[len("desktop/") :]
+            elif lower_rel.startswith("documents/"):
+                base_dir = documents_dir
+                inner_rel = rel_path_raw[len("documents/") :]
+            elif "/" not in rel_path_raw and not os.path.isabs(rel_path_raw):
+                base_dir = desktop_dir
+                inner_rel = rel_path_raw
+            else:
+                return False, "write_file is scoped strictly under Desktop/ or Documents/"
+
+            clean_inner = os.path.normpath(inner_rel).lstrip("\\/")
+            if not clean_inner or clean_inner.startswith("..") or os.path.isabs(clean_inner):
+                return False, f"Invalid relative path: {rel_path_raw}"
+            resolved_out_path = os.path.realpath(os.path.join(base_dir, clean_inner))
+            if not (resolved_out_path.startswith(base_dir + os.sep)):
+                return False, "Path escapes Desktop/Documents sandbox"
+            blocked_exts = {
+                ".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".msi", ".dll",
+                ".scr", ".com", ".hta", ".reg", ".py", ".sh", ".lnk",
+            }
+            _, out_ext = os.path.splitext(resolved_out_path.lower())
+            if out_ext in blocked_exts:
+                return False, f"Refused to write executable/script extension: {out_ext}"
+            if not out_ext:
+                resolved_out_path += ".txt"
+            try:
+                os.makedirs(os.path.dirname(resolved_out_path), exist_ok=True)
+                with open(resolved_out_path, "w", encoding="utf-8") as file_handle:
+                    file_handle.write(file_content)
+                return True, f"Saved file to {os.path.basename(resolved_out_path)}"
+            except Exception as exc:
+                return False, str(exc)
+
+        if command_kind == "system_control":
+            control_action = argument_text.lower().replace("-", "_").replace(" ", "_")
+            if sys.platform != "win32":
+                return False, "System controls require Windows"
+            user32 = ctypes.windll.user32
+
+            def _tap_vk(vk_code: int, repeat_count: int = 1) -> None:
+                for _step_idx in range(max(1, repeat_count)):
+                    user32.keybd_event(int(vk_code), 0, 0, 0)
+                    time.sleep(0.02)
+                    user32.keybd_event(int(vk_code), 0, 2, 0)
+                    time.sleep(0.02)
+
+            if control_action in ("mute", "unmute"):
+                _tap_vk(0xAD, 1)
+                return True, "Toggled audio mute"
+            if control_action in ("volume_up", "vol_up"):
+                _tap_vk(0xAF, 3)
+                return True, "Turned volume up"
+            if control_action in ("volume_down", "vol_down"):
+                _tap_vk(0xAE, 3)
+                return True, "Turned volume down"
+            if control_action in ("play_pause", "play", "pause"):
+                _tap_vk(0xB3, 1)
+                return True, "Toggled media playback"
+            if control_action in ("next_track", "next"):
+                _tap_vk(0xB0, 1)
+                return True, "Skipped to next track"
+            if control_action in ("prev_track", "previous"):
+                _tap_vk(0xB1, 1)
+                return True, "Returned to previous track"
+            if control_action in ("show_desktop", "desktop"):
+                cls._press_win32_combo([0x5B, 0x44])
+                return True, "Toggled desktop view"
+            if control_action in ("screenshot", "snip"):
+                cls._press_win32_combo([0x5B, 0x10, 0x53])
+                return True, "Opened Windows snipping overlay"
+            return False, f"Unsupported system control: {control_action}"
+
+        if command_kind == "run_shell_read":
+            ps_query = argument_text.strip()
+            if not ps_query:
+                return False, "Empty shell query"
+            lowered_query = ps_query.lower()
+            blocked_patterns = (
+                "remove-item", "del ", "rm ", "rmdir", "erase ", "format-", "shutdown",
+                "restart-computer", "stop-computer", "stop-process", "taskkill", "kill ",
+                "reg ", "set-item", "new-item", "remove-itemproperty", "set-executionpolicy",
+                "netsh", "bcdedit", "diskpart", "cipher", "sc ", "invoke-expression", "iex",
+                "start-process", "invoke-webrequest", "iwr", "curl ", "wget ", "set-service",
+                "stop-service", "uninstall", "msiexec", "out-file", "set-content",
+                "add-content", "clear-content", ">", "`", ";", "&",
+            )
+            if any(token in lowered_query for token in blocked_patterns):
+                return False, "Blocked non-read-only shell command"
+            pipeline_segments = [seg.strip() for seg in ps_query.split("|") if seg.strip()]
+            if not pipeline_segments:
+                return False, "Empty pipeline"
+            safe_prefixes = (
+                "get-", "select-", "sort-", "where-", "measure-", "format-", "group-",
+                "test-", "resolve-", "find-", "convertto-", "write-output", "(get-",
+                "[system.", "$env:", "hostname", "whoami", "ipconfig", "systeminfo",
+            )
+            for seg_item in pipeline_segments:
+                seg_lower = seg_item.lstrip("( ").lower()
+                if not seg_lower.startswith(safe_prefixes):
+                    return False, f"Only read-only PowerShell queries allowed (rejected: {seg_item[:28]})"
+            try:
+                proc_result = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_query],
+                    capture_output=True,
+                    text=True,
+                    timeout=6.0,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                raw_out = (proc_result.stdout or proc_result.stderr or "").strip()
+                compact_out = re.sub(r"\s+", " ", raw_out)[:240]
+                if proc_result.returncode == 0:
+                    return True, compact_out or f"Completed {command.header or 'query'}"
+                return False, compact_out or f"Query failed (exit {proc_result.returncode})"
+            except subprocess.TimeoutExpired:
+                return False, "Read-only query timed out"
+            except Exception as exc:
+                return False, str(exc)
 
         return False, f"Unknown agent command: {command_kind}"
 

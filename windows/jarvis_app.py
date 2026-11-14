@@ -11,6 +11,7 @@ Connects:
 from __future__ import annotations
 
 import os
+import queue
 import re
 import threading
 import time
@@ -36,6 +37,7 @@ class JarvisApplicationController(QObject):
     _agentStepSpeechRequested = Signal(str, str)
     _agentSequenceCompleted = Signal(str)
     _webLookupContextReady = Signal(str, str, int)
+    _brainAgentResultReady = Signal(str, str, str, bool)
 
     def __init__(self, settings_store: Optional[jarvis_config.SettingsStore] = None) -> None:
         super().__init__()
@@ -82,11 +84,17 @@ class JarvisApplicationController(QObject):
         self._pending_direct_agent_commands: List[jarvis_response_parser.DrawingCommand] = []
         self._executed_agent_command_in_turn = False
         self._pending_admin_request: Optional[jarvis_services.AdminPermissionRequest] = None
+        self._brain_agent_queue: queue.Queue = queue.Queue()
         self._quitting = False
 
         self._populate_microphone_devices()
         self._connect_signals()
         self._setup_system_tray()
+        threading.Thread(
+            target=self._brain_agent_worker_loop,
+            name="JarvisBrainAgentQueueWorker",
+            daemon=True,
+        ).start()
 
     def _populate_microphone_devices(self) -> None:
         devices = jarvis_services.MicrophoneStreamService.list_input_devices()
@@ -129,6 +137,7 @@ class JarvisApplicationController(QObject):
         self._agentStepSpeechRequested.connect(self._on_agent_step_speech_requested)
         self._agentSequenceCompleted.connect(self._on_agent_sequence_completed)
         self._webLookupContextReady.connect(self._on_web_lookup_context_ready)
+        self._brainAgentResultReady.connect(self._on_brain_agent_result_ready)
 
         # Notch Window
         self.notch_window.promptSubmitted.connect(self._on_notch_prompt_submitted)
@@ -1136,10 +1145,51 @@ class JarvisApplicationController(QObject):
             current_sentence_text=self._current_spoken_sentence_text,
         )
 
+    def _brain_agent_worker_loop(self) -> None:
+        """Sequentially executes queued LLM-emitted desktop/browser agent commands off the Qt UI thread."""
+        while not self._quitting:
+            try:
+                item_payload = self._brain_agent_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if item_payload is None:
+                break
+            item_generation, queued_command = item_payload
+            if item_generation != self._agent_worker_generation:
+                continue
+            action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command_blocking(
+                queued_command
+            )
+            if item_generation != self._agent_worker_generation:
+                continue
+            self._brainAgentResultReady.emit(
+                queued_command.kind,
+                queued_command.label or queued_command.body,
+                status_msg,
+                bool(action_ok),
+            )
+
+    def _on_brain_agent_result_ready(
+        self,
+        action_kind: str,
+        target_summary: str,
+        status_msg: str,
+        succeeded: bool,
+    ) -> None:
+        self.memory_service.record_action(
+            action_kind=action_kind,
+            target_summary=target_summary,
+            status_text=status_msg,
+            succeeded=succeeded,
+        )
+        self.sound_player.play_earcon("jarvis-text-send" if succeeded else "jarvis-error", volume=0.45)
+        if status_msg:
+            self.overlay_window.set_bubble_message(status_msg, word_by_word=False, hold_seconds=2.8)
+
     def _on_brain_drawing_command(self, command: jarvis_response_parser.DrawingCommand) -> None:
         if command.kind == "scroll":
             return
-        if command.kind in (
+        agent_kinds = (
             "open_browser",
             "open_url",
             "open_side_by_side",
@@ -1147,24 +1197,22 @@ class JarvisApplicationController(QObject):
             "open_app",
             "press_keys",
             "type_text",
+            "window_action",
+            "set_clipboard",
+            "write_file",
+            "system_control",
+            "run_shell_read",
             "request_admin_permission",
-        ):
+        )
+        if command.kind in agent_kinds:
             admin_req = jarvis_services.DesktopAgentService.check_command_requires_admin(command)
             if admin_req is not None:
                 self._request_admin_confirmation(admin_req)
                 return
             if bool(self.settings_store.get("agent_actions_enabled", True)):
-                action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command(command)
                 self._executed_agent_command_in_turn = True
                 self._pending_direct_agent_commands = []
-                self.memory_service.record_action(
-                    action_kind=command.kind,
-                    target_summary=command.label or command.body,
-                    status_text=status_msg,
-                    succeeded=action_ok,
-                )
-                self.sound_player.play_earcon("jarvis-text-send" if action_ok else "jarvis-error", volume=0.45)
-                self.overlay_window.set_bubble_message(status_msg, word_by_word=False, hold_seconds=2.8)
+                self._brain_agent_queue.put((self._agent_worker_generation, command))
             return
 
         snapped_command = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(command)

@@ -49,7 +49,7 @@ _POINT_TAG_PATTERN = re.compile(
 
 _COMMAND_NAMES_PATTERN = (
     r"(underline|ring|point|box|frame|paper|highlight|scroll|"
-    r"open_browser|open_url|search_web|open_app|press_keys|type_text)"
+    r"open_browser|open_url|search_web|open_app|press_keys|type_text|request_admin_permission)"
 )
 
 _CALL_LINE_PATTERN = re.compile(
@@ -75,6 +75,199 @@ _COLON_CALL_LINE_PATTERN = re.compile(
 _THINK_BLOCK_PATTERN = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 
 
+def extract_key_topic_phrase(raw_text: str, max_words: int = 3) -> str:
+    """Distills prose or a phrase into a clean 1-to-3 word diagram topic label."""
+    if not raw_text:
+        return "Core Concept"
+    cleaned = clean_spoken_text(raw_text)
+    if not cleaned:
+        return "Core Concept"
+
+    stop_words = {
+        "the",
+        "this",
+        "that",
+        "here",
+        "we",
+        "see",
+        "can",
+        "is",
+        "are",
+        "was",
+        "were",
+        "means",
+        "tells",
+        "us",
+        "what",
+        "how",
+        "why",
+        "when",
+        "where",
+        "in",
+        "simple",
+        "words",
+        "imagine",
+        "you",
+        "start",
+        "a",
+        "an",
+        "of",
+        "to",
+        "for",
+        "and",
+        "or",
+        "with",
+        "by",
+        "on",
+        "at",
+        "from",
+        "as",
+        "it",
+        "they",
+        "first",
+        "second",
+        "third",
+        "finally",
+        "also",
+        "basically",
+        "essentially",
+        "just",
+        "simply",
+        "really",
+        "about",
+        "into",
+        "over",
+        "under",
+        "using",
+        "shows",
+        "explains",
+        "describes",
+    }
+
+    raw_tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9'\-+/]*", cleaned)
+    filtered_tokens: List[str] = []
+    for token in raw_tokens:
+        lower_token = token.lower().strip("'-")
+        if not lower_token or lower_token in stop_words:
+            continue
+        if token.isupper() and len(token) >= 2:
+            formatted_token = token
+        elif any(char.isupper() for char in token[1:]) and token[0].isupper():
+            formatted_token = token
+        else:
+            formatted_token = token[:1].upper() + token[1:]
+        if formatted_token not in filtered_tokens:
+            filtered_tokens.append(formatted_token)
+        if len(filtered_tokens) >= max(1, max_words):
+            break
+
+    if not filtered_tokens:
+        fallback_tokens = [tok[:1].upper() + tok[1:] for tok in raw_tokens[: max(1, max_words)] if tok]
+        return " ".join(fallback_tokens) if fallback_tokens else "Core Concept"
+    return " ".join(filtered_tokens)
+
+
+def should_use_visual_explanation_notes(
+    user_prompt: str,
+    has_lasso_crop: bool = False,
+    is_scroll_session: bool = False,
+    has_agent_commands: bool = False,
+) -> bool:
+    """
+    Decides whether a turn warrants an overlay diagram card (`paper`) and screen underlines,
+    suppressing visual notes on direct utility, telemetry, live lookup, or admin-gate turns.
+    """
+    if has_agent_commands:
+        return False
+    if has_lasso_crop or is_scroll_session:
+        return True
+
+    normalized = re.sub(r"\s+", " ", (user_prompt or "").lower().strip())
+    if not normalized:
+        return False
+
+    utility_or_control_prefixes = (
+        "open ",
+        "launch ",
+        "start ",
+        "go to ",
+        "search ",
+        "google ",
+        "type ",
+        "write ",
+        "press ",
+        "close ",
+        "delete ",
+        "remove ",
+        "uninstall ",
+        "shut down",
+        "shutdown",
+        "restart ",
+        "reboot",
+    )
+    if normalized.startswith(utility_or_control_prefixes):
+        return False
+
+    non_visual_phrases = (
+        "storage left",
+        "disk space",
+        "drive space",
+        "free space",
+        "memory usage",
+        "battery",
+        "stock price",
+        "share price",
+        "price of",
+        "bitcoin",
+        "crypto",
+        "weather",
+        "what time",
+        "shut down",
+        "shutdown",
+        "hey jarvis",
+    )
+    if any(phrase in normalized for phrase in non_visual_phrases):
+        return False
+
+    non_visual_word_pattern = re.compile(
+        r"\b(?:storage|ram|cpu|gpu|delete|remove|uninstall|restart|reboot|"
+        r"approve|confirm|cancel|stop|yes|no|hello|hi|thanks|thank you)\b"
+    )
+    if non_visual_word_pattern.search(normalized):
+        return False
+
+    explanation_cues = (
+        "explain",
+        "summarize",
+        "summary",
+        "teach",
+        "walk me through",
+        "walk through",
+        "what does",
+        "how does",
+        "break down",
+        "diagram",
+        "notes",
+        "understand",
+        "meaning of",
+        "scope of",
+        "difference between",
+        "section",
+        "code",
+        "equation",
+        "formula",
+        "article",
+        "page",
+        "screen",
+        "chatgpt",
+        "this",
+    )
+    if any(cue in normalized for cue in explanation_cues):
+        return True
+
+    return False
+
+
 def build_vision_system_prompt(
     screen_width: int,
     screen_height: int,
@@ -87,6 +280,7 @@ def build_vision_system_prompt(
     agent_actions_enabled: bool = True,
     memory_context: str = "",
     live_screen_context: str = "",
+    suppress_visual_notes: bool = False,
 ) -> str:
     """
     Constructs the system prompt for Jarvis's single-brain screen companion.
@@ -104,7 +298,7 @@ def build_vision_system_prompt(
         "Always inspect the current screenshot freshly; never repeat steps or sections you already explained earlier.",
         "CRITICAL FORMATTING & VOICE-SYNCED DRAWING RULES:",
         "1. VOICE-SYNCHRONIZED TIMING: Put each visual command (`paper(...)` or `underline(...)`) on its OWN standalone line IMMEDIATELY BEFORE the spoken sentence that explains that exact line or concept! Jarvis triggers each screen drawing at the exact moment your spoken sentence begins.",
-        "2. Example synced sequence:\npaper(36, 140, 320, 340, \"Topic Title\", \"Core Flow\", \"Step 1 -> Step 2 | section:Key Idea | doc:Summary -> Result\")\nunderline(420, 210, 360, \"exact first phrase on screen\")\nFirst spoken sentence explaining that first underlined concept and summarizing it in the note card.\nunderline(420, 320, 340, \"exact second phrase on screen\")\nSecond spoken sentence explaining the second underlined line on screen.",
+        "2. Example synced sequence:\npaper(36, 140, 320, 340, \"Topic Title\", \"Visual Map\", \"Topic 1 -> Topic 2 | section:Core Mechanism | doc:Input -> Outcome\")\nunderline(420, 210, 360, \"exact first phrase on screen\")\nFirst spoken sentence explaining that first underlined concept and summarizing its topic flow in the note card.\nunderline(420, 320, 340, \"exact second phrase on screen\")\nSecond spoken sentence explaining the second underlined line on screen.",
         "3. NO markdown bullets (- or *), NO numbering, NO backticks, NO trailing arrow comments on command lines.",
         "4. NEVER speak or write command names like 'underline', 'paper', 'point', 'ring', 'box', or coordinates inside your spoken sentences.",
         "5. Never use markdown asterisks (**bold** or *italic*), bullet symbols, emojis, or code blocks in your spoken text.",
@@ -112,7 +306,14 @@ def build_vision_system_prompt(
         "VISUAL EXPLANATION & SCREEN DRAWING COMMANDS:",
     ]
 
-    if normalized_mode == "cursor_only":
+    if suppress_visual_notes:
+        prompt_sections.extend(
+            [
+                "DIRECT CONTEXTUAL ANSWER MODE: Do NOT emit paper(...) or underline(...) commands for this request.",
+                "Answer the user's question directly and concisely in 1 to 3 spoken sentences using the live screen and fetched context.",
+            ]
+        )
+    elif normalized_mode == "cursor_only":
         prompt_sections.extend(
             [
                 "Cursor-only mode is enabled: do NOT emit underline, ring, box, highlight, or paper commands.",
@@ -123,8 +324,8 @@ def build_vision_system_prompt(
         prompt_sections.extend(
             [
                 "Whenever you explain concepts, code, equations, or ChatGPT answers on screen, ALWAYS include BOTH:",
-                "First (before sentence 1), one visual notes card placed in an empty left or right margin (avoiding main text) matching your spoken note explanation:",
-                "paper(24, 160, 320, 340, \"Topic Title\", \"Core Summary\", \"Concept A -> Concept B | section:Key Idea | Input -> Output\")",
+                "First (before sentence 1), one visual topic flow diagram card placed in an empty left or right margin (avoiding main text). It MUST be a visual topic flow diagram with 1 to 3 word node labels summarizing the topics you speak aloud, and NEVER a prose summary paragraph:",
+                "paper(24, 160, 320, 340, \"Topic Title\", \"Visual Map\", \"Topic 1 -> Topic 2 | section:Core Mechanism | doc:Input -> Outcome\")",
                 f"Second, 2 to 4 crisp horizontal underlines, each emitted right BEFORE the spoken sentence discussing that line (y = text baseline + 4px, x = left edge of phrase, width = exact phrase pixel width in 0..{screen_width} x 0..{screen_height}, 4th arg = exact 2 to 6 words on screen):",
                 "underline(420, 310, 260, \"exact phrase on screen\")",
                 "Optionally glide the cursor to a key term or button with:",
@@ -135,9 +336,9 @@ def build_vision_system_prompt(
     else:
         prompt_sections.extend(
             [
-                "While explaining ChatGPT responses, code, formulas, or articles, emit BOTH one paper(...) summary notes card AND 2 to 4 underline(...) commands placed directly BEFORE each matching spoken sentence:",
+                "While explaining ChatGPT responses, code, formulas, or articles, emit BOTH one paper(...) visual topic flow diagram card (1 to 3 word node labels, NEVER prose paragraphs) AND 2 to 4 underline(...) commands placed directly BEFORE each matching spoken sentence:",
                 f"underline(x, y, width, \"exact screen words\")  (clean underline directly beneath a key heading/phrase; x, y in 0..{screen_width} x 0..{screen_height})",
-                "paper(24, 160, 320, 340, \"Card Title\", \"short header\", \"Concept A -> Concept B | section:Key Idea | Input -> Output\")",
+                "paper(24, 160, 320, 340, \"Topic Title\", \"Visual Map\", \"Topic 1 -> Topic 2 | section:Core Mechanism | doc:Input -> Outcome\")",
                 "ring(x, y, radius, \"label\")  (neat circle around a compact icon or term; radius <= 55)",
                 "point(x, y, \"label\")         (glides the Jarvis cursor to (x, y) and points cleanly)",
                 "box(x, y, width, height, \"label\") (small frame around a compact formula or UI button only)",
@@ -152,6 +353,7 @@ def build_vision_system_prompt(
                 "DESKTOP & BROWSER AGENT COMMANDS:",
                 "When the user asks you to open a browser/app, visit a site, search the web, press a shortcut, or type text, emit ALL required commands on consecutive standalone lines in the SAME response, then give a short spoken confirmation.",
                 "NEVER say 'I will type/search/open it after it loads' — Jarvis automatically waits for the window to open and focus before typing!",
+                "For any destructive or admin-level action (deleting files, uninstalling apps, shutting down/restarting, killing processes, editing registry/security settings), NEVER execute destructively — emit `request_admin_permission(\"action title\", \"risk reason\")` first and ask the admin for confirmation.",
                 "Available commands (each on its own line):",
                 "open_browser(\"https://www.google.com\")",
                 "open_url(\"https://example.com\")",
@@ -159,6 +361,7 @@ def build_vision_system_prompt(
                 "open_app(\"chrome\")",
                 "press_keys(\"ctrl+t\")",
                 "type_text(\"hello\")",
+                "request_admin_permission(\"Delete temporary files\", \"Removes files from disk\")",
                 "Example when user says 'open Chrome and type latest AI news':",
                 "open_app(\"chrome\")",
                 "type_text(\"latest AI news\")",
@@ -415,7 +618,11 @@ def clean_spoken_text(raw_text: str) -> str:
     cleaned = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", cleaned)
     cleaned = re.sub(r"(?m)^\s*[-*•]\s+", "", cleaned)
     # Prevent stray leaked command labels from being spoken aloud
-    cleaned = re.sub(r"(?im)^\s*(?:underline|paper|point|ring|box|highlight|draw|cmd|command)\s*[:\-]\s*", "", cleaned)
+    cleaned = re.sub(
+        r"(?im)^\s*(?:underline|paper|point|ring|box|highlight|draw|cmd|command|request_admin_permission)\s*[:\-]\s*",
+        "",
+        cleaned,
+    )
     cleaned = re.sub(r"(?i)^\s*(?:underline|paper)\b[\s,:\-]*$", "", cleaned)
     # Normalize common curly typography to clean ASCII equivalents
     replacements = {
@@ -550,6 +757,17 @@ def parse_command_line(
                 label=direction_str,
             )
         return None
+
+    if command_name == "request_admin_permission":
+        action_title = _parse_string(arguments[0], "").strip() if arguments else ""
+        if not action_title:
+            return None
+        risk_reason = _parse_string(arguments[1], action_title).strip() if len(arguments) >= 2 else action_title
+        return DrawingCommand(
+            kind="request_admin_permission",
+            label=action_title,
+            body=risk_reason,
+        )
 
     if command_name in ("open_browser", "open_url", "search_web", "open_app", "press_keys", "type_text"):
         primary_value = _parse_string(arguments[0], "").strip() if arguments else ""

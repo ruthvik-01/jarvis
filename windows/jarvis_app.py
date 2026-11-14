@@ -11,6 +11,7 @@ Connects:
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -34,6 +35,7 @@ class JarvisApplicationController(QObject):
     aboutToQuit = Signal()
     _agentStepSpeechRequested = Signal(str, str)
     _agentSequenceCompleted = Signal(str)
+    _webLookupContextReady = Signal(str, str, int)
 
     def __init__(self, settings_store: Optional[jarvis_config.SettingsStore] = None) -> None:
         super().__init__()
@@ -75,6 +77,7 @@ class JarvisApplicationController(QObject):
         self._pre_scroll_image: Optional[object] = None
         self._pending_direct_agent_commands: List[jarvis_response_parser.DrawingCommand] = []
         self._executed_agent_command_in_turn = False
+        self._pending_admin_request: Optional[jarvis_services.AdminPermissionRequest] = None
         self._quitting = False
 
         self._populate_microphone_devices()
@@ -121,6 +124,7 @@ class JarvisApplicationController(QObject):
         self.screen_monitor.foregroundWindowChanged.connect(self._on_foreground_window_changed)
         self._agentStepSpeechRequested.connect(self._on_agent_step_speech_requested)
         self._agentSequenceCompleted.connect(self._on_agent_sequence_completed)
+        self._webLookupContextReady.connect(self._on_web_lookup_context_ready)
 
         # Notch Window
         self.notch_window.promptSubmitted.connect(self._on_notch_prompt_submitted)
@@ -461,6 +465,8 @@ class JarvisApplicationController(QObject):
 
     def _on_escape_pressed(self) -> None:
         self._active_voice_mode = "idle"
+        self._agent_worker_generation += 1
+        self._pending_admin_request = None
         self._pending_direct_agent_commands = []
         self._cancel_scroll_explain_sequence()
         self.overlay_window.cancel_interactive_lasso_mode()
@@ -543,6 +549,7 @@ class JarvisApplicationController(QObject):
 
     def _on_stop_requested(self) -> None:
         self._agent_worker_generation += 1
+        self._pending_admin_request = None
         self._pending_direct_agent_commands = []
         self._pending_voice_synced_commands.clear()
         self._current_spoken_sentence_index = -1
@@ -579,11 +586,7 @@ class JarvisApplicationController(QObject):
 
         self._executed_agent_command_in_turn = False
         agent_actions_enabled = bool(self.settings_store.get("agent_actions_enabled", True))
-        self._pending_direct_agent_commands = (
-            jarvis_services.DesktopAgentService.detect_direct_user_agent_commands(prompt_text)
-            if agent_actions_enabled and not preserve_scroll_session
-            else []
-        )
+        self._pending_direct_agent_commands = []
 
         if not preserve_scroll_session:
             if jarvis_response_parser.is_scroll_and_explain_request(prompt_text):
@@ -630,18 +633,123 @@ class JarvisApplicationController(QObject):
             self.notch_window.set_mode(jarvis_notch_window.NotchVisualMode.THINKING, status_text="Thinking")
             self.overlay_window.set_cursor_visual_state(listening=False, thinking=True, speaking=False)
 
-        if len(self._pending_direct_agent_commands) >= 1:
-            commands_to_run = list(self._pending_direct_agent_commands)
-            self._pending_direct_agent_commands = []
-            self._executed_agent_command_in_turn = True
-            captured_worker_gen = self._agent_worker_generation
-            threading.Thread(
-                target=self._run_multitask_agent_worker,
-                args=(commands_to_run, captured_worker_gen),
-                name="JarvisMultitaskAgentWorker",
-                daemon=True,
-            ).start()
-            return
+        if not preserve_scroll_session and self._pending_admin_request is not None:
+            normalized_reply = re.sub(r"\s+", " ", (prompt_text or "").lower().strip(" .,!?"))
+            approval_pattern = re.compile(
+                r"\b(?:approve|approved|confirm|confirmed|yes|allow|proceed|do\s+it|go\s+ahead)\b"
+            )
+            denial_pattern = re.compile(
+                r"\b(?:cancel|no|deny|stop|abort|don't|dont|never\s+mind)\b"
+            )
+            if approval_pattern.search(normalized_reply):
+                pending_req = self._pending_admin_request
+                self._pending_admin_request = None
+                if pending_req.is_permanently_blocked:
+                    self.memory_service.record_action(
+                        action_kind="admin_gate",
+                        target_summary=pending_req.action_title,
+                        status_text="Blocked irreversible destructive action even after confirmation prompt",
+                        succeeded=False,
+                    )
+                    self._on_agent_sequence_completed(
+                        "Confirmation noted, however erasing files or changing protected system settings automatically remains blocked for safety. Please complete that step manually."
+                    )
+                elif pending_req.approved_commands:
+                    self.memory_service.record_action(
+                        action_kind="admin_gate",
+                        target_summary=pending_req.action_title,
+                        status_text="Admin approved",
+                        succeeded=True,
+                    )
+                    self._executed_agent_command_in_turn = True
+                    captured_worker_gen = self._agent_worker_generation
+                    threading.Thread(
+                        target=self._run_multitask_agent_worker,
+                        args=(pending_req.approved_commands, captured_worker_gen),
+                        name="JarvisAdminApprovedWorker",
+                        daemon=True,
+                    ).start()
+                else:
+                    self._on_agent_sequence_completed(f"Approved {pending_req.action_title}.")
+                return
+            if denial_pattern.search(normalized_reply):
+                pending_req = self._pending_admin_request
+                self._pending_admin_request = None
+                self.memory_service.record_action(
+                    action_kind="admin_gate",
+                    target_summary=pending_req.action_title,
+                    status_text="Canceled by admin",
+                    succeeded=False,
+                )
+                self._on_agent_sequence_completed(f"Canceled {pending_req.action_title}.")
+                return
+            self._pending_admin_request = None
+
+        if not preserve_scroll_session and not highlight_points:
+            intent_plan = jarvis_services.DesktopAgentService.classify_contextual_intent(prompt_text)
+            if intent_plan.intent_kind == "admin_permission_gate" and intent_plan.admin_request is not None:
+                self._request_admin_confirmation(intent_plan.admin_request)
+                return
+
+            if intent_plan.intent_kind == "system_telemetry_and_settings":
+                self._executed_agent_command_in_turn = True
+                if agent_actions_enabled and intent_plan.agent_commands:
+                    captured_worker_gen = self._agent_worker_generation
+                    threading.Thread(
+                        target=self._run_system_telemetry_worker,
+                        args=(
+                            list(intent_plan.agent_commands),
+                            intent_plan.telemetry_response,
+                            captured_worker_gen,
+                        ),
+                        name="JarvisSystemTelemetryWorker",
+                        daemon=True,
+                    ).start()
+                else:
+                    self._on_agent_sequence_completed(intent_plan.telemetry_response)
+                return
+
+            if intent_plan.intent_kind == "web_lookup_and_answer":
+                if agent_actions_enabled:
+                    self._executed_agent_command_in_turn = True
+                    self._on_agent_step_speech_requested(
+                        intent_plan.spoken_step_intro,
+                        intent_plan.spoken_step_intro,
+                    )
+                    captured_worker_gen = self._agent_worker_generation
+                    threading.Thread(
+                        target=self._run_web_lookup_and_answer_worker,
+                        args=(prompt_text, intent_plan.search_query, captured_worker_gen),
+                        name="JarvisWebLookupWorker",
+                        daemon=True,
+                    ).start()
+                    return
+                self.brain_service.start_vision_turn(
+                    user_prompt=prompt_text,
+                    include_screenshot=True,
+                    highlight_points=None,
+                    highlight_color_hex=str(
+                        self.settings_store.get("cursor_color_hex", jarvis_theme.JARVIS_BLUE_HEX)
+                    ),
+                    logical_screen_size=(max(640, self.overlay_window.width()), max(480, self.overlay_window.height())),
+                    scroll_step_index=0,
+                    max_scroll_steps=0,
+                    memory_context=self.memory_service.build_memory_context_for_prompt(),
+                    live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
+                    suppress_visual_notes=True,
+                )
+                return
+
+            if intent_plan.intent_kind == "multitask_agent" and agent_actions_enabled and intent_plan.agent_commands:
+                self._executed_agent_command_in_turn = True
+                captured_worker_gen = self._agent_worker_generation
+                threading.Thread(
+                    target=self._run_multitask_agent_worker,
+                    args=(list(intent_plan.agent_commands), captured_worker_gen),
+                    name="JarvisMultitaskAgentWorker",
+                    daemon=True,
+                ).start()
+                return
 
         self.brain_service.start_vision_turn(
             user_prompt=prompt_text,
@@ -655,6 +763,123 @@ class JarvisApplicationController(QObject):
             max_scroll_steps=self._max_scroll_steps if self._scroll_explain_active else 0,
             memory_context=self.memory_service.build_memory_context_for_prompt(),
             live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
+        )
+
+    def _request_admin_confirmation(self, admin_req: jarvis_services.AdminPermissionRequest) -> None:
+        self._pending_admin_request = admin_req
+        self.memory_service.record_action(
+            action_kind="admin_permission_requested",
+            target_summary=admin_req.action_title,
+            status_text="Awaiting admin confirmation",
+            succeeded=True,
+        )
+        confirmation_message = (
+            f"Admin permission needed for {admin_req.action_title}. {admin_req.risk_description}"
+        )
+        self.sound_player.play_earcon("jarvis-error", volume=0.42)
+        self.overlay_window.set_bubble_message(
+            f"Admin approval needed: {admin_req.action_title}",
+            word_by_word=False,
+            hold_seconds=4.5,
+        )
+        self.main_window.finish_streaming_assistant_message(confirmation_message)
+        if self.notch_window.current_mode() == jarvis_notch_window.NotchVisualMode.TEXT_RESPONSE:
+            self.notch_window.set_streaming_response(confirmation_message, is_generating=False)
+        else:
+            self.notch_window.set_mode(
+                jarvis_notch_window.NotchVisualMode.WARNING,
+                status_text=f"Confirm: {admin_req.action_title[:24]}",
+            )
+        if self._speak_current_turn:
+            self._sentences_enqueued_in_turn += 1
+            self.overlay_window.set_cursor_visual_state(listening=False, thinking=False, speaking=True)
+            self.tts_service.enqueue_sentence(confirmation_message, turn_generation=self._active_tts_generation)
+            self.tts_service.mark_turn_complete(turn_generation=self._active_tts_generation)
+        else:
+            self.overlay_window.set_cursor_visual_state(False, False, False)
+
+    def _run_system_telemetry_worker(
+        self,
+        commands_to_run: List[jarvis_response_parser.DrawingCommand],
+        final_telemetry_text: str,
+        worker_generation: int,
+    ) -> None:
+        for agent_cmd in commands_to_run:
+            if self._quitting or worker_generation != self._agent_worker_generation:
+                return
+            action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command_blocking(agent_cmd)
+            self.memory_service.record_action(
+                action_kind=agent_cmd.kind,
+                target_summary=agent_cmd.label or agent_cmd.body,
+                status_text=status_msg,
+                succeeded=action_ok,
+            )
+            self.screen_monitor.poll_once()
+
+        if self._quitting or worker_generation != self._agent_worker_generation:
+            return
+        self._agentSequenceCompleted.emit(final_telemetry_text or "Done.")
+
+    def _run_web_lookup_and_answer_worker(
+        self,
+        user_prompt: str,
+        search_query: str,
+        worker_generation: int,
+    ) -> None:
+        action_ok, status_msg = jarvis_services.DesktopAgentService.open_chrome_search(search_query)
+        self.memory_service.record_action(
+            action_kind="search_web",
+            target_summary=search_query,
+            status_text=status_msg,
+            succeeded=action_ok,
+        )
+        web_context = jarvis_services.LiveWebLookupService.fetch_live_web_context(
+            search_query,
+            timeout_seconds=4.5,
+        )
+        for _wait_tick in range(15):
+            if self._quitting or worker_generation != self._agent_worker_generation:
+                return
+            time.sleep(0.1)
+
+        if self._quitting or worker_generation != self._agent_worker_generation:
+            return
+        self.screen_monitor.poll_once()
+        self._webLookupContextReady.emit(user_prompt, web_context, worker_generation)
+
+    def _on_web_lookup_context_ready(
+        self,
+        user_prompt: str,
+        web_context: str,
+        worker_generation: int,
+    ) -> None:
+        if self._quitting or worker_generation != self._agent_worker_generation:
+            return
+        if web_context:
+            enriched_prompt = (
+                f"{user_prompt}\n\n"
+                f"[LIVE WEB DATA FETCHED FROM CHROME/WEB]:\n{web_context}\n"
+                "Read the current Chrome window screenshot and this verified live data to answer directly in 1 to 3 concise sentences."
+            )
+        else:
+            enriched_prompt = (
+                f"{user_prompt}\n\n"
+                "[CHROME SEARCH OPENED]: Read the answer directly from the open Chrome search results window in 1 to 3 concise sentences."
+            )
+
+        self.brain_service.start_vision_turn(
+            user_prompt=enriched_prompt,
+            include_screenshot=True,
+            highlight_points=None,
+            highlight_color_hex=str(
+                self.settings_store.get("cursor_color_hex", jarvis_theme.JARVIS_BLUE_HEX)
+            ),
+            logical_screen_size=(max(640, self.overlay_window.width()), max(480, self.overlay_window.height())),
+            scroll_step_index=0,
+            max_scroll_steps=0,
+            memory_context=self.memory_service.build_memory_context_for_prompt(),
+            live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
+            suppress_visual_notes=True,
         )
 
     def _run_multitask_agent_worker(
@@ -793,7 +1018,19 @@ class JarvisApplicationController(QObject):
     def _on_brain_drawing_command(self, command: jarvis_response_parser.DrawingCommand) -> None:
         if command.kind == "scroll":
             return
-        if command.kind in ("open_browser", "open_url", "search_web", "open_app", "press_keys", "type_text"):
+        if command.kind in (
+            "open_browser",
+            "open_url",
+            "search_web",
+            "open_app",
+            "press_keys",
+            "type_text",
+            "request_admin_permission",
+        ):
+            admin_req = jarvis_services.DesktopAgentService.check_command_requires_admin(command)
+            if admin_req is not None:
+                self._request_admin_confirmation(admin_req)
+                return
             if bool(self.settings_store.get("agent_actions_enabled", True)):
                 action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command(command)
                 self._executed_agent_command_in_turn = True

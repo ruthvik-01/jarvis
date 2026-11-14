@@ -528,38 +528,95 @@ def _paint_clear_button_pill(
     painter.restore()
 
 
+def _compact_diagram_node_label(raw_label: str) -> str:
+    """Keeps node labels inside diagram boxes crisp and scannable (1 to 3 words)."""
+    cleaned_label = jarvis_response_parser.clean_spoken_text(raw_label or "")
+    if not cleaned_label:
+        return "Topic"
+    word_tokens = cleaned_label.split()
+    if len(word_tokens) <= 3 and len(cleaned_label) <= 26:
+        return cleaned_label
+    return jarvis_response_parser.extract_key_topic_phrase(cleaned_label, max_words=3)
+
+
 def _parse_paper_body_rows(body_text: str) -> List[_PaperRow]:
-    """Parses `|` or newline-delimited paper card rows into structured diagram items."""
+    """Parses `|` or newline-delimited paper card rows strictly into visual diagram sections and flow rows."""
     if not body_text:
         return []
     normalized = body_text.replace("\n", "|")
     raw_segments = [segment.strip() for segment in normalized.split("|") if segment.strip()]
     parsed_rows: List[_PaperRow] = []
+    pending_topic_nodes: List[_PaperNode] = []
+
+    def _flush_pending_topics() -> None:
+        nonlocal pending_topic_nodes
+        while len(pending_topic_nodes) >= 2:
+            left_node = pending_topic_nodes.pop(0)
+            right_node = pending_topic_nodes.pop(0)
+            parsed_rows.append(_PaperRow(kind="flow", nodes=[left_node, right_node]))
+        if len(pending_topic_nodes) == 1:
+            solo_node = pending_topic_nodes.pop(0)
+            solo_node.is_document = True
+            parsed_rows.append(
+                _PaperRow(
+                    kind="flow",
+                    nodes=[solo_node, _PaperNode(label="Key Point", is_document=False)],
+                )
+            )
 
     for segment in raw_segments:
         cleaned_segment = jarvis_response_parser.clean_spoken_text(segment)
         if not cleaned_segment:
             continue
         if cleaned_segment.lower().startswith("section:"):
+            _flush_pending_topics()
             section_title = cleaned_segment.split(":", 1)[1].strip()
             if section_title:
                 parsed_rows.append(_PaperRow(kind="section", text=section_title))
             continue
 
-        if "->" in cleaned_segment:
-            raw_parts = [part.strip() for part in cleaned_segment.split("->") if part.strip()]
+        normalized_arrow_segment = cleaned_segment.replace("→", "->").replace("=>", "->")
+        if "->" in normalized_arrow_segment:
+            _flush_pending_topics()
+            raw_parts = [part.strip() for part in normalized_arrow_segment.split("->") if part.strip()]
             row_nodes: List[_PaperNode] = []
-            for part in raw_parts:
+            for part in raw_parts[:3]:
                 is_doc = part.lower().startswith("doc:")
-                node_label = part.split(":", 1)[1].strip() if is_doc else part
+                raw_node_text = part.split(":", 1)[1].strip() if is_doc else part
+                node_label = _compact_diagram_node_label(raw_node_text)
                 if node_label:
                     row_nodes.append(_PaperNode(label=node_label, is_document=is_doc))
+            if len(row_nodes) == 1:
+                row_nodes[0].is_document = True
+                row_nodes.append(_PaperNode(label="Outcome", is_document=False))
             if row_nodes:
                 parsed_rows.append(_PaperRow(kind="flow", nodes=row_nodes))
             continue
 
-        parsed_rows.append(_PaperRow(kind="note", text=cleaned_segment))
+        if ":" in cleaned_segment and not cleaned_segment.lower().startswith("doc:"):
+            _flush_pending_topics()
+            left_raw, right_raw = cleaned_segment.split(":", 1)
+            left_label = _compact_diagram_node_label(left_raw)
+            right_label = _compact_diagram_node_label(right_raw)
+            parsed_rows.append(
+                _PaperRow(
+                    kind="flow",
+                    nodes=[
+                        _PaperNode(label=left_label, is_document=False),
+                        _PaperNode(label=right_label, is_document=False),
+                    ],
+                )
+            )
+            continue
 
+        is_doc_topic = cleaned_segment.lower().startswith("doc:")
+        raw_topic_text = cleaned_segment.split(":", 1)[1].strip() if is_doc_topic else cleaned_segment
+        topic_label = _compact_diagram_node_label(raw_topic_text)
+        pending_topic_nodes.append(_PaperNode(label=topic_label, is_document=is_doc_topic))
+        if len(pending_topic_nodes) >= 2:
+            _flush_pending_topics()
+
+    _flush_pending_topics()
     return parsed_rows
 
 
@@ -948,8 +1005,8 @@ def _paint_sketched_node_box(
     )
     outline_path = _build_smooth_catmull_rom_path(outline_points, closed=True)
 
-    fill_color = QColor(39, 39, 46, 245) if highlighted else QColor(24, 24, 30, 232)
-    border_color = QColor("#E4E4E7") if highlighted else QColor(82, 82, 91, 235)
+    fill_color = QColor(26, 40, 64, 244) if highlighted else QColor(24, 24, 30, 232)
+    border_color = _blend_colors(accent_color, QColor("#E4E4E7"), 0.35) if highlighted else QColor(82, 82, 91, 235)
     border_width = 1.9 if highlighted else 1.4
 
     painter.save()

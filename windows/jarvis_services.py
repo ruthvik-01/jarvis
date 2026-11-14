@@ -17,7 +17,7 @@ import asyncio
 import base64
 import ctypes
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import io
 import json
@@ -1597,6 +1597,7 @@ class VisionBrainService(QObject):
         max_scroll_steps: int = 0,
         memory_context: str = "",
         live_screen_context: str = "",
+        suppress_visual_notes: bool = False,
     ) -> int:
         with self._lock:
             self._generation_id += 1
@@ -1626,6 +1627,7 @@ class VisionBrainService(QObject):
                 max_scroll_steps,
                 memory_context,
                 live_screen_context,
+                suppress_visual_notes,
             ),
             daemon=True,
         ).start()
@@ -1643,6 +1645,7 @@ class VisionBrainService(QObject):
         max_scroll_steps: int = 0,
         memory_context: str = "",
         live_screen_context: str = "",
+        suppress_visual_notes: bool = False,
     ) -> None:
         api_key = self._settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
         if not api_key:
@@ -1669,6 +1672,16 @@ class VisionBrainService(QObject):
                 jpeg_b64 = ""
                 lasso_crop_b64 = ""
 
+        allow_visual_notes = (not suppress_visual_notes) and (
+            bool(lasso_crop_b64)
+            or (max_scroll_steps > 0)
+            or jarvis_response_parser.should_use_visual_explanation_notes(
+                user_prompt,
+                has_lasso_crop=bool(lasso_crop_b64),
+                is_scroll_session=(max_scroll_steps > 0),
+            )
+        )
+
         system_prompt = jarvis_response_parser.build_vision_system_prompt(
             screen_width=img_w,
             screen_height=img_h,
@@ -1686,6 +1699,7 @@ class VisionBrainService(QObject):
             agent_actions_enabled=bool(self._settings_store.get("agent_actions_enabled", True)),
             memory_context=memory_context,
             live_screen_context=live_screen_context,
+            suppress_visual_notes=(not allow_visual_notes),
         )
 
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -1749,6 +1763,8 @@ class VisionBrainService(QObject):
 
                     new_sentences, new_commands = extractor.feed_delta(delta_text)
                     for cmd in new_commands:
+                        if not allow_visual_notes and cmd.kind in ("paper", "underline"):
+                            continue
                         self.drawingCommandReady.emit(cmd)
                     for sentence in new_sentences:
                         self.sentenceReady.emit(sentence)
@@ -1761,11 +1777,20 @@ class VisionBrainService(QObject):
 
             final_sentences, final_commands = extractor.flush_remaining()
             for cmd in final_commands:
+                if not allow_visual_notes and cmd.kind in ("paper", "underline"):
+                    continue
                 self.drawingCommandReady.emit(cmd)
             for sentence in final_sentences:
                 self.sentenceReady.emit(sentence)
 
             parsed_response = extractor.build_final_response()
+            if not allow_visual_notes:
+                parsed_response.commands = [
+                    cmd_item
+                    for cmd_item in parsed_response.commands
+                    if cmd_item.kind not in ("paper", "underline")
+                ]
+
             active_drawing_mode = str(
                 self._settings_store.get(
                     "screen_drawing_mode",
@@ -1779,14 +1804,21 @@ class VisionBrainService(QObject):
                 "open_app",
                 "press_keys",
                 "type_text",
+                "request_admin_permission",
                 "scroll",
             }
             has_agent_command = any(cmd_item.kind in agent_command_kinds for cmd_item in parsed_response.commands)
             has_underline = any(cmd_item.kind == "underline" for cmd_item in parsed_response.commands)
             has_paper_card = any(cmd_item.kind == "paper" for cmd_item in parsed_response.commands)
+            underline_labels = [
+                cmd_item.label.strip()
+                for cmd_item in parsed_response.commands
+                if cmd_item.kind == "underline" and cmd_item.label and cmd_item.label.strip()
+            ]
 
             if (
-                active_drawing_mode != "cursor_only"
+                allow_visual_notes
+                and active_drawing_mode != "cursor_only"
                 and not has_agent_command
                 and parsed_response.spoken_text
                 and len(parsed_response.spoken_text) >= 24
@@ -1796,6 +1828,7 @@ class VisionBrainService(QObject):
                         spoken_sentences=parsed_response.sentences,
                         spoken_text=parsed_response.spoken_text,
                         screen_height=img_h,
+                        underline_labels=underline_labels,
                     )
                     if synthesized_card is not None:
                         parsed_response.commands.append(synthesized_card)
@@ -1831,35 +1864,35 @@ class VisionBrainService(QObject):
         spoken_sentences: List[str],
         spoken_text: str,
         screen_height: int,
+        underline_labels: Optional[List[str]] = None,
     ) -> Optional[jarvis_response_parser.DrawingCommand]:
-        """Builds a structured dark visual notes card from the explanation when the model omits `paper(...)`."""
+        """Builds a structured visual topic diagram card summarizing spoken concepts without prose snippets."""
         cleaned_sentences = [sentence.strip() for sentence in spoken_sentences if sentence.strip()]
         if not cleaned_sentences and spoken_text:
             cleaned_sentences = [spoken_text.strip()]
         if not cleaned_sentences:
             return None
 
-        def _compact_phrase(raw_phrase: str, max_words: int = 3) -> str:
-            words = re.findall(r"[A-Za-z0-9'\-]+", raw_phrase)
-            return " ".join(words[:max_words]) if words else "Concept"
+        extracted_topics: List[str] = []
+        for raw_label in underline_labels or []:
+            topic_label = jarvis_response_parser.extract_key_topic_phrase(raw_label, max_words=3)
+            if topic_label and topic_label not in extracted_topics:
+                extracted_topics.append(topic_label)
+        for sentence_text in cleaned_sentences:
+            topic_label = jarvis_response_parser.extract_key_topic_phrase(sentence_text, max_words=3)
+            if topic_label and topic_label not in extracted_topics:
+                extracted_topics.append(topic_label)
 
-        first_words = _compact_phrase(cleaned_sentences[0], max_words=4)
-        body_parts: List[str] = []
-        if len(cleaned_sentences) >= 2:
-            left_node = _compact_phrase(cleaned_sentences[0], max_words=2)
-            right_node = _compact_phrase(cleaned_sentences[1], max_words=2)
-            body_parts.append(f"{left_node} -> {right_node}")
-        else:
-            body_parts.append(f"Input -> {first_words}")
+        topic_one = extracted_topics[0] if len(extracted_topics) >= 1 else "Overview"
+        topic_two = extracted_topics[1] if len(extracted_topics) >= 2 else "Mechanism"
+        topic_three = extracted_topics[2] if len(extracted_topics) >= 3 else topic_one
+        topic_four = extracted_topics[3] if len(extracted_topics) >= 4 else "Outcome"
 
-        if len(cleaned_sentences) >= 3:
-            body_parts.append("section:Key Point")
-            node_three = _compact_phrase(cleaned_sentences[2], max_words=2)
-            body_parts.append(f"doc:Context -> {node_three}")
-        else:
-            snippet = cleaned_sentences[-1][:76].strip()
-            body_parts.append("section:Summary")
-            body_parts.append(snippet)
+        body_diagram = (
+            f"{topic_one} -> {topic_two} | "
+            f"section:Core Flow | "
+            f"doc:{topic_three} -> {topic_four}"
+        )
 
         card_top_y = float(min(max(130, int(screen_height * 0.16)), max(150, screen_height - 370)))
         return jarvis_response_parser.DrawingCommand(
@@ -1868,9 +1901,9 @@ class VisionBrainService(QObject):
             y=card_top_y,
             width=316.0,
             height=330.0,
-            label=first_words,
-            header="Visual Notes",
-            body=" | ".join(body_parts),
+            label=topic_one,
+            header="Visual Map",
+            body=body_diagram,
             tone="blue",
             sentence_index=0,
         )
@@ -2077,8 +2110,278 @@ class GlobalHotkeyService(QObject):
 
 
 # ---------------------------------------------------------------------------
-# Continuous Screen Monitor & Safe Desktop / Browser Multitasking Agent
+# System Telemetry, Live Web Lookup, Continuous Screen Monitor & Safe Agent
 # ---------------------------------------------------------------------------
+
+
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", wintypes.DWORD),
+        ("dwMemoryLoad", wintypes.DWORD),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("sullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
+
+
+class _SystemPowerStatus(ctypes.Structure):
+    _fields_ = [
+        ("ACLineStatus", ctypes.c_ubyte),
+        ("BatteryFlag", ctypes.c_ubyte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("SystemStatusFlag", ctypes.c_ubyte),
+        ("BatteryLifeTime", wintypes.DWORD),
+        ("BatteryFullLifeTime", wintypes.DWORD),
+    ]
+
+
+class SystemTelemetryService:
+    """Reads live Windows disk space, RAM availability, and battery status accurately."""
+
+    DRIVE_FIXED = 3
+
+    @classmethod
+    def get_storage_summary(cls) -> str:
+        drive_reports: List[str] = []
+        kernel32 = ctypes.windll.kernel32 if sys.platform == "win32" else None
+        for ascii_code in range(ord("C"), ord("Z") + 1):
+            drive_letter = chr(ascii_code)
+            root_path = f"{drive_letter}:\\"
+            if not os.path.exists(root_path):
+                continue
+            if kernel32 is not None:
+                try:
+                    drive_type = int(kernel32.GetDriveTypeW(root_path))
+                    if drive_type != cls.DRIVE_FIXED and drive_letter != "C":
+                        continue
+                except Exception:
+                    pass
+            try:
+                usage = shutil.disk_usage(root_path)
+            except Exception:
+                continue
+            if usage.total <= 0:
+                continue
+            gb_divisor = float(1024 ** 3)
+            free_gb = usage.free / gb_divisor
+            total_gb = usage.total / gb_divisor
+            used_pct = ((usage.total - usage.free) / float(usage.total)) * 100.0
+            drive_reports.append(
+                f"{drive_letter}: {free_gb:.1f} GB free of {total_gb:.1f} GB ({used_pct:.0f}% used)"
+            )
+
+        if not drive_reports:
+            try:
+                fallback_usage = shutil.disk_usage(os.path.abspath(os.sep))
+                gb_divisor = float(1024 ** 3)
+                free_gb = fallback_usage.free / gb_divisor
+                total_gb = fallback_usage.total / gb_divisor
+                return f"Available storage: {free_gb:.1f} GB free of {total_gb:.1f} GB."
+            except Exception:
+                return "Could not read disk storage details right now."
+        return "Storage space: " + "; ".join(drive_reports) + "."
+
+    @staticmethod
+    def get_memory_summary() -> str:
+        if sys.platform != "win32":
+            return "Memory telemetry is only available on Windows."
+        try:
+            mem_status = _MemoryStatusEx()
+            mem_status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem_status)):
+                gb_divisor = float(1024 ** 3)
+                avail_gb = mem_status.ullAvailPhys / gb_divisor
+                total_gb = mem_status.ullTotalPhys / gb_divisor
+                used_pct = int(mem_status.dwMemoryLoad)
+                return f"Memory usage is {used_pct}% with {avail_gb:.1f} GB free of {total_gb:.1f} GB RAM."
+        except Exception:
+            pass
+        return "Could not read RAM usage right now."
+
+    @staticmethod
+    def get_battery_summary() -> str:
+        if sys.platform != "win32":
+            return "Battery telemetry is only available on Windows."
+        try:
+            power_status = _SystemPowerStatus()
+            if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(power_status)):
+                ac_online = int(power_status.ACLineStatus) == 1
+                pct = int(power_status.BatteryLifePercent)
+                if pct == 255 or int(power_status.BatteryFlag) == 128:
+                    return "Desktop PC running on AC power (no battery installed)."
+                power_state = "plugged in" if ac_online else "on battery"
+                return f"Battery is at {pct}% and currently {power_state}."
+        except Exception:
+            pass
+        return "Could not read battery status right now."
+
+
+class LiveWebLookupService:
+    """Fetches real-time stock quotes and concise factual web context alongside Chrome search."""
+
+    KNOWN_STOCK_TICKERS: Dict[str, Tuple[str, str]] = {
+        "nvidia": ("NVDA", "Nvidia"),
+        "nvda": ("NVDA", "Nvidia"),
+        "apple": ("AAPL", "Apple"),
+        "aapl": ("AAPL", "Apple"),
+        "microsoft": ("MSFT", "Microsoft"),
+        "msft": ("MSFT", "Microsoft"),
+        "tesla": ("TSLA", "Tesla"),
+        "tsla": ("TSLA", "Tesla"),
+        "google": ("GOOGL", "Alphabet"),
+        "alphabet": ("GOOGL", "Alphabet"),
+        "googl": ("GOOGL", "Alphabet"),
+        "amazon": ("AMZN", "Amazon"),
+        "amzn": ("AMZN", "Amazon"),
+        "meta": ("META", "Meta"),
+        "amd": ("AMD", "AMD"),
+        "intel": ("INTC", "Intel"),
+        "intc": ("INTC", "Intel"),
+        "netflix": ("NFLX", "Netflix"),
+        "nflx": ("NFLX", "Netflix"),
+        "bitcoin": ("BTC-USD", "Bitcoin"),
+        "btc": ("BTC-USD", "Bitcoin"),
+        "ethereum": ("ETH-USD", "Ethereum"),
+        "eth": ("ETH-USD", "Ethereum"),
+    }
+
+    DEFAULT_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        )
+    }
+
+    @classmethod
+    def resolve_stock_ticker(cls, query_text: str) -> Optional[Tuple[str, str]]:
+        lowered = (query_text or "").lower()
+        for keyword, ticker_pair in cls.KNOWN_STOCK_TICKERS.items():
+            if re.search(rf"\b{re.escape(keyword)}\b", lowered):
+                return ticker_pair
+        uppercase_tokens = re.findall(r"\b([A-Z]{2,5})\b", query_text or "")
+        ignored_uppercase = {"WHAT", "PRICE", "STOCK", "SHARE", "CHROME", "SHOW", "TELL", "TODAY", "LIVE", "USD"}
+        for candidate_symbol in uppercase_tokens:
+            if candidate_symbol not in ignored_uppercase:
+                return candidate_symbol, candidate_symbol
+        return None
+
+    @classmethod
+    def fetch_stock_quote_summary(cls, query_text: str, timeout_seconds: float = 4.0) -> str:
+        resolved = cls.resolve_stock_ticker(query_text)
+        if resolved is None:
+            return ""
+        ticker_symbol, company_name = resolved
+        try:
+            response = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(ticker_symbol)}?interval=1d&range=5d",
+                headers=cls.DEFAULT_HEADERS,
+                timeout=timeout_seconds,
+            )
+            if not response.ok:
+                return ""
+            payload = response.json()
+            result_list = payload.get("chart", {}).get("result") or []
+            if not result_list:
+                return ""
+            meta = result_list[0].get("meta") or {}
+            market_price = meta.get("regularMarketPrice")
+            if market_price is None:
+                return ""
+            currency = str(meta.get("currency") or "USD").upper()
+            previous_close = meta.get("chartPreviousClose") or meta.get("previousClose")
+            if previous_close:
+                diff_val = float(market_price) - float(previous_close)
+                diff_pct = (diff_val / float(previous_close)) * 100.0
+                sign_prefix = "+" if diff_val >= 0 else ""
+                return (
+                    f"{company_name} ({ticker_symbol}) live quote: {float(market_price):.2f} {currency} "
+                    f"({sign_prefix}{diff_val:.2f}, {sign_prefix}{diff_pct:.2f}% vs prior close)."
+                )
+            return f"{company_name} ({ticker_symbol}) live quote: {float(market_price):.2f} {currency}."
+        except Exception:
+            return ""
+
+    @classmethod
+    def fetch_general_web_summary(cls, query_text: str, timeout_seconds: float = 4.0) -> str:
+        cleaned_query = (query_text or "").strip()
+        if not cleaned_query:
+            return ""
+        snippets: List[str] = []
+        try:
+            ddg_response = requests.get(
+                f"https://api.duckduckgo.com/?q={urllib.parse.quote_plus(cleaned_query)}&format=json&no_html=1&skip_disambig=1",
+                headers=cls.DEFAULT_HEADERS,
+                timeout=timeout_seconds,
+            )
+            if ddg_response.ok:
+                ddg_json = ddg_response.json()
+                answer_text = str(ddg_json.get("Answer") or "").strip()
+                abstract_text = str(ddg_json.get("AbstractText") or "").strip()
+                if answer_text:
+                    snippets.append(f"Instant answer: {answer_text[:220]}")
+                elif abstract_text:
+                    snippets.append(f"Reference summary: {abstract_text[:220]}")
+        except Exception:
+            pass
+
+        try:
+            rss_response = requests.get(
+                f"https://news.google.com/rss/search?q={urllib.parse.quote_plus(cleaned_query)}&hl=en-US&gl=US&ceid=US:en",
+                headers=cls.DEFAULT_HEADERS,
+                timeout=timeout_seconds,
+            )
+            if rss_response.ok and rss_response.text:
+                raw_titles = re.findall(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", rss_response.text, re.DOTALL)
+                filtered_headlines: List[str] = []
+                for raw_title in raw_titles[1:5]:
+                    cleaned_headline = re.sub(r"\s+", " ", raw_title).strip()
+                    if cleaned_headline and "Google News" not in cleaned_headline:
+                        filtered_headlines.append(cleaned_headline[:120])
+                    if len(filtered_headlines) >= 2:
+                        break
+                if filtered_headlines:
+                    snippets.append("Recent headlines: " + " | ".join(filtered_headlines))
+        except Exception:
+            pass
+
+        return "\n".join(snippets)
+
+    @classmethod
+    def fetch_live_web_context(cls, query_text: str, timeout_seconds: float = 4.5) -> str:
+        context_parts: List[str] = []
+        stock_summary = cls.fetch_stock_quote_summary(query_text, timeout_seconds=timeout_seconds)
+        if stock_summary:
+            context_parts.append(stock_summary)
+        general_summary = cls.fetch_general_web_summary(query_text, timeout_seconds=timeout_seconds)
+        if general_summary:
+            context_parts.append(general_summary)
+        return "\n".join(context_parts).strip()
+
+
+@dataclass
+class AdminPermissionRequest:
+    """Represents a potentially destructive action requiring explicit admin confirmation."""
+
+    action_title: str
+    risk_description: str
+    is_permanently_blocked: bool = False
+    approved_commands: List[jarvis_response_parser.DrawingCommand] = field(default_factory=list)
+
+
+@dataclass
+class ContextualIntentPlan:
+    """High-level execution route selected for a natural user prompt."""
+
+    intent_kind: str
+    spoken_step_intro: str = ""
+    telemetry_response: str = ""
+    search_query: str = ""
+    agent_commands: List[jarvis_response_parser.DrawingCommand] = field(default_factory=list)
+    admin_request: Optional[AdminPermissionRequest] = None
 
 
 class AgentScreenMonitorService(QObject):
@@ -2181,9 +2484,32 @@ class DesktopAgentService:
 
     VK_CONTROL = 0x11
     VK_RETURN = 0x0D
+    VK_F = 0x46
     VK_L = 0x4C
     VK_V = 0x56
     KEYEVENTF_KEYUP = 0x0002
+
+    MS_SETTINGS_URI_MAP: Dict[str, Tuple[str, str]] = {
+        "storage": ("ms-settings:storagesense", "Windows Storage Settings"),
+        "disk": ("ms-settings:storagesense", "Windows Storage Settings"),
+        "space": ("ms-settings:storagesense", "Windows Storage Settings"),
+        "battery": ("ms-settings:batterysaver", "Battery & Power Settings"),
+        "power": ("ms-settings:powersleep", "Power & Sleep Settings"),
+        "display": ("ms-settings:display", "Display Settings"),
+        "brightness": ("ms-settings:display", "Display Settings"),
+        "sound": ("ms-settings:sound", "Sound Settings"),
+        "audio": ("ms-settings:sound", "Sound Settings"),
+        "bluetooth": ("ms-settings:bluetooth", "Bluetooth & Devices Settings"),
+        "wifi": ("ms-settings:network-wifi", "Wi-Fi Settings"),
+        "wi-fi": ("ms-settings:network-wifi", "Wi-Fi Settings"),
+        "network": ("ms-settings:network", "Network Settings"),
+        "update": ("ms-settings:windowsupdate", "Windows Update"),
+        "apps": ("ms-settings:appsfeatures", "Installed Apps Settings"),
+        "uninstall": ("ms-settings:appsfeatures", "Installed Apps Settings"),
+        "ram": ("ms-settings:about", "System About Settings"),
+        "specs": ("ms-settings:about", "System About Settings"),
+        "about": ("ms-settings:about", "System About Settings"),
+    }
 
     KNOWN_URL_ALIASES: Dict[str, str] = {
         "chatgpt": "https://chatgpt.com",
@@ -2353,10 +2679,49 @@ class DesktopAgentService:
             return False
 
     @classmethod
+    def open_chrome_search(cls, query_text: str) -> Tuple[bool, str]:
+        """Opens Chrome directly to the Google search results page for `query_text`."""
+        cleaned_query = (query_text or "").strip()
+        if not cleaned_query:
+            return False, "Empty search query"
+        search_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(cleaned_query)}"
+        try:
+            cls._pre_launch_hwnd = cls._current_foreground_hwnd()
+            cls._last_app_launch_timestamp = time.monotonic()
+            cls._last_launched_target = "chrome"
+            chrome_exe = cls._resolve_chrome_executable()
+            if chrome_exe:
+                subprocess.Popen(
+                    [chrome_exe, search_url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                )
+                return True, f"Opened Chrome search for {cleaned_query}"
+            opened = webbrowser.open(search_url, new=2)
+            return bool(opened), f"Searched Google for {cleaned_query}"
+        except Exception as exc:
+            return False, str(exc)
+
+    @classmethod
+    def _resolve_settings_uri(cls, topic_text: str) -> Optional[Tuple[str, str]]:
+        lowered = (topic_text or "").lower().strip()
+        for keyword, uri_pair in cls.MS_SETTINGS_URI_MAP.items():
+            if keyword in lowered:
+                return uri_pair
+        return None
+
+    @classmethod
     def describe_step_for_speech(cls, command: jarvis_response_parser.DrawingCommand) -> str:
         """Returns a crisp 3-to-6 word phrase spoken right as each agent step begins."""
         argument_text = (command.body or command.label or command.header or "").strip()
         if command.kind == "open_app":
+            if argument_text.lower().startswith("settings:"):
+                subtopic = argument_text.split(":", 1)[1].strip()
+                resolved_pair = cls._resolve_settings_uri(subtopic)
+                if resolved_pair is not None:
+                    return f"Opening {resolved_pair[1]}."
+                return f"Opening Settings for {subtopic[:26]}."
             app_display = argument_text.capitalize() if argument_text else "app"
             if app_display.lower() == "chrome":
                 app_display = "Chrome"
@@ -2374,6 +2739,8 @@ class DesktopAgentService:
             return f"Typing {argument_text[:34]}."
         if command.kind == "press_keys":
             return f"Pressing {argument_text}."
+        if command.kind == "request_admin_permission":
+            return "Admin confirmation required."
         return "Running step."
 
     @classmethod
@@ -2409,34 +2776,64 @@ class DesktopAgentService:
                 cls._pre_launch_hwnd = cls._current_foreground_hwnd()
                 cls._last_app_launch_timestamp = time.monotonic()
                 cls._last_launched_target = "browser"
+                chrome_exe = cls._resolve_chrome_executable()
+                if chrome_exe:
+                    subprocess.Popen(
+                        [chrome_exe, resolved_url],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        shell=False,
+                    )
+                    return True, f"Opened {resolved_url}"
                 opened = webbrowser.open(resolved_url, new=2)
                 return bool(opened), f"Opened {resolved_url}"
             except Exception as exc:
                 return False, str(exc)
 
         if command_kind == "search_web":
-            query_text = argument_text
-            if not query_text:
-                return False, "Empty search query"
-            search_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query_text)}"
-            try:
-                cls._pre_launch_hwnd = cls._current_foreground_hwnd()
-                cls._last_app_launch_timestamp = time.monotonic()
-                cls._last_launched_target = "browser"
-                opened = webbrowser.open(search_url, new=2)
-                return bool(opened), f"Searched Google for {query_text}"
-            except Exception as exc:
-                return False, str(exc)
+            return cls.open_chrome_search(argument_text)
 
         if command_kind == "open_app":
+            raw_lower = argument_text.lower().strip()
+            if raw_lower.startswith("settings:"):
+                subtopic = raw_lower.split(":", 1)[1].strip()
+                resolved_pair = cls._resolve_settings_uri(subtopic)
+                try:
+                    cls._pre_launch_hwnd = cls._current_foreground_hwnd()
+                    cls._last_app_launch_timestamp = time.monotonic()
+                    cls._last_launched_target = "settings"
+                    if resolved_pair is not None:
+                        uri_target, display_label = resolved_pair
+                        os.startfile(uri_target)
+                        return True, f"Opened {display_label}"
+                    os.startfile("ms-settings:")
+                    cls._wait_for_foreground_window_change(cls._pre_launch_hwnd, timeout_seconds=2.5)
+                    cls._press_win32_combo([cls.VK_CONTROL, cls.VK_F])
+                    time.sleep(0.15)
+                    cls._send_text_to_focused_window(subtopic, focus_address_bar=False, submit_enter=True)
+                    return True, f"Opened Settings and searched {subtopic}"
+                except Exception as exc:
+                    return False, str(exc)
+
             normalized_app = re.sub(r"[\s_\-]+", "", argument_text.lower())
             if normalized_app in ("googlechrome", "chrome"):
                 normalized_app = "chrome"
+            if "settings" in normalized_app:
+                resolved_pair = cls._resolve_settings_uri(argument_text)
+                if resolved_pair is not None:
+                    try:
+                        cls._pre_launch_hwnd = cls._current_foreground_hwnd()
+                        cls._last_app_launch_timestamp = time.monotonic()
+                        cls._last_launched_target = "settings"
+                        os.startfile(resolved_pair[0])
+                        return True, f"Opened {resolved_pair[1]}"
+                    except Exception as exc:
+                        return False, str(exc)
             if normalized_app in ("settings", "windowssettings"):
                 try:
                     cls._pre_launch_hwnd = cls._current_foreground_hwnd()
                     cls._last_app_launch_timestamp = time.monotonic()
-                    cls._last_launched_target = normalized_app
+                    cls._last_launched_target = "settings"
                     os.startfile("ms-settings:")
                     return True, "Opened Windows Settings"
                 except Exception as exc:
@@ -2493,17 +2890,34 @@ class DesktopAgentService:
                 return False, "No text to type"
             elapsed_since_launch = time.monotonic() - cls._last_app_launch_timestamp
             recently_launched_app = elapsed_since_launch < 6.0
+            launched_settings = cls._last_launched_target.startswith("settings")
+            if launched_settings:
+                resolved_pair = cls._resolve_settings_uri(argument_text)
+                if resolved_pair is not None:
+                    try:
+                        os.startfile(resolved_pair[0])
+                        return True, f"Opened {resolved_pair[1]}"
+                    except Exception:
+                        pass
+
             launched_browser = any(
                 browser_name in cls._last_launched_target
                 for browser_name in ("chrome", "edge", "msedge", "firefox", "browser")
             )
-            should_submit = (command.header or "").strip().lower() == "submit" or launched_browser
+            should_submit = (
+                (command.header or "").strip().lower() == "submit"
+                or launched_browser
+                or launched_settings
+            )
             if recently_launched_app:
                 captured_previous_hwnd = cls._pre_launch_hwnd
                 captured_text = argument_text
 
                 def _delayed_typing_worker() -> None:
                     cls._wait_for_foreground_window_change(captured_previous_hwnd, timeout_seconds=2.8)
+                    if launched_settings:
+                        cls._press_win32_combo([cls.VK_CONTROL, cls.VK_F])
+                        time.sleep(0.15)
                     cls._send_text_to_focused_window(
                         captured_text,
                         focus_address_bar=launched_browser,
@@ -2521,6 +2935,9 @@ class DesktopAgentService:
                 ).start()
                 return True, f"Opening & typing {argument_text[:36]}"
 
+            if launched_settings:
+                cls._press_win32_combo([cls.VK_CONTROL, cls.VK_F])
+                time.sleep(0.15)
             typed_ok = cls._send_text_to_focused_window(
                 argument_text,
                 focus_address_bar=False,
@@ -2542,6 +2959,21 @@ class DesktopAgentService:
         if not cleaned:
             return []
         lowered = cleaned.lower().strip(" .,!?")
+
+        settings_compound_match = re.match(
+            r"^(?:please\s+)?(?:open|launch|go\s+to)\s+(?:windows\s+)?settings\s+(?:and|then)\s+(?:please\s+)?(?:search(?:\s+for)?|find|open|check|show|type)\s+(.+)$",
+            lowered,
+        )
+        if settings_compound_match:
+            subtopic = cleaned[settings_compound_match.start(1) :].strip(" .!?")
+            if subtopic:
+                return [
+                    jarvis_response_parser.DrawingCommand(
+                        kind="open_app",
+                        body=f"settings:{subtopic}",
+                        label=f"Settings: {subtopic}",
+                    )
+                ]
 
         compound_url_match = re.match(
             r"^(?:please\s+)?(?:open|launch|start)\s+(?:my\s+)?(chrome|google\s+chrome|edge|firefox|browser|web\s+browser)\s+(?:and|then)\s+(?:please\s+)?(?:go\s+to|open|visit)\s+(.+)$",
@@ -2728,3 +3160,316 @@ class DesktopAgentService:
         """Backward-compatible single-command accessor for direct user agent requests."""
         detected_commands = cls.detect_direct_user_agent_commands(user_prompt)
         return detected_commands[0] if detected_commands else None
+
+    @classmethod
+    def coalesce_agent_commands(
+        cls,
+        commands: List[jarvis_response_parser.DrawingCommand],
+    ) -> List[jarvis_response_parser.DrawingCommand]:
+        """Merges fragile two-step launch+type pairs into direct Chrome search URLs or deep Settings URIs."""
+        coalesced: List[jarvis_response_parser.DrawingCommand] = []
+        scan_idx = 0
+        total_cmds = len(commands)
+        while scan_idx < total_cmds:
+            current_cmd = commands[scan_idx]
+            if scan_idx + 1 < total_cmds and commands[scan_idx + 1].kind == "type_text":
+                next_cmd = commands[scan_idx + 1]
+                next_text = (next_cmd.body or next_cmd.label or "").strip()
+                is_browser_launch = (
+                    current_cmd.kind == "open_browser"
+                    or (
+                        current_cmd.kind == "open_app"
+                        and (current_cmd.body or "").strip().lower()
+                        in ("chrome", "googlechrome", "edge", "msedge", "firefox", "browser")
+                    )
+                )
+                if is_browser_launch and next_text:
+                    maybe_url = cls.normalize_target_url(next_text)
+                    if maybe_url is not None and " " not in next_text:
+                        coalesced.append(
+                            jarvis_response_parser.DrawingCommand(
+                                kind="open_url",
+                                body=maybe_url,
+                                label=next_text,
+                            )
+                        )
+                        scan_idx += 2
+                        continue
+                    if (next_cmd.header or "").strip().lower() == "submit":
+                        coalesced.append(
+                            jarvis_response_parser.DrawingCommand(
+                                kind="search_web",
+                                body=next_text,
+                                label=next_text,
+                            )
+                        )
+                        scan_idx += 2
+                        continue
+                if current_cmd.kind == "open_app" and (current_cmd.body or "").strip().lower().startswith("settings") and next_text:
+                    coalesced.append(
+                        jarvis_response_parser.DrawingCommand(
+                            kind="open_app",
+                            body=f"settings:{next_text}",
+                            label=f"Settings: {next_text}",
+                        )
+                    )
+                    scan_idx += 2
+                    continue
+            coalesced.append(current_cmd)
+            scan_idx += 1
+        return coalesced
+
+    @classmethod
+    def check_command_requires_admin(
+        cls,
+        command: jarvis_response_parser.DrawingCommand,
+    ) -> Optional[AdminPermissionRequest]:
+        """Checks whether an LLM-emitted command asks for admin approval or touches destructive keys."""
+        if command.kind == "request_admin_permission":
+            action_title = (command.label or "Protected Action").strip()
+            risk_desc = (command.body or "This action modifies files or system state.").strip()
+            return AdminPermissionRequest(
+                action_title=action_title,
+                risk_description=f"{risk_desc} Confirm to approve or cancel to abort.",
+                is_permanently_blocked=True,
+            )
+        if command.kind == "press_keys":
+            combo_lower = (command.body or command.label or "").lower().replace(" ", "")
+            if any(risky_combo in combo_lower for risky_combo in ("alt+f4", "shift+delete", "shift+del")):
+                return AdminPermissionRequest(
+                    action_title=f"Send shortcut {combo_lower}",
+                    risk_description="Closing an app or deleting items can cause unsaved data loss. Reply 'confirm' to proceed or 'cancel' to abort.",
+                    is_permanently_blocked=False,
+                    approved_commands=[command],
+                )
+        return None
+
+    @classmethod
+    def check_destructive_or_admin_request(cls, user_prompt: str) -> Optional[AdminPermissionRequest]:
+        """Detects potentially destructive user requests and returns an AdminPermissionRequest gate."""
+        normalized = re.sub(r"\s+", " ", (user_prompt or "").lower().strip())
+        if not normalized:
+            return None
+
+        if re.search(
+            r"\b(?:format\s+(?:drive|[a-z]:)|wipe\s+(?:disk|drive|system|pc)|erase\s+(?:disk|drive|all)|"
+            r"delete\s+(?:all\s+)?(?:system|windows|important|my)?\s*files?|remove\s+all\s+files?|"
+            r"rm\s+-rf|rmdir|del\s+/f|empty\s+(?:the\s+)?recycle\s+bin)\b",
+            normalized,
+        ):
+            return AdminPermissionRequest(
+                action_title="Delete or Erase Files / Drive Data",
+                risk_description=(
+                    "Deleting files, clearing the Recycle Bin, or formatting a drive can permanently destroy data. "
+                    "Admin confirmation is required — reply 'confirm' or 'cancel'."
+                ),
+                is_permanently_blocked=True,
+            )
+
+        if re.search(
+            r"\b(?:reg\s+delete|(?:edit|modify|delete)\s+(?:the\s+)?registry|"
+            r"disable\s+(?:windows\s+)?defender|disable\s+firewall|turn\s+off\s+firewall|"
+            r"kill\s+process|terminate\s+process|taskkill)\b",
+            normalized,
+        ):
+            return AdminPermissionRequest(
+                action_title="Modify Protected System Security or Processes",
+                risk_description=(
+                    "Changing Windows Defender, firewall, registry keys, or killing processes requires administrator privileges "
+                    "and can destabilize Windows. Reply 'confirm' to acknowledge or 'cancel' to abort."
+                ),
+                is_permanently_blocked=True,
+            )
+
+        if re.search(r"\b(?:shut\s*down|power\s+off|restart\s+(?:my\s+)?(?:pc|computer|laptop)|reboot)\b", normalized):
+            return AdminPermissionRequest(
+                action_title="Shut Down or Restart Windows",
+                risk_description=(
+                    "Powering off or restarting Windows will close all active applications and may discard unsaved work. "
+                    "Reply 'confirm' to proceed to Power Settings or 'cancel' to abort."
+                ),
+                is_permanently_blocked=False,
+                approved_commands=[
+                    jarvis_response_parser.DrawingCommand(
+                        kind="open_app",
+                        body="settings:power",
+                        label="Power & Sleep Settings",
+                    )
+                ],
+            )
+
+        if re.search(r"\buninstall\b", normalized):
+            return AdminPermissionRequest(
+                action_title="Uninstall Application",
+                risk_description=(
+                    "Uninstalling removes programs and application data from this PC. "
+                    "Reply 'confirm' to open Installed Apps Settings or 'cancel' to abort."
+                ),
+                is_permanently_blocked=False,
+                approved_commands=[
+                    jarvis_response_parser.DrawingCommand(
+                        kind="open_app",
+                        body="settings:apps",
+                        label="Installed Apps Settings",
+                    )
+                ],
+            )
+
+        if re.search(r"\b(?:alt\s*\+\s*f4|shift\s*\+\s*del(?:ete)?)\b", normalized):
+            shortcut_combo = "alt+f4" if "f4" in normalized else "shift+delete"
+            return AdminPermissionRequest(
+                action_title=f"Execute {shortcut_combo}",
+                risk_description=(
+                    f"Running {shortcut_combo} closes windows or permanently deletes items. "
+                    "Reply 'confirm' to proceed or 'cancel' to abort."
+                ),
+                is_permanently_blocked=False,
+                approved_commands=[
+                    jarvis_response_parser.DrawingCommand(
+                        kind="press_keys",
+                        body=shortcut_combo,
+                        label=shortcut_combo,
+                    )
+                ],
+            )
+
+        return None
+
+    @staticmethod
+    def _extract_web_lookup_query(user_prompt: str) -> str:
+        cleaned = re.sub(r"\s+", " ", (user_prompt or "").strip()).strip(" ?!.")
+        cleaned = re.sub(
+            r"^(?:please\s+|hey\s+jarvis\s*,?\s*|jarvis\s*,?\s*)?"
+            r"(?:can\s+you\s+|could\s+you\s+|go\s+to\s+chrome\s+and\s+|"
+            r"open\s+chrome\s+and\s+|check\s+chrome\s+for\s+|"
+            r"tell\s+me\s+(?:what\s+(?:is|are)\s+)?|what(?:'s|\s+is|\s+are)\s+(?:the\s+)?|check\s+)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(
+            r"\s+(?:and\s+tell\s+me|on\s+chrome|in\s+chrome|right\s+now|today|for\s+me)$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip(" ?!.")
+        return cleaned or (user_prompt or "").strip()
+
+    @classmethod
+    def classify_contextual_intent(cls, user_prompt: str) -> ContextualIntentPlan:
+        """
+        Routes natural user prompts with practical intelligence:
+        1. Admin confirmation gate for destructive operations
+        2. Live Windows telemetry + deep-linked Settings pages (Storage, RAM, Battery)
+        3. Live web / stock / market lookup -> open Chrome search + read exact answer back
+        4. Compound / multitask desktop & browser agent chains (coalesced cleanly)
+        5. Standard visual screen tutor & drawing explanation
+        """
+        cleaned_prompt = re.sub(r"\s+", " ", (user_prompt or "").strip())
+        lowered = cleaned_prompt.lower()
+
+        admin_request = cls.check_destructive_or_admin_request(cleaned_prompt)
+        if admin_request is not None:
+            return ContextualIntentPlan(
+                intent_kind="admin_permission_gate",
+                admin_request=admin_request,
+            )
+
+        if any(
+            phrase in lowered
+            for phrase in (
+                "storage left",
+                "disk space",
+                "free space",
+                "how much storage",
+                "check my storage",
+                "drive space",
+                "storage space",
+                "how much space",
+            )
+        ):
+            storage_text = SystemTelemetryService.get_storage_summary()
+            return ContextualIntentPlan(
+                intent_kind="system_telemetry_and_settings",
+                spoken_step_intro="Opening Windows Storage Settings.",
+                telemetry_response=f"Opened Windows Storage Settings. {storage_text}",
+                agent_commands=[
+                    jarvis_response_parser.DrawingCommand(
+                        kind="open_app",
+                        body="settings:storage",
+                        label="Windows Storage Settings",
+                    )
+                ],
+            )
+
+        if any(
+            phrase in lowered
+            for phrase in ("how much ram", "ram left", "memory left", "ram usage", "memory usage", "check my ram")
+        ):
+            ram_text = SystemTelemetryService.get_memory_summary()
+            return ContextualIntentPlan(
+                intent_kind="system_telemetry_and_settings",
+                spoken_step_intro="Opening System About Settings.",
+                telemetry_response=f"Opened System Settings. {ram_text}",
+                agent_commands=[
+                    jarvis_response_parser.DrawingCommand(
+                        kind="open_app",
+                        body="settings:ram",
+                        label="System About Settings",
+                    )
+                ],
+            )
+
+        if any(
+            phrase in lowered
+            for phrase in ("battery left", "battery percentage", "how much battery", "check battery", "battery level")
+        ):
+            battery_text = SystemTelemetryService.get_battery_summary()
+            return ContextualIntentPlan(
+                intent_kind="system_telemetry_and_settings",
+                spoken_step_intro="Opening Battery Settings.",
+                telemetry_response=f"Opened Battery Settings. {battery_text}",
+                agent_commands=[
+                    jarvis_response_parser.DrawingCommand(
+                        kind="open_app",
+                        body="settings:battery",
+                        label="Battery Settings",
+                    )
+                ],
+            )
+
+        is_web_lookup_question = any(
+            phrase in lowered
+            for phrase in (
+                "stock price",
+                "share price",
+                "price of ",
+                "bitcoin price",
+                "crypto price",
+                "weather in ",
+                "latest news on ",
+                "who won ",
+            )
+        ) or bool(
+            re.search(
+                r"\b(?:search|check|look\s+up|find)\b.*\b(?:chrome|google)\b.*\b(?:tell\s+me|what\s+is|price|answer)\b",
+                lowered,
+            )
+        )
+        if is_web_lookup_question:
+            lookup_query = cls._extract_web_lookup_query(cleaned_prompt)
+            return ContextualIntentPlan(
+                intent_kind="web_lookup_and_answer",
+                spoken_step_intro=f"Searching Chrome for {lookup_query[:38]}.",
+                search_query=lookup_query,
+            )
+
+        direct_commands = cls.detect_direct_user_agent_commands(cleaned_prompt)
+        if direct_commands:
+            coalesced_commands = cls.coalesce_agent_commands(direct_commands)
+            return ContextualIntentPlan(
+                intent_kind="multitask_agent",
+                agent_commands=coalesced_commands,
+            )
+
+        return ContextualIntentPlan(intent_kind="visual_explanation")

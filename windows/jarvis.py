@@ -424,6 +424,35 @@ def run_strict_selftest() -> int:
                 and ("User" in memory_context_text)
             )
 
+        parsed_diagram_rows = jarvis_overlay_windows._parse_paper_body_rows(
+            "Planning | Recruitment | section:Key Idea | Training -> Appraisal"
+        )
+        diagram_notes_ok = (
+            bool(parsed_diagram_rows)
+            and all(row_item.kind in ("flow", "section") for row_item in parsed_diagram_rows)
+            and (jarvis_response_parser.should_use_visual_explanation_notes("what is my storage left") is False)
+            and (jarvis_response_parser.should_use_visual_explanation_notes("explain the scope of HRM") is True)
+            and (jarvis_response_parser.should_use_visual_explanation_notes("explain this diagram") is True)
+        )
+
+        web_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
+            "what is the nvidia stock price"
+        )
+        storage_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
+            "what is my storage left"
+        )
+        admin_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
+            "delete all system files"
+        )
+        intent_router_ok = (
+            web_intent.intent_kind == "web_lookup_and_answer"
+            and ("nvidia" in web_intent.search_query.lower())
+            and storage_intent.intent_kind == "system_telemetry_and_settings"
+            and ("GB" in jarvis_services.SystemTelemetryService.get_storage_summary())
+            and admin_intent.intent_kind == "admin_permission_gate"
+            and (admin_intent.admin_request is not None)
+        )
+
         parser_ok = (
             "internal reasoning hidden" not in parsed_turn.spoken_text
             and len(collected_commands) >= 4
@@ -435,6 +464,8 @@ def run_strict_selftest() -> int:
             and multitask_agent_ok
             and voice_sync_ok
             and memory_ok
+            and diagram_notes_ok
+            and intent_router_ok
             and precise_norm_ok
         )
         suite4_ok = (
@@ -452,7 +483,8 @@ def run_strict_selftest() -> int:
                 f"mean_ms={main_mean_ms:.3f}ms, hidden={hidden_on_close}, "
                 f"personal={main_personal_ok}, scroll_ok={scroll_intent_ok and scroll_parse_ok}, "
                 f"snap_ok={baseline_snap_ok}, agent_ok={agent_ok}, multitask_ok={multitask_agent_ok}, "
-                f"sync_ok={voice_sync_ok}, memory_ok={memory_ok}, precise_ok={precise_norm_ok}, "
+                f"sync_ok={voice_sync_ok}, memory_ok={memory_ok}, diagram_ok={diagram_notes_ok}, "
+                f"intent_ok={intent_router_ok}, precise_ok={precise_norm_ok}, "
                 f"single_char={single_char_violations[:8]}"
             ),
         )

@@ -1,0 +1,28 @@
+# Secrets & local runtime config
+.env
+.env.*
+!.env.example
+*.env
+user_settings.json
+windows/user_settings.json
+*.log
+__pycache__/
+*.pyc
+*.pyo
+
+# Workspace directories & files not part of Jarvis
+.remember/
+leanring-buddy/
+leanring-buddy.xcodeproj/
+leanring-buddyTests/
+leanring-buddyUITests/
+reference images/
+scripts/
+worker/
+/AGENTS.md
+/appcast.xml
+/CLAUDE.md
+/*-demo.gif
+/dmg-background.png
+/HEY*_REVERSE_ENGINEERED.md
+/LICENSE

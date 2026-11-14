@@ -60,20 +60,22 @@ ACTIVITY_GLOW_COLORS: Dict[str, tuple] = {
     "warning": (QColor("#FF9F0A"), QColor("#FFD60A")),
 }
 
-# Obsidian-glass personal studio dark theme + mirrored crisp light theme.
+# Pure dark obsidian/carbon studio theme + mirrored light theme.
 WINDOW_PALETTE_DARK: Dict[str, str] = {
-    "background": "#0D0F14",
-    "sidebar": "#12151E",
-    "card": "#181C26",
-    "card_hover": "#1F2533",
-    "separator": "#283042",
-    "text_primary": "#F6F8FF",
-    "text_secondary": "#A3AEC2",
-    "text_tertiary": "#697386",
-    "accent": "#3388FF",
-    "accent_soft": "#7CC4FF",
-    "danger": "#FF5C5C",
-    "selection": "#232B3D",
+    "background": "#09090B",
+    "sidebar": "#0E0E11",
+    "card": "#141418",
+    "card_hover": "#1C1C22",
+    "separator": "#24242C",
+    "text_primary": "#F4F4F6",
+    "text_secondary": "#A1A1AA",
+    "text_tertiary": "#71717A",
+    "accent": "#27272A",
+    "accent_soft": "#E4E4E7",
+    "success": "#22C55E",
+    "warning": "#F59E0B",
+    "danger": "#EF4444",
+    "selection": "#1F1F26",
 }
 WINDOW_PALETTE_LIGHT: Dict[str, str] = {
     "background": "#F5F5F7",
@@ -90,12 +92,13 @@ WINDOW_PALETTE_LIGHT: Dict[str, str] = {
     "selection": "#E2E2E6",
 }
 
-# Drawing palette (Jarvis draw engine PALETTE): warm paper, charcoal ink, semantic tones.
-DRAWING_PAPER_CREAM = QColor("#FAF6EE")
-DRAWING_PAPER_COOL = QColor("#EDF1F5")  # light grey-blue board seen in the photos
-DRAWING_PAPER_HEADER = QColor("#D9DEE5")
-DRAWING_GRID_LINE = QColor(120, 140, 165, 34)
-DRAWING_INK = QColor("#1E1E1C")
+# Drawing palette (Jarvis draw engine PALETTE): sleek dark notes paper, crisp ink, semantic tones.
+DRAWING_PAPER_CREAM = QColor("#121216")
+DRAWING_PAPER_WARM = QColor("#121216")
+DRAWING_PAPER_COOL = QColor("#121216")
+DRAWING_PAPER_HEADER = QColor("#1A1A20")
+DRAWING_GRID_LINE = QColor(255, 255, 255, 16)
+DRAWING_INK = QColor("#F4F4F6")
 DRAWING_TONES: Dict[str, QColor] = {
     "blue": QColor("#1E7BFF"),
     "red": QColor("#FF4D4F"),

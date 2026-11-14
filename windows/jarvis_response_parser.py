@@ -57,7 +57,17 @@ _CALL_LINE_PATTERN = re.compile(
 )
 
 _COMMAND_PREFIX_PATTERN = re.compile(
-    rf"^{_COMMAND_NAMES_PATTERN}\s*\(",
+    rf"^[\s\-*\u2022\d.)>`]*(?:DRAW|CMD|COMMAND|ACTION|TOOL)?\s*:?\s*`*{_COMMAND_NAMES_PATTERN}\s*(?:\(|:)",
+    re.IGNORECASE,
+)
+
+_INLINE_COMMAND_START_PATTERN = re.compile(
+    rf"\b{_COMMAND_NAMES_PATTERN}\s*\(",
+    re.IGNORECASE,
+)
+
+_COLON_CALL_LINE_PATTERN = re.compile(
+    rf"^\s*{_COMMAND_NAMES_PATTERN}\s*:\s*(.+?)\s*;?\s*$",
     re.IGNORECASE,
 )
 
@@ -72,7 +82,7 @@ def build_vision_system_prompt(
     has_lasso_crop: bool = False,
     scroll_step_index: int = 0,
     max_scroll_steps: int = 0,
-    drawing_mode: str = "precise_lines",
+    drawing_mode: str = "lines_and_card",
     agent_actions_enabled: bool = True,
 ) -> str:
     """
@@ -82,15 +92,17 @@ def build_vision_system_prompt(
     (`0..screen_width` x `0..screen_height`) so drawing coordinates align accurately
     with visible text, equations, ChatGPT sections, and buttons.
     """
-    normalized_mode = (drawing_mode or "precise_lines").strip().lower()
+    normalized_mode = (drawing_mode or "lines_and_card").strip().lower()
     prompt_sections: List[str] = [
         "You are Jarvis, a warm, crystal-clear visual tutor and desktop companion on Windows.",
         f"The attached screenshot is {screen_width}x{screen_height} pixels (1:1 logical screen coordinates, top-left is 0,0).",
-        "A coordinate ruler runs along the top and left edges (ticks every 100px, faint grid every 200px) — carefully read exact X and Y pixel values from those rulers so every underline lands cleanly under the intended phrase without drifting into whitespace or covering text.",
+        "A coordinate ruler runs along the top and left edges (ticks every 100px, faint grid every 200px). Read exact X and Y pixel values from those rulers so every underline lands directly under the intended text without drifting into whitespace.",
         "Keep spoken replies warm, direct, and easy to follow (2 to 4 natural sentences).",
         "Always inspect the current screenshot freshly; never repeat steps or sections you already explained earlier.",
-        "Never use markdown asterisks (**bold** or *italic*), bullet symbols, emojis, or code blocks in your text.",
-        "Never read coordinates, numbers from drawing commands, or command names aloud.",
+        "CRITICAL FORMATTING RULES:",
+        "1. Put every command on its OWN standalone line BEFORE the spoken sentence that explains it, with NO bullet (- or *), NO numbering, NO backticks, and NO trailing arrow comments.",
+        "2. NEVER speak or write command names like 'underline', 'paper', 'point', 'ring', 'box', or coordinates inside your spoken sentences.",
+        "3. Never use markdown asterisks (**bold** or *italic*), bullet symbols, emojis, or code blocks in your spoken text.",
         "",
         "VISUAL EXPLANATION & SCREEN DRAWING COMMANDS:",
     ]
@@ -99,34 +111,32 @@ def build_vision_system_prompt(
         prompt_sections.extend(
             [
                 "Cursor-only mode is enabled: do NOT emit underline, ring, box, highlight, or paper commands.",
-                f"- Optionally emit up to 2 point(x, y, \"\") commands (x, y in 0..{screen_width} x 0..{screen_height}) to aim the cursor cleanly.",
+                f"Optionally emit up to 2 point(x, y, \"\") commands (x, y in 0..{screen_width} x 0..{screen_height}) on their own lines to aim the cursor cleanly.",
             ]
         )
     elif normalized_mode in ("precise_lines", "lines_and_card"):
         prompt_sections.extend(
             [
-                "Keep screen annotations minimal, neat, and textbook-clean while explaining:",
-                f"- underline(x, y, width, \"\") -> PRIMARY tool. Draw 2 to 4 crisp horizontal underlines directly beneath the exact key words or short phrases you are explaining (y = bottom baseline of that text + 4px, x = left edge of the phrase, width = exact phrase pixel width; x, y in 0..{screen_width} x 0..{screen_height}). Pass empty \"\" for the label.",
-                "- point(x, y, \"\") -> OPTIONAL. Gently glides the Jarvis cursor to a single button, icon, or formula.",
-                "STRICTLY AVOID: Do NOT emit `box(...)`, `frame(...)`, `highlight(...)`, or `ring(...)`. Never draw giant boxes around whole paragraphs, never cover readable text with yellow highlights, and never invent floating tags.",
+                "Whenever you explain concepts, code, equations, or ChatGPT answers on screen, ALWAYS include BOTH:",
+                "First, one visual notes card on a clear side margin (empty left or right area, avoiding overlapping the main text) using exact format:",
+                "paper(24, 160, 320, 340, \"Topic Title\", \"Core Summary\", \"Concept A -> Concept B | section:Key Idea | Input -> Output\")",
+                f"Second, 2 to 4 crisp horizontal underlines placed directly underneath the exact key headings or phrases you explain on screen (y = baseline of that text + 4px, x = left edge of phrase, width = exact phrase pixel width in 0..{screen_width} x 0..{screen_height}):",
+                "underline(420, 310, 260, \"\")",
+                "Optionally glide the cursor to a key term or button with:",
+                "point(420, 310, \"\")",
+                "STRICTLY AVOID: Do NOT emit box(...), frame(...), highlight(...), or ring(...). Never draw giant boxes around whole paragraphs.",
             ]
         )
-        if normalized_mode == "lines_and_card":
-            prompt_sections.extend(
-                [
-                    "- paper(24, 160, 320, 340, \"Card Title\", \"short header\", \"Step 1 -> Step 2 | section:Key Idea\") -> OPTIONAL summary diagram card in an empty margin when explaining multi-step flows; invent text strictly from visible screen content.",
-                ]
-            )
     else:
         prompt_sections.extend(
             [
-                "While explaining ChatGPT responses, code, formulas, or articles, emit 2 to 4 accurate visual commands on their own lines between sentences:",
-                f"- underline(x, y, width, \"\")  -> clean blue underline directly beneath a key heading/phrase (x, y in 0..{screen_width} x 0..{screen_height}).",
-                "- ring(x, y, radius, \"label\")  -> neat circle around a compact icon or term (radius <= 55).",
-                "- point(x, y, \"label\")         -> flies the blue Jarvis cursor to (x, y) and points cleanly.",
-                "- box(x, y, width, height, \"label\") -> small frame around a compact formula or UI button only (never wrap whole paragraphs).",
-                "- highlight(x, y, width, height, \"label\") -> subtle wash across one short line only.",
-                "- paper(24, 160, 320, 340, \"Card Title\", \"short header\", \"Concept A -> Concept B | section:Key Idea | doc:Input -> doc:Output\")",
+                "While explaining ChatGPT responses, code, formulas, or articles, emit BOTH one paper(...) summary notes card AND 2 to 4 underline(...) commands on their own lines between sentences:",
+                f"underline(x, y, width, \"\")  (clean underline directly beneath a key heading/phrase; x, y in 0..{screen_width} x 0..{screen_height})",
+                "paper(24, 160, 320, 340, \"Card Title\", \"short header\", \"Concept A -> Concept B | section:Key Idea | Input -> Output\")",
+                "ring(x, y, radius, \"label\")  (neat circle around a compact icon or term; radius <= 55)",
+                "point(x, y, \"label\")         (glides the Jarvis cursor to (x, y) and points cleanly)",
+                "box(x, y, width, height, \"label\") (small frame around a compact formula or UI button only)",
+                "highlight(x, y, width, height, \"label\") (subtle wash across one short line only)",
             ]
         )
 
@@ -135,13 +145,19 @@ def build_vision_system_prompt(
             [
                 "",
                 "DESKTOP & BROWSER AGENT COMMANDS:",
-                "When the user explicitly asks you to open their browser, visit a website, search the web, launch an app, press a shortcut, or type text, emit the matching command on its own line alongside a brief spoken confirmation:",
-                "- open_browser(\"https://www.google.com\") -> opens the default web browser (or \"https://chatgpt.com\", etc.).",
-                "- open_url(\"https://example.com\")        -> opens a specific URL in a new browser tab.",
-                "- search_web(\"search query\")            -> opens a web search for the query.",
-                "- open_app(\"notepad\")                   -> launches a desktop app (chrome, edge, notepad, calculator, paint, explorer, terminal, vscode, settings).",
-                "- press_keys(\"ctrl+t\")                  -> sends a safe keyboard shortcut or key (e.g., ctrl+t, ctrl+l, enter, pagedown).",
-                "- type_text(\"hello\")                    -> types short text into the focused field.",
+                "When the user asks you to open a browser/app, visit a site, search the web, press a shortcut, or type text, emit ALL required commands on consecutive standalone lines in the SAME response, then give a short spoken confirmation.",
+                "NEVER say 'I will type/search/open it after it loads' — Jarvis automatically waits for the window to open and focus before typing!",
+                "Available commands (each on its own line):",
+                "open_browser(\"https://www.google.com\")",
+                "open_url(\"https://example.com\")",
+                "search_web(\"search query\")",
+                "open_app(\"chrome\")",
+                "press_keys(\"ctrl+t\")",
+                "type_text(\"hello\")",
+                "Example when user says 'open Chrome and type latest AI news':",
+                "open_app(\"chrome\")",
+                "type_text(\"latest AI news\")",
+                "Opening Chrome and typing that for you.",
             ]
         )
 
@@ -150,8 +166,8 @@ def build_vision_system_prompt(
             [
                 "",
                 "LASSO HIGHLIGHT FOCUS:",
-                "The user drew a cyan lasso around a specific target region, and a 2x zoomed close-up crop is attached as the second image.",
-                "Focus your explanation directly on the content inside the cyan lasso and align any underline or point to its exact coordinates on the main screenshot.",
+                "The user drew a lasso around a specific target region, and a 2x zoomed close-up crop is attached as the second image.",
+                "Focus your explanation directly on the content inside the lasso and align any underline or point to its exact coordinates on the main screenshot.",
             ]
         )
 
@@ -258,12 +274,123 @@ def extract_style_preference_from_user_message(user_message: str) -> Optional[st
     return None
 
 
+def _find_matching_paren_end(raw_text: str, open_paren_index: int) -> int:
+    """Returns the index of the closing `)` balancing `open_paren_index`, or -1 if unclosed."""
+    active_quote: Optional[str] = None
+    escape_next = False
+    paren_depth = 0
+    text_length = len(raw_text)
+
+    for char_index in range(open_paren_index, text_length):
+        character = raw_text[char_index]
+        if escape_next:
+            escape_next = False
+            continue
+        if character == "\\" and active_quote is not None:
+            escape_next = True
+            continue
+        if active_quote is not None:
+            if character == active_quote:
+                active_quote = None
+            continue
+        if character in ('"', "'"):
+            active_quote = character
+            continue
+        if character == "(":
+            paren_depth += 1
+        elif character == ")":
+            paren_depth -= 1
+            if paren_depth == 0:
+                return char_index
+    return -1
+
+
+def _strip_command_line_noise(raw_line: str) -> str:
+    """Strips markdown bullets, prefixes, brackets, and backticks around a standalone command."""
+    cleaned = (raw_line or "").strip()
+    cleaned = re.sub(r"^[\s\-*\u2022\d.)>`]+", "", cleaned).strip()
+    cleaned = re.sub(r"^(?:DRAW|CMD|COMMAND|ACTION|TOOL)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    if cleaned.startswith("`") and cleaned.endswith("`") and len(cleaned) >= 2:
+        cleaned = cleaned[1:-1].strip()
+    if cleaned.startswith("[") and cleaned.endswith("]") and len(cleaned) >= 2:
+        cleaned = cleaned[1:-1].strip()
+    cleaned = cleaned.strip("`").strip()
+    return cleaned
+
+
+def _extract_inline_commands(
+    raw_text: str,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> Tuple[str, List[DrawingCommand]]:
+    """Extracts any inline command calls (`underline(...)`, `paper(...)`, etc.) embedded in prose."""
+    if not raw_text:
+        return "", []
+    text_without_tags, tag_commands = _extract_inline_point_tags(raw_text, scale_x=scale_x, scale_y=scale_y)
+    extracted_commands: List[DrawingCommand] = list(tag_commands)
+
+    kept_fragments: List[str] = []
+    scan_index = 0
+    text_length = len(text_without_tags)
+    while scan_index < text_length:
+        inline_match = _INLINE_COMMAND_START_PATTERN.search(text_without_tags, scan_index)
+        if not inline_match:
+            kept_fragments.append(text_without_tags[scan_index:])
+            break
+
+        open_paren_index = text_without_tags.find("(", inline_match.start())
+        close_paren_index = _find_matching_paren_end(text_without_tags, open_paren_index)
+        if close_paren_index == -1:
+            kept_fragments.append(text_without_tags[scan_index:])
+            break
+
+        candidate_call = text_without_tags[inline_match.start() : close_paren_index + 1]
+        parsed_command = parse_command_line(candidate_call, scale_x=scale_x, scale_y=scale_y)
+        if parsed_command is not None:
+            prefix_slice = text_without_tags[scan_index : inline_match.start()]
+            prefix_slice = re.sub(r"[\[`\s\-*\u2022>]+$", " ", prefix_slice)
+            prefix_slice = re.sub(r"(?:DRAW|CMD|COMMAND|ACTION|TOOL)\s*:\s*$", "", prefix_slice, flags=re.IGNORECASE)
+            kept_fragments.append(prefix_slice)
+            extracted_commands.append(parsed_command)
+            scan_index = close_paren_index + 1
+            while scan_index < text_length and text_without_tags[scan_index] in ("]", "`", ";"):
+                scan_index += 1
+        else:
+            kept_fragments.append(text_without_tags[scan_index : close_paren_index + 1])
+            scan_index = close_paren_index + 1
+
+    cleaned_remaining = "".join(kept_fragments)
+    # Also remove any leaked colon-form commands like `underline: 120, 200, 300`
+    cleaned_remaining = re.sub(
+        rf"(?i)(?:^|\s){_COMMAND_NAMES_PATTERN}\s*:\s*[\d.,\s\"'a-zA-Z_-]+?(?=$|\s+[A-Z]|\s*\n)",
+        " ",
+        cleaned_remaining,
+    )
+    return cleaned_remaining, extracted_commands
+
+
+def _has_unclosed_command(partial_text: str) -> bool:
+    """True when `partial_text` ends inside an unclosed command call like `underline(420, 3`."""
+    if not partial_text:
+        return False
+    last_match: Optional[re.Match] = None
+    for candidate_match in _INLINE_COMMAND_START_PATTERN.finditer(partial_text):
+        last_match = candidate_match
+    if last_match is None:
+        return False
+    open_paren_index = partial_text.find("(", last_match.start())
+    return _find_matching_paren_end(partial_text, open_paren_index) == -1
+
+
 def clean_spoken_text(raw_text: str) -> str:
     """Strips markdown noise, thinking tags, and leftover drawing syntax from spoken text."""
     if not raw_text:
         return ""
     cleaned = _THINK_BLOCK_PATTERN.sub(" ", raw_text)
     cleaned = _POINT_TAG_PATTERN.sub("", cleaned)
+    cleaned, _unused_commands = _extract_inline_commands(cleaned, scale_x=1.0, scale_y=1.0)
+    # Strip any trailing truncated command call (`underline(120, 300...` without closing paren)
+    cleaned = re.sub(rf"(?is)\b{_COMMAND_NAMES_PATTERN}\s*\([^)]*$", "", cleaned)
     cleaned = re.sub(r"```[a-zA-Z0-9_-]*", "", cleaned)
     cleaned = cleaned.replace("```", "")
     # Strip markdown bold/italic/code/headings while keeping plain apostrophes and punctuation
@@ -272,6 +399,9 @@ def clean_spoken_text(raw_text: str) -> str:
     cleaned = cleaned.replace("`", "")
     cleaned = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", cleaned)
     cleaned = re.sub(r"(?m)^\s*[-*•]\s+", "", cleaned)
+    # Prevent stray leaked command labels from being spoken aloud
+    cleaned = re.sub(r"(?im)^\s*(?:underline|paper|point|ring|box|highlight|draw|cmd|command)\s*[:\-]\s*", "", cleaned)
+    cleaned = re.sub(r"(?i)^\s*(?:underline|paper)\b[\s,:\-]*$", "", cleaned)
     # Normalize common curly typography to clean ASCII equivalents
     replacements = {
         "\u2018": "'",
@@ -349,7 +479,26 @@ def parse_command_line(
     scale_y: float = 1.0,
 ) -> Optional[DrawingCommand]:
     """Parses one standalone drawing command line into a scaled DrawingCommand."""
-    match = _CALL_LINE_PATTERN.match(line_text or "")
+    normalized_line = _strip_command_line_noise(line_text)
+    match = _CALL_LINE_PATTERN.match(normalized_line)
+    if not match:
+        prefix_call_match = re.match(rf"^\s*{_COMMAND_NAMES_PATTERN}\s*\(", normalized_line, re.IGNORECASE)
+        if prefix_call_match:
+            open_paren_index = normalized_line.find("(", prefix_call_match.start())
+            close_paren_index = _find_matching_paren_end(normalized_line, open_paren_index)
+            if close_paren_index != -1:
+                trailing_after_call = normalized_line[close_paren_index + 1 :].strip()
+                if (
+                    not trailing_after_call
+                    or trailing_after_call.startswith((";", "`", "]", "->", "//", "#"))
+                ):
+                    normalized_line = normalized_line[: close_paren_index + 1]
+                    match = _CALL_LINE_PATTERN.match(normalized_line)
+    if not match:
+        colon_match = _COLON_CALL_LINE_PATTERN.match(normalized_line)
+        if colon_match:
+            synthesized_call = f"{colon_match.group(1)}({colon_match.group(2)})"
+            match = _CALL_LINE_PATTERN.match(synthesized_call)
     if not match:
         return None
 
@@ -574,11 +723,11 @@ def parse_model_response(
         if parsed_cmd is not None:
             commands.append(parsed_cmd)
             continue
-        line_without_tags, inline_commands = _extract_inline_point_tags(
+        line_without_commands, inline_commands = _extract_inline_commands(
             stripped_line, scale_x=scale_x, scale_y=scale_y
         )
         commands.extend(inline_commands)
-        cleaned_line = clean_spoken_text(line_without_tags)
+        cleaned_line = clean_spoken_text(line_without_commands)
         if cleaned_line:
             spoken_lines.append(cleaned_line)
 
@@ -668,20 +817,21 @@ class StreamingSentenceExtractor:
             new_sentences.extend(line_sentences)
             new_commands.extend(line_commands)
 
-        # If the current incomplete line is clearly prose (not a command call or fence),
+        # If the current incomplete line is prose (and not inside an unclosed command call),
         # flush completed sentences mid-line so speech starts fast on single-paragraph replies.
         stripped_partial = self._line_buffer.lstrip()
         looks_like_command = bool(
             _COMMAND_PREFIX_PATTERN.match(stripped_partial)
+            or _has_unclosed_command(stripped_partial)
             or stripped_partial.startswith("```")
             or stripped_partial.startswith("[POINT:")
         )
         if not looks_like_command and "[" not in stripped_partial:
             boundary_index = _find_last_sentence_boundary(self._line_buffer)
-            if boundary_index != -1:
+            if boundary_index != -1 and not _has_unclosed_command(self._line_buffer[: boundary_index + 1]):
                 ready_prefix = self._line_buffer[: boundary_index + 1]
                 self._line_buffer = self._line_buffer[boundary_index + 1 :].lstrip()
-                cleaned_prefix, inline_cmds = _extract_inline_point_tags(
+                cleaned_prefix, inline_cmds = _extract_inline_commands(
                     ready_prefix, scale_x=self._scale_x, scale_y=self._scale_y
                 )
                 if inline_cmds:
@@ -728,6 +878,7 @@ class StreamingSentenceExtractor:
         partial_line = self._line_buffer.lstrip()
         looks_like_command = bool(
             _COMMAND_PREFIX_PATTERN.match(partial_line)
+            or _has_unclosed_command(partial_line)
             or partial_line.startswith("```")
             or partial_line.startswith("[POINT:")
         )
@@ -758,13 +909,13 @@ class StreamingSentenceExtractor:
             self.all_commands.append(parsed_cmd)
             return [], [parsed_cmd]
 
-        line_without_tags, inline_commands = _extract_inline_point_tags(
+        line_without_commands, inline_commands = _extract_inline_commands(
             stripped_line, scale_x=self._scale_x, scale_y=self._scale_y
         )
         if inline_commands:
             self.all_commands.extend(inline_commands)
 
-        cleaned_line = clean_spoken_text(line_without_tags)
+        cleaned_line = clean_spoken_text(line_without_commands)
         new_sentences: List[str] = []
         if cleaned_line:
             combined = f"{self._prose_buffer} {cleaned_line}".strip()

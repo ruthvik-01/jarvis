@@ -61,7 +61,7 @@ class JarvisApplicationController(QObject):
         self._pending_scroll_after_speech: Optional[Tuple[str, int]] = None
         self._scroll_generation_id = 0
         self._pre_scroll_image: Optional[object] = None
-        self._pending_direct_agent_command: Optional[jarvis_response_parser.DrawingCommand] = None
+        self._pending_direct_agent_commands: List[jarvis_response_parser.DrawingCommand] = []
         self._executed_agent_command_in_turn = False
         self._quitting = False
 
@@ -250,6 +250,8 @@ class JarvisApplicationController(QObject):
             self.notch_window.collapse_to_idle()
 
         self.main_window.open_tab(mapped_tab)
+        if hasattr(self.main_window, "position_under_notch"):
+            self.main_window.position_under_notch()
         if self.main_window.isMinimized():
             self.main_window.showNormal()
         else:
@@ -272,8 +274,8 @@ class JarvisApplicationController(QObject):
         self.tts_service.stop_speaking()
         if self.notch_window.current_mode() == jarvis_notch_window.NotchVisualMode.HOME_PEEK:
             self.notch_window.collapse_to_idle()
-        if self.main_window.isVisible() and self.main_window.isActiveWindow():
-            self.main_window.showMinimized()
+        if self.main_window.isVisible():
+            self.main_window.hide()
         self.sound_player.play_earcon("jarvis-text-open", volume=0.45)
         self.overlay_window.start_interactive_lasso_mode()
         self.overlay_window.set_bubble_message(
@@ -315,8 +317,8 @@ class JarvisApplicationController(QObject):
         )
         if self.notch_window.current_mode() == jarvis_notch_window.NotchVisualMode.HOME_PEEK:
             self.notch_window.collapse_to_idle()
-        if self.main_window.isVisible() and self.main_window.isActiveWindow():
-            self.main_window.showMinimized()
+        if self.main_window.isVisible():
+            self.main_window.hide()
         self.sound_player.play_earcon("jarvis-question", volume=0.45)
         self._start_turn(
             prompt_text=self._scroll_explain_user_prompt,
@@ -402,7 +404,7 @@ class JarvisApplicationController(QObject):
 
     def _on_escape_pressed(self) -> None:
         self._active_voice_mode = "idle"
-        self._pending_direct_agent_command = None
+        self._pending_direct_agent_commands = []
         self._cancel_scroll_explain_sequence()
         self.overlay_window.cancel_interactive_lasso_mode()
         self.tts_service.stop_speaking()
@@ -483,7 +485,7 @@ class JarvisApplicationController(QObject):
         self._start_turn(prompt_text=prompt_text, speak_reply=speak, from_typed_notch=False)
 
     def _on_stop_requested(self) -> None:
-        self._pending_direct_agent_command = None
+        self._pending_direct_agent_commands = []
         self._cancel_scroll_explain_sequence()
         self.overlay_window.cancel_interactive_lasso_mode()
         self.brain_service.stop_current_turn()
@@ -514,10 +516,10 @@ class JarvisApplicationController(QObject):
 
         self._executed_agent_command_in_turn = False
         agent_actions_enabled = bool(self.settings_store.get("agent_actions_enabled", True))
-        self._pending_direct_agent_command = (
-            jarvis_services.DesktopAgentService.detect_direct_user_agent_command(prompt_text)
+        self._pending_direct_agent_commands = (
+            jarvis_services.DesktopAgentService.detect_direct_user_agent_commands(prompt_text)
             if agent_actions_enabled and not preserve_scroll_session
-            else None
+            else []
         )
 
         if not preserve_scroll_session:
@@ -556,6 +558,29 @@ class JarvisApplicationController(QObject):
         else:
             self.notch_window.set_mode(jarvis_notch_window.NotchVisualMode.THINKING, status_text="Thinking")
             self.overlay_window.set_cursor_visual_state(listening=False, thinking=True, speaking=False)
+
+        if len(self._pending_direct_agent_commands) >= 2:
+            action_statuses: List[str] = []
+            any_action_ok = False
+            for direct_command in self._pending_direct_agent_commands:
+                action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command(direct_command)
+                any_action_ok = any_action_ok or action_ok
+                if status_msg:
+                    action_statuses.append(status_msg)
+            self._executed_agent_command_in_turn = True
+            self._pending_direct_agent_commands = []
+            combined_status = ", ".join(action_statuses) if action_statuses else "Done."
+            self.sound_player.play_earcon("jarvis-text-send" if any_action_ok else "jarvis-error", volume=0.45)
+            self.overlay_window.set_bubble_message(combined_status, word_by_word=False, hold_seconds=2.8)
+            direct_summary = f"{combined_status}."
+            self._on_brain_turn_completed(
+                jarvis_response_parser.ParsedTurnResponse(
+                    spoken_text=direct_summary,
+                    sentences=[direct_summary],
+                    commands=[],
+                )
+            )
+            return
 
         self.brain_service.start_vision_turn(
             user_prompt=prompt_text,
@@ -599,7 +624,7 @@ class JarvisApplicationController(QObject):
             if bool(self.settings_store.get("agent_actions_enabled", True)):
                 action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command(command)
                 self._executed_agent_command_in_turn = True
-                self._pending_direct_agent_command = None
+                self._pending_direct_agent_commands = []
                 self.sound_player.play_earcon("jarvis-text-send" if action_ok else "jarvis-error", volume=0.45)
                 self.overlay_window.set_bubble_message(status_msg, word_by_word=False, hold_seconds=2.8)
             return
@@ -624,17 +649,22 @@ class JarvisApplicationController(QObject):
 
     def _on_brain_turn_completed(self, parsed_response: jarvis_response_parser.ParsedTurnResponse) -> None:
         if (
-            self._pending_direct_agent_command is not None
+            self._pending_direct_agent_commands
             and not self._executed_agent_command_in_turn
             and bool(self.settings_store.get("agent_actions_enabled", True))
         ):
-            action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command(
-                self._pending_direct_agent_command
-            )
+            last_status_msg = ""
+            any_action_ok = False
+            for direct_command in self._pending_direct_agent_commands:
+                action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command(direct_command)
+                any_action_ok = any_action_ok or action_ok
+                if status_msg:
+                    last_status_msg = status_msg
             self._executed_agent_command_in_turn = True
-            self.sound_player.play_earcon("jarvis-text-send" if action_ok else "jarvis-error", volume=0.45)
-            self.overlay_window.set_bubble_message(status_msg, word_by_word=False, hold_seconds=2.8)
-        self._pending_direct_agent_command = None
+            self.sound_player.play_earcon("jarvis-text-send" if any_action_ok else "jarvis-error", volume=0.45)
+            if last_status_msg:
+                self.overlay_window.set_bubble_message(last_status_msg, word_by_word=False, hold_seconds=2.8)
+        self._pending_direct_agent_commands = []
 
         final_text = parsed_response.spoken_text or "Done."
         self.main_window.finish_streaming_assistant_message(final_text)

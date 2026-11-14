@@ -24,16 +24,23 @@ import os
 import queue
 import random
 import re
+import shutil
 import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import urllib.parse
 from urllib.parse import quote, quote_plus, urlparse
 
 import mss
 import subprocess
 import wave
 import webbrowser
+
+try:
+    import pyautogui  # type: ignore
+except Exception:
+    pyautogui = None  # type: ignore
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -470,6 +477,87 @@ class ScreenCaptureService:
             )
         except Exception:
             return command
+
+    @classmethod
+    def detect_visual_text_anchors(
+        cls,
+        screen_width: int,
+        screen_height: int,
+        count: int = 2,
+    ) -> List[Tuple[float, float, float]]:
+        """
+        Detects up to `count` prominent horizontal text bands `(x, baseline_y, span_width)`
+        from `_last_raw_logical_image` so fallback underlines land accurately on screen text.
+        """
+        default_anchors = [
+            (round(screen_width * 0.28, 1), round(screen_height * 0.28, 1), min(360.0, screen_width * 0.26)),
+            (round(screen_width * 0.28, 1), round(screen_height * 0.44, 1), min(320.0, screen_width * 0.24)),
+        ]
+        source_image = cls._last_raw_logical_image
+        if source_image is None:
+            return default_anchors[:count]
+
+        try:
+            img_width, img_height = source_image.size
+            roi_left = max(40, int(img_width * 0.22))
+            roi_right = min(img_width - 40, int(img_width * 0.88))
+            roi_top = max(60, int(img_height * 0.14))
+            roi_bottom = min(img_height - 90, int(img_height * 0.78))
+            if (roi_right - roi_left) < 120 or (roi_bottom - roi_top) < 80:
+                return default_anchors[:count]
+
+            roi_gray = np.asarray(
+                source_image.crop((roi_left, roi_top, roi_right, roi_bottom)).convert("L"),
+                dtype=np.float32,
+            )
+            bg_luma = float(np.median(roi_gray))
+            row_activity = np.mean(np.abs(roi_gray - bg_luma) > 18.0, axis=1)
+            active_rows = row_activity > 0.035
+
+            candidate_bands: List[Tuple[int, int, float]] = []
+            band_start: Optional[int] = None
+            for row_idx, is_active in enumerate(active_rows):
+                if is_active and band_start is None:
+                    band_start = row_idx
+                elif not is_active and band_start is not None:
+                    band_height = row_idx - band_start
+                    if 7 <= band_height <= 36:
+                        peak_density = float(np.max(row_activity[band_start:row_idx]))
+                        candidate_bands.append((band_start, row_idx - 1, peak_density))
+                    band_start = None
+            if band_start is not None:
+                band_height = len(active_rows) - band_start
+                if 7 <= band_height <= 36:
+                    peak_density = float(np.max(row_activity[band_start:]))
+                    candidate_bands.append((band_start, len(active_rows) - 1, peak_density))
+
+            if not candidate_bands:
+                return default_anchors[:count]
+
+            selected_anchors: List[Tuple[float, float, float]] = []
+            last_picked_y = -999.0
+            for band_top, band_bottom, _density in candidate_bands:
+                baseline_y = float(roi_top + band_bottom + 5.0)
+                if baseline_y - last_picked_y < 52.0:
+                    continue
+                band_slice = roi_gray[band_top : band_bottom + 1, :]
+                col_activity = np.mean(np.abs(band_slice - bg_luma) > 18.0, axis=0)
+                active_cols = np.where(col_activity > 0.08)[0]
+                if active_cols.size < 18:
+                    continue
+                first_col = int(active_cols[0])
+                anchor_x = float(roi_left + first_col)
+                span_right = int(active_cols[-1])
+                raw_span = float(span_right - first_col)
+                span_width = max(140.0, min(420.0, raw_span))
+                selected_anchors.append((anchor_x, baseline_y, span_width))
+                last_picked_y = baseline_y
+                if len(selected_anchors) >= count:
+                    break
+
+            return selected_anchors if selected_anchors else default_anchors[:count]
+        except Exception:
+            return default_anchors[:count]
 
 
 def _paint_coordinate_ruler_on_screenshot(screenshot: Image.Image) -> Image.Image:
@@ -1350,6 +1438,54 @@ class VisionBrainService(QObject):
                 self.sentenceReady.emit(sentence)
 
             parsed_response = extractor.build_final_response()
+            active_drawing_mode = str(
+                self._settings_store.get(
+                    "screen_drawing_mode",
+                    jarvis_config.DEFAULT_SETTINGS["screen_drawing_mode"],
+                )
+            ).strip().lower()
+            agent_command_kinds = {
+                "open_browser",
+                "open_url",
+                "search_web",
+                "open_app",
+                "press_keys",
+                "type_text",
+                "scroll",
+            }
+            has_agent_command = any(cmd_item.kind in agent_command_kinds for cmd_item in parsed_response.commands)
+            has_underline = any(cmd_item.kind == "underline" for cmd_item in parsed_response.commands)
+            has_paper_card = any(cmd_item.kind == "paper" for cmd_item in parsed_response.commands)
+
+            if (
+                active_drawing_mode != "cursor_only"
+                and not has_agent_command
+                and parsed_response.spoken_text
+                and len(parsed_response.spoken_text) >= 24
+            ):
+                if not has_paper_card:
+                    synthesized_card = self._build_fallback_paper_card(
+                        spoken_sentences=parsed_response.sentences,
+                        spoken_text=parsed_response.spoken_text,
+                        screen_height=img_h,
+                    )
+                    if synthesized_card is not None:
+                        parsed_response.commands.append(synthesized_card)
+                        self.drawingCommandReady.emit(synthesized_card)
+                if not has_underline:
+                    anchors = ScreenCaptureService.detect_visual_text_anchors(img_w, img_h, count=2)
+                    for anchor_x, baseline_y, span_width in anchors:
+                        fallback_underline = jarvis_response_parser.DrawingCommand(
+                            kind="underline",
+                            x=anchor_x,
+                            y=baseline_y,
+                            width=span_width,
+                            label="",
+                            tone="blue",
+                        )
+                        parsed_response.commands.append(fallback_underline)
+                        self.drawingCommandReady.emit(fallback_underline)
+
             if parsed_response.spoken_text:
                 self._history.append({"role": "user", "content": user_prompt})
                 self._history.append({"role": "assistant", "content": parsed_response.spoken_text})
@@ -1360,6 +1496,54 @@ class VisionBrainService(QObject):
             self._is_running = False
             if self._generation_id == turn_generation:
                 self.turnFailed.emit(f"Could not reach River AI: {err}")
+
+    @staticmethod
+    def _build_fallback_paper_card(
+        spoken_sentences: List[str],
+        spoken_text: str,
+        screen_height: int,
+    ) -> Optional[jarvis_response_parser.DrawingCommand]:
+        """Builds a structured dark visual notes card from the explanation when the model omits `paper(...)`."""
+        cleaned_sentences = [sentence.strip() for sentence in spoken_sentences if sentence.strip()]
+        if not cleaned_sentences and spoken_text:
+            cleaned_sentences = [spoken_text.strip()]
+        if not cleaned_sentences:
+            return None
+
+        def _compact_phrase(raw_phrase: str, max_words: int = 3) -> str:
+            words = re.findall(r"[A-Za-z0-9'\-]+", raw_phrase)
+            return " ".join(words[:max_words]) if words else "Concept"
+
+        first_words = _compact_phrase(cleaned_sentences[0], max_words=4)
+        body_parts: List[str] = []
+        if len(cleaned_sentences) >= 2:
+            left_node = _compact_phrase(cleaned_sentences[0], max_words=2)
+            right_node = _compact_phrase(cleaned_sentences[1], max_words=2)
+            body_parts.append(f"{left_node} -> {right_node}")
+        else:
+            body_parts.append(f"Input -> {first_words}")
+
+        if len(cleaned_sentences) >= 3:
+            body_parts.append("section:Key Point")
+            node_three = _compact_phrase(cleaned_sentences[2], max_words=2)
+            body_parts.append(f"doc:Context -> {node_three}")
+        else:
+            snippet = cleaned_sentences[-1][:76].strip()
+            body_parts.append("section:Summary")
+            body_parts.append(snippet)
+
+        card_top_y = float(min(max(130, int(screen_height * 0.16)), max(150, screen_height - 370)))
+        return jarvis_response_parser.DrawingCommand(
+            kind="paper",
+            x=24.0,
+            y=card_top_y,
+            width=316.0,
+            height=330.0,
+            label=first_words,
+            header="Visual Notes",
+            body=" | ".join(body_parts),
+            tone="blue",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1570,6 +1754,16 @@ class GlobalHotkeyService(QObject):
 class DesktopAgentService:
     """Executes bounded desktop & browser actions requested by the AI or directly by the user."""
 
+    _last_app_launch_timestamp: float = 0.0
+    _last_launched_target: str = ""
+    _pre_launch_hwnd: int = 0
+
+    VK_CONTROL = 0x11
+    VK_RETURN = 0x0D
+    VK_L = 0x4C
+    VK_V = 0x56
+    KEYEVENTF_KEYUP = 0x0002
+
     KNOWN_URL_ALIASES: Dict[str, str] = {
         "chatgpt": "https://chatgpt.com",
         "chat.openai.com": "https://chatgpt.com",
@@ -1655,6 +1849,88 @@ class DesktopAgentService:
             return None
         return cleaned
 
+    @staticmethod
+    def _resolve_chrome_executable() -> Optional[str]:
+        which_path = shutil.which("chrome")
+        if which_path and os.path.exists(which_path):
+            return which_path
+        candidate_roots = [
+            os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+            os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+            os.environ.get("LOCALAPPDATA", ""),
+        ]
+        for root_dir in candidate_roots:
+            if not root_dir:
+                continue
+            candidate_exe = os.path.join(root_dir, "Google", "Chrome", "Application", "chrome.exe")
+            if os.path.exists(candidate_exe):
+                return candidate_exe
+        return None
+
+    @staticmethod
+    def _current_foreground_hwnd() -> int:
+        try:
+            return int(ctypes.windll.user32.GetForegroundWindow())
+        except Exception:
+            return 0
+
+    @classmethod
+    def _wait_for_foreground_window_change(
+        cls,
+        previous_hwnd: int,
+        timeout_seconds: float = 2.8,
+    ) -> None:
+        deadline = time.monotonic() + max(0.4, timeout_seconds)
+        window_switched = False
+        while time.monotonic() < deadline:
+            active_hwnd = cls._current_foreground_hwnd()
+            if active_hwnd and active_hwnd != previous_hwnd:
+                window_switched = True
+                break
+            time.sleep(0.1)
+        time.sleep(0.55 if window_switched else 0.9)
+
+    @classmethod
+    def _press_win32_combo(cls, virtual_keys: List[int]) -> None:
+        user32 = ctypes.windll.user32
+        for vk_code in virtual_keys:
+            user32.keybd_event(vk_code, 0, 0, 0)
+        time.sleep(0.03)
+        for vk_code in reversed(virtual_keys):
+            user32.keybd_event(vk_code, 0, cls.KEYEVENTF_KEYUP, 0)
+
+    @classmethod
+    def _send_text_to_focused_window(
+        cls,
+        text_to_type: str,
+        focus_address_bar: bool = False,
+        submit_enter: bool = False,
+    ) -> bool:
+        cleaned = (text_to_type or "")[:280].strip()
+        if not cleaned:
+            return False
+        try:
+            if focus_address_bar:
+                cls._press_win32_combo([cls.VK_CONTROL, cls.VK_L])
+                time.sleep(0.12)
+            SmartDictationInjector._set_clipboard_unicode(cleaned)
+            time.sleep(0.05)
+            cls._press_win32_combo([cls.VK_CONTROL, cls.VK_V])
+            if submit_enter:
+                time.sleep(0.08)
+                cls._press_win32_combo([cls.VK_RETURN])
+            return True
+        except Exception:
+            if pyautogui is not None:
+                try:
+                    pyautogui.write(cleaned, interval=0.012)
+                    if submit_enter:
+                        pyautogui.press("enter")
+                    return True
+                except Exception:
+                    return False
+            return False
+
     @classmethod
     def execute_agent_command(
         cls,
@@ -1669,6 +1945,9 @@ class DesktopAgentService:
             if resolved_url is None:
                 return False, f"Invalid URL: {argument_text}"
             try:
+                cls._pre_launch_hwnd = cls._current_foreground_hwnd()
+                cls._last_app_launch_timestamp = time.monotonic()
+                cls._last_launched_target = "browser"
                 opened = webbrowser.open(resolved_url, new=2)
                 return bool(opened), f"Opened {resolved_url}"
             except Exception as exc:
@@ -1680,6 +1959,9 @@ class DesktopAgentService:
                 return False, "Empty search query"
             search_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query_text)}"
             try:
+                cls._pre_launch_hwnd = cls._current_foreground_hwnd()
+                cls._last_app_launch_timestamp = time.monotonic()
+                cls._last_launched_target = "browser"
                 opened = webbrowser.open(search_url, new=2)
                 return bool(opened), f"Searched Google for {query_text}"
             except Exception as exc:
@@ -1687,8 +1969,13 @@ class DesktopAgentService:
 
         if command_kind == "open_app":
             normalized_app = re.sub(r"[\s_\-]+", "", argument_text.lower())
+            if normalized_app in ("googlechrome", "chrome"):
+                normalized_app = "chrome"
             if normalized_app in ("settings", "windowssettings"):
                 try:
+                    cls._pre_launch_hwnd = cls._current_foreground_hwnd()
+                    cls._last_app_launch_timestamp = time.monotonic()
+                    cls._last_launched_target = normalized_app
                     os.startfile("ms-settings:")
                     return True, "Opened Windows Settings"
                 except Exception as exc:
@@ -1698,9 +1985,16 @@ class DesktopAgentService:
                     jarvis_response_parser.DrawingCommand(kind="open_browser", label=argument_text)
                 )
             launch_args = cls.SAFE_APP_LAUNCHERS.get(normalized_app)
+            if normalized_app == "chrome":
+                chrome_exe = cls._resolve_chrome_executable()
+                if chrome_exe:
+                    launch_args = [chrome_exe, "--new-window"]
             if launch_args is None:
                 return False, f"App not in safe launcher allowlist: {argument_text}"
             try:
+                cls._pre_launch_hwnd = cls._current_foreground_hwnd()
+                cls._last_app_launch_timestamp = time.monotonic()
+                cls._last_launched_target = normalized_app
                 subprocess.Popen(
                     launch_args,
                     stdout=subprocess.DEVNULL,
@@ -1722,46 +2016,131 @@ class DesktopAgentService:
                 if not (is_single_alnum or is_modifier or token in cls.ALLOWED_SINGLE_KEYS):
                     return False, f"Key blocked by safety check: {token}"
             try:
-                if len(normalized_tokens) == 1:
-                    pyautogui.press(normalized_tokens[0])
-                else:
-                    pyautogui.hotkey(*normalized_tokens)
-                return True, f"Pressed {'+'.join(normalized_tokens)}"
+                if pyautogui is not None:
+                    if len(normalized_tokens) == 1:
+                        pyautogui.press(normalized_tokens[0])
+                    else:
+                        pyautogui.hotkey(*normalized_tokens)
+                    return True, f"Pressed {'+'.join(normalized_tokens)}"
+                return False, "Keyboard helper unavailable"
             except Exception as exc:
                 return False, str(exc)
 
         if command_kind == "type_text":
             if not argument_text:
                 return False, "No text to type"
-            try:
-                pyautogui.write(argument_text[:280], interval=0.012)
+            elapsed_since_launch = time.monotonic() - cls._last_app_launch_timestamp
+            recently_launched_app = elapsed_since_launch < 5.0
+            launched_browser = any(
+                browser_name in cls._last_launched_target
+                for browser_name in ("chrome", "edge", "msedge", "firefox", "browser")
+            )
+            should_submit = (command.header or "").strip().lower() == "submit" or launched_browser
+            if recently_launched_app:
+                captured_previous_hwnd = cls._pre_launch_hwnd
+                captured_text = argument_text
+
+                def _delayed_typing_worker() -> None:
+                    cls._wait_for_foreground_window_change(captured_previous_hwnd, timeout_seconds=2.8)
+                    cls._send_text_to_focused_window(
+                        captured_text,
+                        focus_address_bar=launched_browser,
+                        submit_enter=should_submit,
+                    )
+
+                threading.Thread(
+                    target=_delayed_typing_worker,
+                    name="JarvisDelayedTypeWorker",
+                    daemon=True,
+                ).start()
+                return True, f"Opening & typing {argument_text[:36]}"
+
+            typed_ok = cls._send_text_to_focused_window(
+                argument_text,
+                focus_address_bar=False,
+                submit_enter=should_submit,
+            )
+            if typed_ok:
                 return True, f"Typed {len(argument_text[:280])} characters"
-            except Exception as exc:
-                return False, str(exc)
+            return False, "Could not focus active field for typing"
 
         return False, f"Unknown agent command: {command_kind}"
 
     @classmethod
-    def detect_direct_user_agent_command(
+    def detect_direct_user_agent_commands(
         cls,
         user_prompt: str,
-    ) -> Optional[jarvis_response_parser.DrawingCommand]:
-        """Fast local fallback recognizing direct open/search user requests even before/without AI tags."""
+    ) -> List[jarvis_response_parser.DrawingCommand]:
+        """Recognizes single and compound open+type/search user requests cleanly."""
         cleaned = re.sub(r"\s+", " ", (user_prompt or "").strip())
         if not cleaned:
-            return None
+            return []
         lowered = cleaned.lower().strip(" .,!?")
+
+        compound_url_match = re.match(
+            r"^(?:please\s+)?(?:open|launch|start)\s+(?:my\s+)?(chrome|google\s+chrome|edge|firefox|browser|web\s+browser)\s+(?:and|then)\s+(?:please\s+)?(?:go\s+to|open|visit)\s+(.+)$",
+            lowered,
+        )
+        if compound_url_match:
+            raw_target = cleaned[compound_url_match.start(2) :].strip(" .!?")
+            normalized_url = cls.normalize_target_url(raw_target)
+            if normalized_url is not None:
+                return [
+                    jarvis_response_parser.DrawingCommand(
+                        kind="open_url",
+                        body=normalized_url,
+                        label=raw_target,
+                    )
+                ]
+
+        compound_type_match = re.match(
+            r"^(?:please\s+)?(?:open|launch|start)\s+(?:my\s+)?(chrome|google\s+chrome|edge|firefox|browser|web\s+browser|notepad|terminal|powershell|cmd|vs\s?code|vscode)\s+(?:and|then)\s+(?:please\s+)?(?:type|write|enter|search(?:\s+for)?|look\s+up|ask)\s+(.+)$",
+            lowered,
+        )
+        if compound_type_match:
+            app_name = compound_type_match.group(1).strip()
+            normalized_app_token = re.sub(r"\s+", "", app_name.lower())
+            if normalized_app_token in ("googlechrome",):
+                normalized_app_token = "chrome"
+            elif normalized_app_token in ("webbrowser",):
+                normalized_app_token = "browser"
+            typed_payload = cleaned[compound_type_match.start(2) :].strip(" .!?")
+            if typed_payload:
+                open_cmd = (
+                    jarvis_response_parser.DrawingCommand(
+                        kind="open_browser",
+                        body="https://www.google.com",
+                        label="default browser",
+                    )
+                    if normalized_app_token == "browser"
+                    else jarvis_response_parser.DrawingCommand(
+                        kind="open_app",
+                        body=normalized_app_token,
+                        label=normalized_app_token,
+                    )
+                )
+                return [
+                    open_cmd,
+                    jarvis_response_parser.DrawingCommand(
+                        kind="type_text",
+                        body=typed_payload,
+                        label=typed_payload,
+                        header="submit",
+                    ),
+                ]
 
         browser_match = re.search(
             r"\b(?:open|launch|start)\s+(?:my\s+)?(?:web\s+)?browser\b",
             lowered,
         )
         if browser_match:
-            return jarvis_response_parser.DrawingCommand(
-                kind="open_browser",
-                body="https://www.google.com",
-                label="default browser",
-            )
+            return [
+                jarvis_response_parser.DrawingCommand(
+                    kind="open_browser",
+                    body="https://www.google.com",
+                    label="default browser",
+                )
+            ]
 
         url_match = re.match(
             r"^(?:please\s+)?(?:open|go to|launch|visit)\s+([a-z0-9.\-]+(?:\.[a-z]{2,}|chatgpt|youtube|github|gmail|claude|notion))(?:\s+for\s+me)?$",
@@ -1769,11 +2148,13 @@ class DesktopAgentService:
         )
         if url_match:
             target = url_match.group(1)
-            return jarvis_response_parser.DrawingCommand(
-                kind="open_url",
-                body=target,
-                label=target,
-            )
+            return [
+                jarvis_response_parser.DrawingCommand(
+                    kind="open_url",
+                    body=target,
+                    label=target,
+                )
+            ]
 
         search_match = re.match(
             r"^(?:please\s+)?(?:google|search(?:\s+the\s+web)?\s+for)\s+(.+)$",
@@ -1782,22 +2163,39 @@ class DesktopAgentService:
         if search_match:
             query_text = cleaned[search_match.start(1) :].strip(" .!?")
             if query_text:
-                return jarvis_response_parser.DrawingCommand(
-                    kind="search_web",
-                    body=query_text,
-                    label=query_text,
-                )
+                return [
+                    jarvis_response_parser.DrawingCommand(
+                        kind="search_web",
+                        body=query_text,
+                        label=query_text,
+                    )
+                ]
 
         app_match = re.match(
-            r"^(?:please\s+)?(?:open|launch|start)\s+(?:my\s+)?(chrome|edge|firefox|notepad|calculator|calc|paint|explorer|terminal|powershell|cmd|vs\s?code|vscode|settings)$",
+            r"^(?:please\s+)?(?:open|launch|start)\s+(?:my\s+)?(chrome|google\s+chrome|edge|firefox|notepad|calculator|calc|paint|explorer|terminal|powershell|cmd|vs\s?code|vscode|settings)$",
             lowered,
         )
         if app_match:
             app_name = app_match.group(1).strip()
-            return jarvis_response_parser.DrawingCommand(
-                kind="open_app",
-                body=app_name,
-                label=app_name,
-            )
+            if app_name == "google chrome":
+                app_name = "chrome"
+            return [
+                jarvis_response_parser.DrawingCommand(
+                    kind="open_app",
+                    body=app_name,
+                    label=app_name,
+                )
+            ]
+
+        return []
+
+    @classmethod
+    def detect_direct_user_agent_command(
+        cls,
+        user_prompt: str,
+    ) -> Optional[jarvis_response_parser.DrawingCommand]:
+        """Backward-compatible single-command accessor for direct user agent requests."""
+        detected_commands = cls.detect_direct_user_agent_commands(user_prompt)
+        return detected_commands[0] if detected_commands else None
 
         return None

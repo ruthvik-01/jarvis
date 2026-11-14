@@ -201,10 +201,10 @@ def _paint_sidebar_icon(
             circle_diameter,
             circle_diameter,
         )
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(DARK_PALETTE["accent"]))
+        painter.setPen(QPen(QColor("#52525B"), 1.0))
+        painter.setBrush(QColor("#27272A"))
         painter.drawEllipse(avatar_rect)
-        painter.setPen(QColor("#FFFFFF"))
+        painter.setPen(QColor("#F4F4F6"))
         painter.setFont(jarvis_theme.ui_font(8.5, QFont.Weight.Bold))
         painter.drawText(avatar_rect, Qt.AlignmentFlag.AlignCenter, (avatar_initial or "R")[:1].upper())
         painter.restore()
@@ -423,24 +423,24 @@ class ToggleSwitch(QAbstractButton):
 
         if is_checked:
             if is_pressed:
-                track_color = QColor("#296FE3")
+                track_color = QColor("#D4D4D8")
             elif is_hovered:
-                track_color = QColor("#4A90FF")
+                track_color = QColor("#F4F4F6")
             else:
-                track_color = QColor(DARK_PALETTE["accent"])
+                track_color = QColor("#E4E4E7")
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(track_color)
         else:
-            # Changelog 1.1.5: OFF switch stays strictly neutral grey on hover (never blue).
+            # OFF switch stays dark neutral zinc.
             if is_pressed:
-                track_color = QColor("#484850")
-                border_color = QColor("#74747E")
+                track_color = QColor("#383842")
+                border_color = QColor("#646470")
             elif is_hovered:
-                track_color = QColor("#3F3F46")
-                border_color = QColor("#666670")
+                track_color = QColor("#2E2E36")
+                border_color = QColor("#52525B")
             else:
-                track_color = QColor("#343439")
-                border_color = QColor("#4E4E56")
+                track_color = QColor("#222229")
+                border_color = QColor("#3F3F46")
             painter.setPen(QPen(border_color, 1.0))
             painter.setBrush(track_color)
 
@@ -463,7 +463,7 @@ class ToggleSwitch(QAbstractButton):
         painter.setBrush(QColor(0, 0, 0, 55))
         painter.drawEllipse(thumb_rect.translated(0.0, 0.8))
 
-        thumb_color = QColor("#FFFFFF") if is_checked else QColor("#E4E4EA")
+        thumb_color = QColor("#09090B") if is_checked else QColor("#D4D4D8")
         painter.setBrush(thumb_color)
         painter.drawEllipse(thumb_rect)
 
@@ -743,8 +743,8 @@ class MicrophoneLevelMeter(QWidget):
             fill_width = max(track_rect.height(), track_rect.width() * self._level)
             fill_rect = QRectF(track_rect.left(), track_rect.top(), fill_width, track_rect.height())
             gradient = QLinearGradient(fill_rect.topLeft(), fill_rect.topRight())
-            gradient.setColorAt(0.0, QColor("#2BC8FF"))
-            gradient.setColorAt(1.0, QColor(DARK_PALETTE["accent"]))
+            gradient.setColorAt(0.0, QColor("#A1A1AA"))
+            gradient.setColorAt(1.0, QColor("#F4F4F6"))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(gradient)
             painter.drawRoundedRect(fill_rect, radius, radius)
@@ -780,16 +780,16 @@ class PillSlider(QSlider):
         knob_center_x = track_left + track_width * fraction
 
         fill_rect = QRectF(track_left, track_rect.top(), max(0.0, knob_center_x - track_left), track_height)
-        painter.setBrush(QColor(DARK_PALETTE["accent"]))
+        painter.setBrush(QColor("#E4E4E7"))
         painter.drawRoundedRect(fill_rect, 2.0, 2.0)
 
         knob_radius = 7.5 if self.underMouse() or self.isSliderDown() else 6.8
         if self.underMouse() or self.isSliderDown():
-            painter.setBrush(QColor(51, 128, 255, 65))
+            painter.setBrush(QColor(228, 228, 231, 55))
             painter.drawEllipse(QPointF(knob_center_x, center_y), knob_radius + 3.5, knob_radius + 3.5)
 
-        painter.setPen(QPen(QColor(DARK_PALETTE["accent"]), 2.0))
-        painter.setBrush(QColor("#FFFFFF"))
+        painter.setPen(QPen(QColor("#3F3F46"), 2.0))
+        painter.setBrush(QColor("#F4F4F6"))
         painter.drawEllipse(QPointF(knob_center_x, center_y), knob_radius, knob_radius)
 
 
@@ -875,11 +875,11 @@ class VoiceChoiceRow(QFrame):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         indicator_rect = QRectF(1.5, 1.5, 15.0, 15.0)
         if self._selected:
-            painter.setPen(QPen(QColor(DARK_PALETTE["accent"]), 2.0))
-            painter.setBrush(QColor(DARK_PALETTE["accent"]))
+            painter.setPen(QPen(QColor("#E4E4E7"), 2.0))
+            painter.setBrush(QColor("#E4E4E7"))
             painter.drawEllipse(indicator_rect)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#FFFFFF"))
+            painter.setBrush(QColor("#09090B"))
             painter.drawEllipse(QPointF(9.0, 9.0), 3.2, 3.2)
         else:
             ring_color = QColor("#8A8A94") if self._hovered else QColor("#585862")
@@ -1071,8 +1071,13 @@ class JarvisMainWindow(QMainWindow):
 
     def _configure_window_identity(self) -> None:
         self.setWindowTitle("Jarvis")
-        self.resize(860, 580)
-        self.setMinimumSize(720, 480)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.resize(860, 560)
+        self.setMinimumSize(780, 500)
         icon_path = jarvis_theme.asset_path("jarvis.ico")
         if os.path.exists(icon_path):
             app_icon = QIcon(icon_path)
@@ -1080,6 +1085,26 @@ class JarvisMainWindow(QMainWindow):
             qt_app = QApplication.instance()
             if qt_app is not None and qt_app.windowIcon().isNull():
                 qt_app.setWindowIcon(app_icon)
+        self.position_under_notch()
+
+    def position_under_notch(self) -> None:
+        """Docks the frameless Studio/Chat panel directly under the top hardware notch."""
+        primary_screen = QApplication.primaryScreen()
+        screen_geo = primary_screen.geometry() if primary_screen is not None else QRect(0, 0, 1920, 1080)
+        panel_width = min(self.width(), max(720, screen_geo.width() - 48))
+        panel_height = min(self.height(), max(460, screen_geo.height() - 64))
+        if (panel_width, panel_height) != (self.width(), self.height()):
+            self.resize(panel_width, panel_height)
+        dock_x = screen_geo.x() + (screen_geo.width() - panel_width) // 2
+        dock_y = screen_geo.y() + 18
+        self.move(dock_x, dock_y)
+
+    def keyPressEvent(self, key_event: Any) -> None:
+        if key_event.key() == Qt.Key.Key_Escape:
+            self.hide()
+            key_event.accept()
+            return
+        super().keyPressEvent(key_event)
 
     def allow_real_close(self) -> None:
         self._allow_close = True
@@ -1093,6 +1118,7 @@ class JarvisMainWindow(QMainWindow):
 
     def showEvent(self, show_event: Any) -> None:
         super().showEvent(show_event)
+        self.position_under_notch()
         window_handle = int(self.winId())
         _enable_dark_title_bar(window_handle)
         jarvis_theme.set_window_excluded_from_capture(
@@ -1322,6 +1348,14 @@ class JarvisMainWindow(QMainWindow):
         self._byok_status_pill.setCursor(Qt.CursorShape.PointingHandCursor)
         self._byok_status_pill.clicked.connect(lambda: self.open_tab("settings:account"))
         right_actions.addWidget(self._byok_status_pill)
+
+        self._drawer_close_button = QPushButton("×")
+        self._drawer_close_button.setObjectName("HeaderCloseButton")
+        self._drawer_close_button.setFixedSize(28, 28)
+        self._drawer_close_button.setToolTip("Collapse back into Notch (Esc)")
+        self._drawer_close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._drawer_close_button.clicked.connect(self.hide)
+        right_actions.addWidget(self._drawer_close_button)
 
         header_layout.addLayout(right_actions, 0)
         return header_widget
@@ -2360,6 +2394,9 @@ class JarvisMainWindow(QMainWindow):
                 color: {DARK_PALETTE["text_primary"]};
                 font-family: {font_family};
             }}
+            QWidget#MainWindowRoot {{
+                border: 1px solid #2A2A34;
+            }}
             QFrame#SidebarPanel, QScrollArea#SidebarScrollArea, QWidget#SidebarScrollContents {{
                 background-color: {DARK_PALETTE["sidebar"]};
                 color: {DARK_PALETTE["text_primary"]};
@@ -2433,8 +2470,9 @@ class JarvisMainWindow(QMainWindow):
                 color: {DARK_PALETTE["text_primary"]};
             }}
             QPushButton#HeaderTogglePill:checked {{
-                background-color: {DARK_PALETTE["accent"]};
-                color: #FFFFFF;
+                background-color: #27272E;
+                color: #F4F4F6;
+                border: 1px solid #3F3F46;
             }}
             QPushButton#HeaderSecondaryButton {{
                 background-color: {DARK_PALETTE["card"]};
@@ -2450,16 +2488,31 @@ class JarvisMainWindow(QMainWindow):
                 border-color: #52525A;
             }}
             QPushButton#HeaderSkyPillButton {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #D4EAFF, stop:1 #9CC3FF);
-                color: #0D223D;
-                border: none;
+                background-color: #27272E;
+                color: #F4F4F6;
+                border: 1px solid #52525B;
                 border-radius: 14px;
                 padding: 5px 12px;
                 font-size: 12px;
-                font-weight: 700;
+                font-weight: 600;
             }}
             QPushButton#HeaderSkyPillButton:hover {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #E4F2FF, stop:1 #B2D1FF);
+                background-color: #34343D;
+                border-color: #71717A;
+            }}
+            QPushButton#HeaderCloseButton {{
+                background-color: #18181D;
+                color: #A1A1AA;
+                border: 1px solid #2E2E36;
+                border-radius: 14px;
+                font-size: 15px;
+                font-weight: 600;
+                padding: 0px;
+            }}
+            QPushButton#HeaderCloseButton:hover {{
+                background-color: #27272E;
+                color: #F4F4F6;
+                border-color: #52525B;
             }}
             QLabel#SectionHeaderLabel {{
                 color: {DARK_PALETTE["text_secondary"]};
@@ -2502,11 +2555,11 @@ class JarvisMainWindow(QMainWindow):
                 font-weight: 700;
             }}
             QFrame#PlanMeterTrack {{
-                background-color: #3A3A40;
+                background-color: #26262C;
                 border-radius: 2px;
             }}
             QFrame#PlanMeterFill[connected="true"] {{
-                background-color: {DARK_PALETTE["accent"]};
+                background-color: #E4E4E7;
                 border-radius: 2px;
             }}
             QFrame#PlanMeterFill[connected="false"] {{
@@ -2530,19 +2583,19 @@ class JarvisMainWindow(QMainWindow):
                 color: #FFC35A;
             }}
             QLineEdit#SettingsLineEdit {{
-                background-color: #202023;
+                background-color: #16161B;
                 color: {DARK_PALETTE["text_primary"]};
                 border: 1px solid {DARK_PALETTE["separator"]};
                 border-radius: 8px;
                 padding: 5px 10px;
                 font-size: 13px;
-                selection-background-color: {DARK_PALETTE["accent"]};
+                selection-background-color: #3F3F46;
             }}
             QLineEdit#SettingsLineEdit:focus {{
-                border: 1px solid {DARK_PALETTE["accent"]};
+                border: 1px solid #71717A;
             }}
             QComboBox#SettingsComboBox {{
-                background-color: #202023;
+                background-color: #16161B;
                 color: {DARK_PALETTE["text_primary"]};
                 border: 1px solid {DARK_PALETTE["separator"]};
                 border-radius: 8px;
@@ -2558,17 +2611,17 @@ class JarvisMainWindow(QMainWindow):
                 width: 24px;
             }}
             QComboBox#SettingsComboBox QAbstractItemView {{
-                background-color: #26262A;
+                background-color: #1A1A20;
                 color: {DARK_PALETTE["text_primary"]};
                 border: 1px solid {DARK_PALETTE["separator"]};
                 border-radius: 8px;
-                selection-background-color: {DARK_PALETTE["accent"]};
-                selection-color: #FFFFFF;
+                selection-background-color: #2E2E38;
+                selection-color: #F4F4F6;
                 outline: 0;
                 padding: 4px;
             }}
             QLabel#ValuePillLabel {{
-                background-color: #202023;
+                background-color: #18181D;
                 color: {DARK_PALETTE["text_primary"]};
                 border: 1px solid {DARK_PALETTE["separator"]};
                 border-radius: 7px;
@@ -2582,11 +2635,11 @@ class JarvisMainWindow(QMainWindow):
                 border-radius: 9px;
             }}
             QFrame#VoiceChoiceRow:hover {{
-                background-color: #323237;
+                background-color: #222229;
             }}
             QFrame#VoiceChoiceRow[selected="true"] {{
-                background-color: rgba(51, 128, 255, 36);
-                border: 1px solid rgba(51, 128, 255, 130);
+                background-color: #1E1E24;
+                border: 1px solid #52525B;
             }}
             QLabel#VoiceNameLabel {{
                 color: {DARK_PALETTE["text_primary"]};
@@ -2649,16 +2702,17 @@ class JarvisMainWindow(QMainWindow):
                 font-weight: 500;
             }}
             QPushButton#PrimaryActionButton {{
-                background-color: {DARK_PALETTE["accent"]};
-                color: #FFFFFF;
-                border: none;
+                background-color: #27272E;
+                color: #F4F4F6;
+                border: 1px solid #52525B;
                 border-radius: 8px;
                 padding: 7px 14px;
                 font-size: 12px;
                 font-weight: 600;
             }}
             QPushButton#PrimaryActionButton:hover {{
-                background-color: #498FFF;
+                background-color: #34343D;
+                border-color: #71717A;
             }}
             QPushButton#SecondaryActionButton {{
                 background-color: #343439;
@@ -2703,8 +2757,8 @@ class JarvisMainWindow(QMainWindow):
                 color: #FF8B85;
             }}
             QFrame#UserChatBubble {{
-                background-color: #243E6B;
-                border: 1px solid #3863AC;
+                background-color: #1C1C22;
+                border: 1px solid #3F3F46;
                 border-radius: 13px;
             }}
             QFrame#AssistantChatBubble {{

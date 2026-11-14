@@ -84,7 +84,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "hide_floating_cursor": False,
     "shake_to_detach_enabled": False,
     "screen_highlight_enabled": True,
-    "screen_drawing_mode": "precise_lines",
+    "screen_drawing_mode": "lines_and_card",
     "drawing_speed": "slow_smooth",
     # Voice (AssemblyAI-TTS-1)
     "voice_id": "aai-kyla",

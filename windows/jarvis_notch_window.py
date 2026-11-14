@@ -80,10 +80,10 @@ except Exception:  # pragma: no cover - optional global outside-click listener
 BEZIER_CIRCLE_KAPPA = 0.5522847498
 TOP_EAR_RADIUS = 10.0
 
-IDLE_COMPACT_SIZE = (64.0, 10.0, 5.0)
-IDLE_DEFAULT_SIZE = (96.0, 18.0, 9.0)
-RESTING_SIZE = (96.0, 18.0, 9.0)
-ACTIVITY_STRIP_SIZE = (290.0, 30.0, 15.0)
+IDLE_COMPACT_SIZE = (76.0, 18.0, 9.0)
+IDLE_DEFAULT_SIZE = (112.0, 22.0, 11.0)
+RESTING_SIZE = (112.0, 22.0, 11.0)
+ACTIVITY_STRIP_SIZE = (310.0, 32.0, 16.0)
 TEXT_INPUT_SIZE = (520.0, 108.0, 20.0)
 TEXT_RESPONSE_SIZE = (520.0, 250.0, 22.0)
 HOME_PEEK_SIZE = (540.0, 395.0, 24.0)
@@ -138,7 +138,7 @@ class ClickHitRegion:
 
 
 def _build_default_arc_cards() -> List[ArcDockCardData]:
-    """Builds the 3 Personal Studio ArcDock cards shown in the expanded Home Peek."""
+    """Builds the 3 dark-theme Personal Studio ArcDock cards shown in the expanded Home Peek."""
     return [
         ArcDockCardData(
             card_id="lasso-explain",
@@ -146,13 +146,13 @@ def _build_default_arc_cards() -> List[ArcDockCardData]:
             badge_text="Precision",
             badge_kind="lasso",
             subtitle=(
-                "Drag a smooth neon lasso around any formula, code block, or paragraph "
+                "Drag a simple lasso around any formula, code block, or paragraph "
                 "for a 2x zoomed visual breakdown."
             ),
             action_label="Draw Lasso",
             artifact_path="",
-            card_background_hex="#F4F7FC",
-            header_background_hex="#E6EEF9",
+            card_background_hex="#141418",
+            header_background_hex="#1B1B22",
         ),
         ArcDockCardData(
             card_id="scroll-explain",
@@ -161,12 +161,12 @@ def _build_default_arc_cards() -> List[ArcDockCardData]:
             badge_kind="scroll",
             subtitle=(
                 "Scrolls down long ChatGPT answers or docs step by step and draws "
-                "underlines, rings, and diagram cards on every section."
+                "underlines and visual notes cards on every section."
             ),
             action_label="Start Scroll",
             artifact_path="",
-            card_background_hex="#FFFFFF",
-            header_background_hex="#EBF4FF",
+            card_background_hex="#15151A",
+            header_background_hex="#1D1D25",
         ),
         ArcDockCardData(
             card_id="screen-sketch-demo",
@@ -175,12 +175,12 @@ def _build_default_arc_cards() -> List[ArcDockCardData]:
             badge_kind="interactive",
             subtitle=(
                 "Preview 2x Retina Catmull-Rom ink, baseline-snapped underlines, "
-                "and gridded diagram paper cards on screen."
+                "and dark visual notes cards on screen."
             ),
             action_label="Run Demo",
             artifact_path="",
-            card_background_hex="#FAF8F3",
-            header_background_hex="#F1EDE4",
+            card_background_hex="#131317",
+            header_background_hex="#1A1A20",
         ),
     ]
 
@@ -292,8 +292,8 @@ class _NotchIconButton(QPushButton):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         bounds = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
         if self._icon_kind == "send":
-            fill_color = QColor("#4A92FF") if self._hovered else QColor("#3380FF")
-            painter.setPen(Qt.PenStyle.NoPen)
+            fill_color = QColor("#3F3F46") if self._hovered else QColor("#27272A")
+            painter.setPen(QPen(QColor(255, 255, 255, 45), 1.0))
             painter.setBrush(fill_color)
             painter.drawEllipse(bounds)
             center = bounds.center()
@@ -415,6 +415,11 @@ class NotchWindow(QWidget):
         self._is_hovering_notch: bool = False
         self._hovered_region_id: str = ""
         self._hit_regions: List[ClickHitRegion] = []
+
+        logo_asset_path = os.path.join(jarvis_theme.ASSETS_DIRECTORY, "jarvis-logo.png")
+        banner_asset_path = os.path.join(jarvis_theme.ASSETS_DIRECTORY, "jarvis-banner.png")
+        self._jarvis_logo_pixmap = QPixmap(logo_asset_path) if os.path.exists(logo_asset_path) else QPixmap()
+        self._jarvis_banner_pixmap = QPixmap(banner_asset_path) if os.path.exists(banner_asset_path) else QPixmap()
 
         self._arc_cards: List[ArcDockCardData] = _build_default_arc_cards()
         self._selected_card_target: float = 1.0  # Center Scroll & Explain by default
@@ -1399,8 +1404,7 @@ class NotchWindow(QWidget):
         painter.setClipPath(fill_path)
 
         if self._mode in (NotchVisualMode.IDLE, NotchVisualMode.RESTING) and notch_rect.height() <= 24.0:
-            if self._mode == NotchVisualMode.RESTING or self._is_hovering_notch:
-                self._paint_blinking_eyes(painter, notch_rect, elapsed_seconds)
+            self._paint_idle_jarvis_mark(painter, notch_rect)
         elif self._mode in (
             NotchVisualMode.LISTENING,
             NotchVisualMode.DICTATING,
@@ -1451,6 +1455,63 @@ class NotchWindow(QWidget):
             painter.setBrush(QColor(0, 0, 0, alpha_value))
             painter.drawPath(shadow_path)
         painter.restore()
+
+    def _paint_jarvis_emblem(
+        self,
+        painter: QPainter,
+        target_rect: QRectF,
+        alpha: float = 1.0,
+    ) -> None:
+        """Draws the user's J.A.R.V.I.S circular emblem crisply inside the top notch."""
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setOpacity(alpha)
+        if not self._jarvis_logo_pixmap.isNull():
+            clip_circle = QPainterPath()
+            clip_circle.addEllipse(target_rect)
+            painter.setClipPath(clip_circle)
+            painter.fillRect(target_rect, Qt.GlobalColor.black)
+            painter.drawPixmap(target_rect.toRect(), self._jarvis_logo_pixmap)
+        else:
+            painter.setPen(QPen(QColor(244, 244, 246, 235), 1.3))
+            painter.setBrush(Qt.GlobalColor.black)
+            painter.drawEllipse(target_rect)
+        painter.restore()
+
+    def _paint_idle_jarvis_mark(
+        self,
+        painter: QPainter,
+        notch_rect: QRectF,
+    ) -> None:
+        """Renders the J.A.R.V.I.S emblem (and micro wordmark when wide enough) in the black top notch."""
+        emblem_diameter = max(12.0, min(16.0, notch_rect.height() - 4.0))
+        if notch_rect.width() >= 96.0:
+            total_span = emblem_diameter + 48.0
+            start_x = notch_rect.center().x() - total_span * 0.5
+            emblem_rect = QRectF(
+                start_x,
+                notch_rect.center().y() - emblem_diameter * 0.5,
+                emblem_diameter,
+                emblem_diameter,
+            )
+            self._paint_jarvis_emblem(painter, emblem_rect, alpha=0.96)
+            wordmark_font = jarvis_theme.ui_font(7.6, QFont.Weight.DemiBold)
+            wordmark_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.3)
+            painter.setFont(wordmark_font)
+            painter.setPen(QColor(244, 244, 246, 235))
+            painter.drawText(
+                QRectF(emblem_rect.right() + 5.0, notch_rect.top(), 46.0, notch_rect.height()),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                "JARVIS",
+            )
+        else:
+            emblem_rect = QRectF(
+                notch_rect.center().x() - emblem_diameter * 0.5,
+                notch_rect.center().y() - emblem_diameter * 0.5,
+                emblem_diameter,
+                emblem_diameter,
+            )
+            self._paint_jarvis_emblem(painter, emblem_rect, alpha=0.94)
 
     def _paint_blinking_eyes(
         self,
@@ -1529,16 +1590,25 @@ class NotchWindow(QWidget):
         painter.setBrush(core_gradient)
         painter.drawEllipse(core_center, core_radius, notch_rect.height() * 0.92)
 
-        # 2. Crisp white left label
+        # 2. J.A.R.V.I.S emblem + crisp white status label
+        emblem_size = 18.0
+        emblem_rect = QRectF(
+            notch_rect.left() + 12.0,
+            notch_rect.center().y() - emblem_size * 0.5,
+            emblem_size,
+            emblem_size,
+        )
+        self._paint_jarvis_emblem(painter, emblem_rect)
+
         label_font = jarvis_theme.ui_font(9.8, QFont.Weight.DemiBold)
         painter.setFont(label_font)
         painter.setPen(jarvis_theme.NOTCH_TEXT_PRIMARY)
-        available_label_width = max(80.0, notch_rect.width() - 96.0)
+        available_label_width = max(80.0, notch_rect.width() - 114.0)
         elided_label = QFontMetricsF(label_font).elidedText(
             display_label, Qt.TextElideMode.ElideRight, available_label_width
         )
         painter.drawText(
-            QRectF(notch_rect.left() + 18.0, notch_rect.top(), available_label_width, notch_rect.height()),
+            QRectF(notch_rect.left() + 36.0, notch_rect.top(), available_label_width, notch_rect.height()),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
             elided_label,
         )
@@ -1597,14 +1667,14 @@ class NotchWindow(QWidget):
                 )
 
     def _paint_text_input_chrome(self, painter: QPainter, notch_rect: QRectF) -> None:
-        # Header icon + title
-        cursor_color = QColor(self._settings_store.get("cursor_color_hex", jarvis_theme.JARVIS_BLUE_HEX))
-        self._paint_mini_cursor_mark(painter, QPointF(notch_rect.left() + 26.0, notch_rect.top() + 21.0), cursor_color)
+        # J.A.R.V.I.S emblem + title
+        emblem_rect = QRectF(notch_rect.left() + 16.0, notch_rect.top() + 11.0, 20.0, 20.0)
+        self._paint_jarvis_emblem(painter, emblem_rect)
 
         painter.setFont(jarvis_theme.ui_font(9.5, QFont.Weight.DemiBold))
         painter.setPen(jarvis_theme.NOTCH_TEXT_PRIMARY)
         painter.drawText(
-            QRectF(notch_rect.left() + 41.0, notch_rect.top() + 10.0, 240.0, 22.0),
+            QRectF(notch_rect.left() + 43.0, notch_rect.top() + 10.0, 240.0, 22.0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
             "Ask Jarvis",
         )
@@ -1620,17 +1690,17 @@ class NotchWindow(QWidget):
         # Rounded dark composer box
         box_rect = QRectF(notch_rect.left() + 18.0, notch_rect.top() + 38.0, notch_rect.width() - 36.0, 40.0)
         border_color = (
-            QColor(51, 128, 255, 165)
+            QColor(228, 228, 231, 165)
             if self._text_input_edit.hasFocus()
             else QColor(255, 255, 255, 38)
         )
         painter.setPen(QPen(border_color, 1.0))
-        painter.setBrush(QColor("#14161D"))
+        painter.setBrush(QColor("#141418"))
         painter.drawRoundedRect(box_rect, 12.0, 12.0)
 
         # Footer hint
         painter.setFont(jarvis_theme.ui_font(7.8, QFont.Weight.Normal))
-        painter.setPen(QColor(152, 158, 174, 210))
+        painter.setPen(QColor(161, 161, 170, 210))
         painter.drawText(
             QRectF(notch_rect.left() + 22.0, notch_rect.bottom() - 23.0, notch_rect.width() - 44.0, 16.0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
@@ -1638,22 +1708,22 @@ class NotchWindow(QWidget):
         )
 
     def _paint_text_response_chrome(self, painter: QPainter, notch_rect: QRectF) -> None:
-        cursor_color = QColor(self._settings_store.get("cursor_color_hex", jarvis_theme.JARVIS_BLUE_HEX))
-        self._paint_mini_cursor_mark(painter, QPointF(notch_rect.left() + 26.0, notch_rect.top() + 22.0), cursor_color)
+        emblem_rect = QRectF(notch_rect.left() + 16.0, notch_rect.top() + 12.0, 20.0, 20.0)
+        self._paint_jarvis_emblem(painter, emblem_rect)
 
         painter.setFont(jarvis_theme.ui_font(9.5, QFont.Weight.DemiBold))
         painter.setPen(jarvis_theme.NOTCH_TEXT_PRIMARY)
         painter.drawText(
-            QRectF(notch_rect.left() + 41.0, notch_rect.top() + 11.0, 120.0, 22.0),
+            QRectF(notch_rect.left() + 43.0, notch_rect.top() + 11.0, 120.0, 22.0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            "Jarvis",
+            "J.A.R.V.I.S",
         )
 
         if self._is_response_generating:
             painter.setFont(jarvis_theme.ui_font(8.0, QFont.Weight.Medium))
-            painter.setPen(QColor("#78B9FF"))
+            painter.setPen(QColor("#A1A1AA"))
             painter.drawText(
-                QRectF(notch_rect.left() + 108.0, notch_rect.top() + 11.0, 110.0, 22.0),
+                QRectF(notch_rect.left() + 120.0, notch_rect.top() + 11.0, 110.0, 22.0),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 "Answering...",
             )
@@ -1668,12 +1738,12 @@ class NotchWindow(QWidget):
         # Reply input box at bottom
         reply_rect = QRectF(notch_rect.left() + 16.0, notch_rect.bottom() - 52.0, notch_rect.width() - 32.0, 38.0)
         reply_border = (
-            QColor(51, 128, 255, 165)
+            QColor(228, 228, 231, 165)
             if self._reply_input_edit.hasFocus()
             else QColor(255, 255, 255, 34)
         )
         painter.setPen(QPen(reply_border, 1.0))
-        painter.setBrush(QColor("#14161D"))
+        painter.setBrush(QColor("#141418"))
         painter.drawRoundedRect(reply_rect, 12.0, 12.0)
 
     def _paint_mini_cursor_mark(self, painter: QPainter, center: QPointF, color: QColor) -> None:
@@ -1720,9 +1790,13 @@ class NotchWindow(QWidget):
             ClickHitRegion(
                 "top_chat",
                 chat_rect,
-                lambda: self.openMainWindowRequested.emit("chat"),
+                lambda: self.set_mode(NotchVisualMode.TEXT_INPUT),
             )
         )
+
+        # Center J.A.R.V.I.S emblem right in the Notch header
+        header_emblem_rect = QRectF(center_x - 14.0, top_y, 28.0, 28.0)
+        self._paint_jarvis_emblem(painter, header_emblem_rect)
 
         scroll_pill_rect = QRectF(notch_rect.right() - 160.0, top_y, 106.0, 28.0)
         self._paint_studio_pill(painter, scroll_pill_rect, "Scroll & Explain")
@@ -1892,9 +1966,9 @@ class NotchWindow(QWidget):
 
         painter.restore()
 
-        # Crisp card rim
+        # Crisp dark card rim
         is_card_hovered = self._hovered_region_id == f"card_{card_data.card_id}"
-        rim_color = QColor("#7CC3FF") if is_card_hovered else QColor(232, 236, 244, 240)
+        rim_color = QColor(228, 228, 231, 180) if is_card_hovered else QColor(63, 63, 70, 210)
         painter.setPen(QPen(rim_color, 1.0))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(local_rect, 15.0, 15.0)
@@ -1946,11 +2020,11 @@ class NotchWindow(QWidget):
         card_data: ArcDockCardData,
     ) -> None:
         painter.setFont(jarvis_theme.ui_font(8.4, QFont.Weight.DemiBold))
-        painter.setPen(QColor("#0A84FF"))
+        painter.setPen(QColor("#D4D4D8"))
         painter.drawText(header_rect, Qt.AlignmentFlag.AlignCenter, card_data.badge_text)
 
         painter.setFont(jarvis_theme.ui_font(11.6, QFont.Weight.DemiBold))
-        painter.setPen(QColor("#1F232C"))
+        painter.setPen(QColor("#F4F4F6"))
         painter.drawText(
             QRectF(local_rect.left() + 16.0, local_rect.top() + 38.0, 166.0, 22.0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
@@ -1958,7 +2032,7 @@ class NotchWindow(QWidget):
         )
 
         painter.setFont(jarvis_theme.ui_font(7.7, QFont.Weight.Normal))
-        painter.setPen(QColor("#626977"))
+        painter.setPen(QColor("#A1A1AA"))
         painter.drawText(
             QRectF(local_rect.left() + 16.0, local_rect.top() + 63.0, 152.0, 74.0),
             Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap,
@@ -1969,26 +2043,26 @@ class NotchWindow(QWidget):
         is_hovered = self._hovered_region_id == f"pill_{card_data.card_id}"
         self._paint_card_action_pill(painter, pill_rect, card_data.action_label, icon_kind="play", hovered=is_hovered)
 
-        # Mini vector illustration of a scrolling ChatGPT page with neon underline + down arrow
+        # Mini dark vector illustration of a scrolling ChatGPT page
         preview_rect = QRectF(local_rect.right() - 84.0, local_rect.top() + 56.0, 68.0, 90.0)
-        painter.setPen(QPen(QColor("#D5E2F5"), 1.0))
-        painter.setBrush(QColor("#F7FAFF"))
+        painter.setPen(QPen(QColor("#32323C"), 1.0))
+        painter.setBrush(QColor("#0E0E12"))
         painter.drawRoundedRect(preview_rect, 8.0, 8.0)
 
         for row_idx, width_ratio in enumerate((0.72, 0.85, 0.62, 0.78)):
             line_y = preview_rect.top() + 16.0 + row_idx * 13.0
             line_x0 = preview_rect.left() + 10.0
             line_x1 = line_x0 + (preview_rect.width() - 20.0) * width_ratio
-            painter.setPen(QPen(QColor("#CBD5E1"), 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.setPen(QPen(QColor("#3F3F46"), 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             painter.drawLine(QPointF(line_x0, line_y), QPointF(line_x1, line_y))
             if row_idx == 1:
-                painter.setPen(QPen(QColor("#1E88FF"), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.setPen(QPen(QColor("#E4E4E7"), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 painter.drawLine(QPointF(line_x0, line_y + 4.0), QPointF(line_x1, line_y + 4.0))
 
         # Scroll down chevron indicator
         arrow_cx = preview_rect.center().x()
         arrow_cy = preview_rect.bottom() - 14.0
-        painter.setPen(QPen(QColor("#0A84FF"), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.setPen(QPen(QColor("#D4D4D8"), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         painter.drawLine(QPointF(arrow_cx - 6.0, arrow_cy - 3.0), QPointF(arrow_cx, arrow_cy + 3.0))
         painter.drawLine(QPointF(arrow_cx, arrow_cy + 3.0), QPointF(arrow_cx + 6.0, arrow_cy - 3.0))
 
@@ -2001,26 +2075,26 @@ class NotchWindow(QWidget):
         is_center: bool,
     ) -> None:
         painter.setFont(jarvis_theme.ui_font(8.4, QFont.Weight.DemiBold))
-        painter.setPen(QColor("#1A78E5"))
+        painter.setPen(QColor("#D4D4D8"))
         painter.drawText(header_rect, Qt.AlignmentFlag.AlignCenter, card_data.badge_text)
 
         painter.setFont(jarvis_theme.ui_font(12.2 if is_center else 13.0, QFont.Weight.DemiBold))
-        painter.setPen(QColor("#222630"))
+        painter.setPen(QColor("#F4F4F6"))
         painter.drawText(
             QRectF(local_rect.left() + 16.0, local_rect.top() + 42.0, local_rect.width() - 32.0, 26.0),
             Qt.AlignmentFlag.AlignCenter,
             card_data.title,
         )
 
-        # Crisp miniature neon lasso loop
+        # Clean miniature lasso loop without glow
         loop_rect = QRectF(local_rect.center().x() - 34.0, local_rect.top() + 72.0, 68.0, 32.0)
-        painter.setPen(QPen(QColor("#26B4FF"), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.setBrush(QColor(38, 180, 255, 28))
+        painter.setPen(QPen(QColor("#D4D4D8"), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(loop_rect, 14.0, 14.0)
 
         if is_center:
             painter.setFont(jarvis_theme.ui_font(7.8, QFont.Weight.Normal))
-            painter.setPen(QColor("#626977"))
+            painter.setPen(QColor("#A1A1AA"))
             painter.drawText(
                 QRectF(local_rect.left() + 20.0, local_rect.top() + 110.0, local_rect.width() - 40.0, 38.0),
                 Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap,
@@ -2040,11 +2114,11 @@ class NotchWindow(QWidget):
         card_data: ArcDockCardData,
     ) -> None:
         painter.setFont(jarvis_theme.ui_font(8.4, QFont.Weight.DemiBold))
-        painter.setPen(QColor("#3380FF"))
+        painter.setPen(QColor("#D4D4D8"))
         painter.drawText(header_rect, Qt.AlignmentFlag.AlignCenter, card_data.badge_text)
 
         painter.setFont(jarvis_theme.ui_font(11.6, QFont.Weight.DemiBold))
-        painter.setPen(QColor("#262A34"))
+        painter.setPen(QColor("#F4F4F6"))
         painter.drawText(
             QRectF(local_rect.left() + 16.0, local_rect.top() + 38.0, 164.0, 22.0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
@@ -2052,19 +2126,19 @@ class NotchWindow(QWidget):
         )
 
         painter.setFont(jarvis_theme.ui_font(7.8, QFont.Weight.Normal))
-        painter.setPen(QColor("#6A707E"))
+        painter.setPen(QColor("#A1A1AA"))
         painter.drawText(
             QRectF(local_rect.left() + 16.0, local_rect.top() + 64.0, 152.0, 74.0),
             Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap,
             card_data.subtitle,
         )
 
-        # Mini live-sketch illustration badge on right
+        # Mini dark sketch illustration badge on right
         sketch_rect = QRectF(local_rect.right() - 82.0, local_rect.top() + 58.0, 66.0, 86.0)
-        painter.setPen(QPen(QColor("#DFDBD1"), 1.0))
-        painter.setBrush(QColor("#FFFDF9"))
+        painter.setPen(QPen(QColor("#32323C"), 1.0))
+        painter.setBrush(QColor("#0E0E12"))
         painter.drawRoundedRect(sketch_rect, 8.0, 8.0)
-        painter.setPen(QPen(QColor("#1E7BFF"), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setPen(QPen(QColor("#E4E4E7"), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(QPointF(sketch_rect.center().x(), sketch_rect.top() + 28.0), 14.0, 11.0)
         arrow_path = QPainterPath()
@@ -2089,14 +2163,14 @@ class NotchWindow(QWidget):
         icon_kind: str,
         hovered: bool,
     ) -> None:
-        fill_color = QColor("#D5ECFF") if hovered else QColor("#E4F3FF")
-        painter.setPen(QPen(QColor("#78C4FF"), 1.0))
+        fill_color = QColor("#32323B") if hovered else QColor("#24242B")
+        painter.setPen(QPen(QColor("#52525B"), 1.0))
         painter.setBrush(fill_color)
         painter.drawRoundedRect(pill_rect, pill_rect.height() / 2.0, pill_rect.height() / 2.0)
 
         icon_x = pill_rect.left() + 15.0
         icon_y = pill_rect.center().y()
-        accent_color = QColor("#007CD6")
+        accent_color = QColor("#F4F4F6")
         if icon_kind == "pdf":
             painter.setPen(QPen(accent_color, 1.2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -2123,15 +2197,13 @@ class NotchWindow(QWidget):
 
     def _paint_studio_pill(self, painter: QPainter, bounds: QRectF, label_text: str) -> None:
         hovered = self._hovered_region_id == "top_scroll_explain"
-        gradient = QLinearGradient(bounds.topLeft(), bounds.bottomLeft())
-        gradient.setColorAt(0.0, QColor("#5AB6FF") if hovered else QColor("#3A9BFF"))
-        gradient.setColorAt(1.0, QColor("#2983FF") if hovered else QColor("#1D6FE8"))
-        painter.setPen(QPen(QColor(175, 224, 255, 190), 1.0))
-        painter.setBrush(gradient)
+        fill_color = QColor("#2D2D35") if hovered else QColor("#1F1F26")
+        painter.setPen(QPen(QColor(82, 82, 91, 210), 1.0))
+        painter.setBrush(fill_color)
         painter.drawRoundedRect(bounds, bounds.height() / 2.0, bounds.height() / 2.0)
 
         painter.setFont(jarvis_theme.ui_font(8.4, QFont.Weight.DemiBold))
-        painter.setPen(QColor("#FFFFFF"))
+        painter.setPen(QColor("#F4F4F6"))
         painter.drawText(bounds, Qt.AlignmentFlag.AlignCenter, label_text)
 
     def _paint_footer_pill(
@@ -2145,15 +2217,15 @@ class NotchWindow(QWidget):
     ) -> None:
         hovered = self._hovered_region_id == region_id
         if is_light_pill:
-            fill_color = QColor("#FFFFFF") if hovered else QColor("#F3F4F8")
-            border_color = QColor(255, 255, 255, 200)
-            foreground_color = QColor("#1D1F26")
-            icon_color = QColor("#2578D4")
+            fill_color = QColor("#2D2D35") if hovered else QColor("#222229")
+            border_color = QColor("#52525B")
+            foreground_color = QColor("#F4F4F6")
+            icon_color = QColor("#E4E4E7")
         else:
-            fill_color = QColor("#2A2D36") if hovered else QColor("#1B1D23")
-            border_color = QColor(255, 255, 255, 34)
-            foreground_color = QColor("#EEF1F7")
-            icon_color = QColor("#DCE1EC")
+            fill_color = QColor("#27272E") if hovered else QColor("#18181D")
+            border_color = QColor(63, 63, 70, 210)
+            foreground_color = QColor("#E4E4E7")
+            icon_color = QColor("#D4D4D8")
 
         painter.setPen(QPen(border_color, 1.0))
         painter.setBrush(fill_color)

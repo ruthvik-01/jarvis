@@ -484,20 +484,20 @@ def _paint_clear_button_pill(
     hovered: bool = False,
     pressed: bool = False,
 ) -> None:
-    """Shared painter for the floating white `[ x Clear ]` top-right pill button."""
+    """Shared painter for the floating dark `[ x Clear ]` top-right pill button."""
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     radius = pill_rect.height() / 2.0
 
-    # Soft multi-layer elevation shadow matching reference photo 2.14.00 AM.jpeg
-    for offset_y, expand_px, shadow_alpha in ((4.0, 2.5, 22), (2.0, 1.0, 34)):
+    # Soft multi-layer elevation shadow
+    for offset_y, expand_px, shadow_alpha in ((4.0, 2.5, 28), (2.0, 1.0, 44)):
         shadow_rect = pill_rect.adjusted(-expand_px, -expand_px + offset_y, expand_px, expand_px + offset_y)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(0, 0, 0, shadow_alpha))
         painter.drawRoundedRect(shadow_rect, radius + expand_px, radius + expand_px)
 
-    fill_color = QColor(242, 245, 250, 252) if pressed else (QColor(248, 250, 253, 255) if hovered else QColor(255, 255, 255, 250))
-    border_color = QColor(196, 204, 216, 255) if hovered else QColor(218, 224, 232, 245)
+    fill_color = QColor(36, 36, 44, 250) if pressed else (QColor(28, 28, 34, 252) if hovered else QColor(18, 18, 22, 245))
+    border_color = QColor(82, 82, 91, 250) if hovered else QColor(63, 63, 70, 235)
 
     draw_rect = pill_rect.translated(0.0, 1.0) if pressed else pill_rect
     painter.setBrush(fill_color)
@@ -505,7 +505,7 @@ def _paint_clear_button_pill(
     painter.drawRoundedRect(draw_rect, radius, radius)
 
     # Crisp vector 'x' icon on the left side of the pill
-    ink_color = QColor(28, 32, 40, 245)
+    ink_color = QColor(244, 244, 246, 245)
     icon_center_x = draw_rect.left() + 21.0
     icon_center_y = draw_rect.center().y()
     cross_half = 4.0
@@ -619,9 +619,9 @@ def _paint_paper_document_icon(
     )
     frame_path = _build_smooth_catmull_rom_path(frame_points, closed=True)
 
-    fill_color = jarvis_theme.with_alpha(accent_color, 44) if highlighted else QColor(255, 255, 255, 165)
-    stroke_color = QColor(accent_color) if highlighted else QColor(78, 86, 98, 235)
-    line_color = jarvis_theme.with_alpha(accent_color, 150) if highlighted else QColor(95, 104, 118, 195)
+    fill_color = QColor(39, 39, 46, 240) if highlighted else QColor(26, 26, 32, 228)
+    stroke_color = QColor("#E4E4E7") if highlighted else QColor(138, 138, 150, 235)
+    line_color = QColor("#D4D4D8") if highlighted else QColor(161, 161, 170, 200)
 
     painter.save()
     painter.setBrush(fill_color)
@@ -688,14 +688,14 @@ def _render_paper_card_to_pixmap(
     # Top header strip (`DRAWING_PAPER_HEADER`)
     header_rect = QRectF(0.0, 0.0, card_width, PAPER_HEADER_HEIGHT)
     painter.fillRect(header_rect, jarvis_theme.DRAWING_PAPER_HEADER)
-    painter.setPen(QPen(QColor(186, 195, 208, 180), 1.0))
+    painter.setPen(QPen(QColor(42, 42, 52, 210), 1.0))
     painter.drawLine(QPointF(0.0, PAPER_HEADER_HEIGHT), QPointF(card_width, PAPER_HEADER_HEIGHT))
 
     header_label = jarvis_response_parser.clean_spoken_text(command.header or "")
     if header_label:
         header_font = jarvis_theme.barlow_font(9.5, semibold=False)
         painter.setFont(header_font)
-        painter.setPen(QColor(98, 108, 122, 235))
+        painter.setPen(QColor(161, 161, 170, 235))
         painter.drawText(header_rect, Qt.AlignmentFlag.AlignCenter, header_label)
 
     # Graph-paper grid lines (`DRAWING_GRID_LINE`)
@@ -709,7 +709,7 @@ def _render_paper_card_to_pixmap(
         painter.drawLine(QPointF(0.0, grid_y), QPointF(card_width, grid_y))
         grid_y += PAPER_GRID_SPACING
 
-    # 3. Title (`hand_font(19)` with soft white outline halo)
+    # 3. Title (`hand_font(19)` with soft dark outline halo)
     inner_margin_x = 20.0
     inner_width = card_width - inner_margin_x * 2.0
     cursor_y = PAPER_HEADER_HEIGHT + 16.0
@@ -737,7 +737,7 @@ def _render_paper_card_to_pixmap(
             text=title_text,
             font=title_font,
             text_color=jarvis_theme.DRAWING_INK,
-            halo_color=QColor(255, 255, 255, 238),
+            halo_color=QColor(18, 18, 22, 232),
             halo_width=5.2,
         )
         cursor_y += title_metrics.height() + 14.0
@@ -776,7 +776,7 @@ def _render_paper_card_to_pixmap(
                     text=section_text,
                     font=section_font,
                     text_color=jarvis_theme.DRAWING_INK,
-                    halo_color=QColor(255, 255, 255, 230),
+                    halo_color=QColor(18, 18, 22, 230),
                     halo_width=4.2,
                 )
             elif row.kind == "flow":
@@ -805,8 +805,8 @@ def _render_paper_card_to_pixmap(
 
     painter.restore()
 
-    # Crisp subtle paper rim border
-    painter.setPen(QPen(QColor(186, 198, 212, 215), 1.1))
+    # Crisp subtle dark paper rim border
+    painter.setPen(QPen(QColor(63, 63, 70, 220), 1.1))
     painter.setBrush(Qt.BrushStyle.NoBrush)
     painter.drawRoundedRect(card_rect, PAPER_CORNER_RADIUS, PAPER_CORNER_RADIUS)
     painter.end()
@@ -862,7 +862,7 @@ def _paint_paper_flow_row(
                 )
                 painter.save()
                 painter.setFont(caption_font)
-                painter.setPen(QColor(46, 52, 62, 240))
+                painter.setPen(QColor(212, 212, 216, 240))
                 elided_label = caption_metrics.elidedText(node.label, Qt.TextElideMode.ElideRight, label_rect.width())
                 painter.drawText(label_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, elided_label)
                 painter.restore()
@@ -891,7 +891,7 @@ def _paint_paper_flow_row(
                 arrow_y,
                 arrow_end_x,
                 arrow_y,
-                color=QColor(72, 80, 92, 225),
+                color=QColor(212, 212, 216, 225),
                 seed_value=seed_value + arrow_index * 41,
             )
         return
@@ -924,7 +924,7 @@ def _paint_paper_flow_row(
                 arrow_mid_y,
                 arrow_end_x,
                 arrow_mid_y,
-                color=QColor(72, 80, 92, 225),
+                color=QColor(212, 212, 216, 225),
                 seed_value=seed_value + node_index * 53,
             )
 
@@ -948,8 +948,8 @@ def _paint_sketched_node_box(
     )
     outline_path = _build_smooth_catmull_rom_path(outline_points, closed=True)
 
-    fill_color = jarvis_theme.with_alpha(accent_color, 36) if highlighted else QColor(228, 234, 242, 160)
-    border_color = QColor(accent_color) if highlighted else QColor(88, 96, 108, 235)
+    fill_color = QColor(39, 39, 46, 245) if highlighted else QColor(24, 24, 30, 232)
+    border_color = QColor("#E4E4E7") if highlighted else QColor(82, 82, 91, 235)
     border_width = 1.9 if highlighted else 1.4
 
     painter.save()
@@ -1548,7 +1548,7 @@ class OverlayCanvasWindow(QWidget):
 
         if drawing_mode in ("precise_lines", "lines_and_card"):
             if command.kind == "paper":
-                return command if drawing_mode == "lines_and_card" else None
+                return command
             if command.kind == "point":
                 return jarvis_response_parser.DrawingCommand(
                     kind="point",
@@ -2764,77 +2764,19 @@ class OverlayCanvasWindow(QWidget):
         if self._highlight_cached_path is None:
             self._highlight_cached_path = _build_smooth_catmull_rom_path(self._highlight_points)
 
-        cyan_blue = QColor("#26B4FF")
-
-        # When lasso covers a region, render a translucent glass interior + HUD corner brackets
-        if len(self._highlight_points) >= 5:
-            point_x_list = [pt_x for pt_x, _ in self._highlight_points]
-            point_y_list = [pt_y for _, pt_y in self._highlight_points]
-            min_x, max_x = min(point_x_list), max(point_x_list)
-            min_y, max_y = min(point_y_list), max(point_y_list)
-            region_w = max_x - min_x
-            region_h = max_y - min_y
-            if region_w > 36.0 and region_h > 24.0:
-                closed_lasso_path = _build_smooth_catmull_rom_path(self._highlight_points, closed=True)
-                painter.save()
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(jarvis_theme.with_alpha(cyan_blue, int(28 * fade_alpha)))
-                painter.drawPath(closed_lasso_path)
-
-                bracket_rect = QRectF(min_x - 6.0, min_y - 6.0, region_w + 12.0, region_h + 12.0)
-                bracket_len = min(18.0, min(bracket_rect.width(), bracket_rect.height()) * 0.25)
-                bracket_pen = QPen(
-                    jarvis_theme.with_alpha(QColor("#8AE0FF"), int(190 * fade_alpha)),
-                    1.6,
-                    Qt.PenStyle.SolidLine,
-                    Qt.PenCapStyle.RoundCap,
-                )
-                painter.setPen(bracket_pen)
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                corners = [
-                    (bracket_rect.topLeft(), (1.0, 0.0), (0.0, 1.0)),
-                    (bracket_rect.topRight(), (-1.0, 0.0), (0.0, 1.0)),
-                    (bracket_rect.bottomLeft(), (1.0, 0.0), (0.0, -1.0)),
-                    (bracket_rect.bottomRight(), (-1.0, 0.0), (0.0, -1.0)),
-                ]
-                for corner_pt, dir_h, dir_v in corners:
-                    painter.drawLine(
-                        corner_pt,
-                        QPointF(corner_pt.x() + dir_h[0] * bracket_len, corner_pt.y()),
-                    )
-                    painter.drawLine(
-                        corner_pt,
-                        QPointF(corner_pt.x(), corner_pt.y() + dir_v[1] * bracket_len),
-                    )
-                painter.restore()
-
-                _paint_callout_pill(
-                    painter,
-                    center_x=min_x + region_w * 0.5,
-                    top_y=max(16.0, min_y - 34.0),
-                    text="LASSO TARGET",
-                    accent_color=cyan_blue,
-                    opacity=fade_alpha,
-                )
-
-        _paint_glow_stroke(
-            painter,
-            self._highlight_cached_path,
-            core_color=cyan_blue,
-            core_width=HIGHLIGHT_CORE_WIDTH,
-            glow_width=HIGHLIGHT_GLOW_WIDTH,
-            opacity=fade_alpha,
+        # Clean, simple, non-glowing lasso stroke without corner HUD brackets or floating pill
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        lasso_pen = QPen(
+            QColor(228, 232, 240, int(235 * fade_alpha)),
+            2.2,
+            Qt.PenStyle.SolidLine,
+            Qt.PenCapStyle.RoundCap,
+            Qt.PenJoinStyle.RoundJoin,
         )
-
-        # Glowing pen tip orb on the leading point while lassoing
-        tip_x, tip_y = self._highlight_points[-1]
-        jarvis_theme.paint_soft_glow(
-            painter,
-            QPointF(tip_x, tip_y),
-            radius=13.0,
-            color=QColor("#96EAFF"),
-            peak_alpha=int(180 * fade_alpha),
-        )
+        painter.setPen(lasso_pen)
+        painter.drawPath(self._highlight_cached_path)
+        painter.restore()
 
     def _paint_companion_cursor(
         self,

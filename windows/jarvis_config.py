@@ -376,6 +376,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "custom_api_base_url": "",
     "remember_style_notes": [],
     "agent_actions_enabled": True,
+    "projects_root_dir": r"D:\Projects",
+    "autonomous_agent_max_steps": 6,
     # General
     "launch_at_login": False,
     "show_in_taskbar": False,
@@ -596,6 +598,12 @@ class SettingsStore(QObject):
             or self.get_secret(SECRET_RIVER_API_KEY)
             or self.get_effective_endpoint_url()
         )
+
+    def get_projects_root_dir(self) -> str:
+        """Returns the configured projects workspace directory (defaulting to D:\\Projects)."""
+        with self._lock:
+            configured_root = str(self._values.get("projects_root_dir", r"D:\Projects") or r"D:\Projects").strip()
+            return os.path.realpath(configured_root)
 
     def set_secret(self, secret_name: str, secret_value: str) -> None:
         secret_value = secret_value.strip()

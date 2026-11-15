@@ -779,6 +779,22 @@ class JarvisApplicationController(QObject):
                 )
                 return
 
+            if intent_plan.intent_kind == "autonomous_workspace_agent" and agent_actions_enabled:
+                self._executed_agent_command_in_turn = True
+                if intent_plan.spoken_step_intro:
+                    self._on_agent_step_speech_requested(
+                        intent_plan.spoken_step_intro,
+                        intent_plan.spoken_step_intro,
+                    )
+                captured_worker_gen = self._agent_worker_generation
+                threading.Thread(
+                    target=self._run_autonomous_agent_worker,
+                    args=(prompt_text, captured_worker_gen),
+                    name="JarvisAutonomousAgentWorker",
+                    daemon=True,
+                ).start()
+                return
+
             if intent_plan.intent_kind == "multitask_agent" and agent_actions_enabled and intent_plan.agent_commands:
                 self._executed_agent_command_in_turn = True
                 captured_worker_gen = self._agent_worker_generation
@@ -920,6 +936,100 @@ class JarvisApplicationController(QObject):
             live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
             suppress_visual_notes=False,
         )
+
+    def _run_autonomous_agent_worker(
+        self,
+        user_goal: str,
+        worker_generation: int,
+    ) -> None:
+        """Multi-step Plan-Act-Observe agent loop for D:\\Projects builds and complex Windows tasks."""
+        max_steps = max(2, min(10, int(self.settings_store.get("autonomous_agent_max_steps", 6) or 6)))
+        projects_root = self.settings_store.get_projects_root_dir()
+        step_observations: List[str] = []
+        final_spoken_summary = ""
+
+        for step_index in range(max_steps):
+            if self._quitting or worker_generation != self._agent_worker_generation:
+                return
+
+            active_window = self.screen_monitor.get_foreground_window_title() or "Unknown"
+            uia_summary = jarvis_services.WindowsUIAService.format_ui_summary(max_elements=18)
+            project_folders = jarvis_services.ProjectWorkspaceService.list_projects(projects_root)
+            history_block = "\n".join(step_observations[-8:]) if step_observations else "(No steps executed yet)"
+            observation_text = (
+                f"Foreground Window: {active_window}\n"
+                f"Projects Root ({projects_root}): {', '.join(project_folders[:24]) or '(empty)'}\n"
+                f"Active UIA Controls: {uia_summary}\n"
+                f"Previous Step Results:\n{history_block}"
+            )
+
+            screenshot_b64 = ""
+            if step_index == 0:
+                try:
+                    screen_w = max(640, self.overlay_window.width())
+                    screen_h = max(480, self.overlay_window.height())
+                    screenshot_b64, _crop_b64, _sw, _sh = (
+                        jarvis_services.ScreenCaptureService.capture_screen_with_highlight(
+                            highlight_points=[],
+                            highlight_color_hex=jarvis_theme.JARVIS_BLUE_HEX,
+                            logical_screen_size=(screen_w, screen_h),
+                        )
+                    )
+                except Exception:
+                    screenshot_b64 = ""
+
+            step_ok, parsed_step, step_err = self.brain_service.request_autonomous_agent_step(
+                user_goal=user_goal,
+                step_index=step_index,
+                max_steps=max_steps,
+                observation_text=observation_text,
+                jpeg_b64=screenshot_b64,
+            )
+            if self._quitting or worker_generation != self._agent_worker_generation:
+                return
+            if not step_ok:
+                final_spoken_summary = step_err or "Workspace step failed."
+                break
+
+            step_spoken = (parsed_step.spoken_text or "").strip()
+            if not parsed_step.commands:
+                final_spoken_summary = step_spoken or "Done."
+                break
+
+            done_reached = False
+            for cmd_item in parsed_step.commands:
+                if self._quitting or worker_generation != self._agent_worker_generation:
+                    return
+                if cmd_item.kind == "agent_done":
+                    final_spoken_summary = (cmd_item.body or step_spoken or "Completed, sir.").strip()
+                    done_reached = True
+                    break
+                step_banner = step_spoken or jarvis_services.DesktopAgentService.describe_step_for_speech(cmd_item)
+                if step_banner and cmd_item == parsed_step.commands[0]:
+                    self._agentStepSpeechRequested.emit(step_banner, step_banner)
+                action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_item)
+                self.memory_service.record_action(
+                    action_kind=cmd_item.kind,
+                    target_summary=cmd_item.label or cmd_item.body or cmd_item.header,
+                    status_text=status_msg,
+                    succeeded=action_ok,
+                )
+                step_observations.append(
+                    f"[Step {step_index + 1}] {cmd_item.kind}({cmd_item.body[:60]}): "
+                    f"{'OK' if action_ok else 'FAILED'} -> {status_msg[:180]}"
+                )
+                self.screen_monitor.poll_once()
+                time.sleep(0.15)
+
+            if done_reached:
+                break
+        else:
+            if not final_spoken_summary:
+                final_spoken_summary = "Finished workspace steps, sir."
+
+        if self._quitting or worker_generation != self._agent_worker_generation:
+            return
+        self._agentSequenceCompleted.emit(final_spoken_summary or "Done.")
 
     def _run_multitask_agent_worker(
         self,
@@ -1203,6 +1313,13 @@ class JarvisApplicationController(QObject):
             "system_control",
             "run_shell_read",
             "request_admin_permission",
+            "write_project_file",
+            "read_project_file",
+            "run_project_command",
+            "open_project",
+            "click_ui",
+            "inspect_ui",
+            "agent_done",
         )
         if command.kind in agent_kinds:
             admin_req = jarvis_services.DesktopAgentService.check_command_requires_admin(command)

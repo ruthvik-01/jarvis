@@ -948,6 +948,84 @@ def run_strict_selftest() -> int:
             and env_endpoint_resolution_ok
         )
 
+        # Upgraded Jarvis UIA, D:\Projects workspace builder, and Plan-Act-Observe checks
+        uia_summary_text = jarvis_services.WindowsUIAService.format_ui_summary(max_elements=6)
+        projects_found = jarvis_services.ProjectWorkspaceService.list_projects()
+        nectar_resolved = jarvis_services.ProjectWorkspaceService.resolve_project_dir("nectar link")
+        parsed_build_turn = jarvis_response_parser.parse_model_response(
+            'write_project_file("demo-app/main.py", "print(42)")\nCreating demo app.'
+        )
+        open_proj_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
+            "open my Nectarlink project in VS Code"
+        )
+        build_proj_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
+            "build me a todo web app in D:\\Projects"
+        )
+        with tempfile.TemporaryDirectory() as temp_workspace_root:
+            jail_escape_ok, _ = jarvis_services.ProjectWorkspaceService.write_workspace_file(
+                r"C:\Windows\System32\evil.txt",
+                "bad",
+                projects_root=temp_workspace_root,
+            )
+            jail_dotdot_ok, _ = jarvis_services.ProjectWorkspaceService.write_workspace_file(
+                "../escape.txt",
+                "bad",
+                projects_root=temp_workspace_root,
+            )
+            jail_env_ok, _ = jarvis_services.ProjectWorkspaceService.write_workspace_file(
+                "demo/.env",
+                "SECRET=1",
+                projects_root=temp_workspace_root,
+            )
+            jail_exe_ok, _ = jarvis_services.ProjectWorkspaceService.write_workspace_file(
+                "demo/app.exe",
+                "MZ",
+                projects_root=temp_workspace_root,
+            )
+            write_py_ok, _ = jarvis_services.ProjectWorkspaceService.write_workspace_file(
+                "demo/hello.py",
+                "print('WORKSPACE_RUN_OK')",
+                projects_root=temp_workspace_root,
+            )
+            read_py_ok, read_py_body = jarvis_services.ProjectWorkspaceService.read_workspace_file(
+                "demo/hello.py",
+                projects_root=temp_workspace_root,
+            )
+            run_py_ok, run_py_out = jarvis_services.ProjectWorkspaceService.run_project_command(
+                "python hello.py",
+                cwd_rel="demo",
+                projects_root=temp_workspace_root,
+            )
+            run_blocked_ok, _ = jarvis_services.ProjectWorkspaceService.run_project_command(
+                "rm -rf /",
+                cwd_rel="demo",
+                projects_root=temp_workspace_root,
+            )
+        jarvis_agent_upgrade_ok = (
+            isinstance(uia_summary_text, str)
+            and bool(uia_summary_text)
+            and ("clicky" in [name.lower() for name in projects_found])
+            and (nectar_resolved is not None and "nectarlink" in nectar_resolved.lower())
+            and any(
+                cmd_item.kind == "write_project_file" and cmd_item.body == "demo-app/main.py"
+                for cmd_item in parsed_build_turn.commands
+            )
+            and open_proj_intent.intent_kind == "multitask_agent"
+            and bool(open_proj_intent.agent_commands)
+            and open_proj_intent.agent_commands[0].kind == "open_project"
+            and build_proj_intent.intent_kind == "autonomous_workspace_agent"
+            and (not jail_escape_ok)
+            and (not jail_dotdot_ok)
+            and (not jail_env_ok)
+            and (not jail_exe_ok)
+            and write_py_ok
+            and read_py_ok
+            and ("WORKSPACE_RUN_OK" in read_py_body)
+            and run_py_ok
+            and ("WORKSPACE_RUN_OK" in run_py_out)
+            and (not run_blocked_ok)
+        )
+
         regression_safety_ok = (
             len(twitter_cmds) == 1
             and twitter_cmds[0].kind == "open_url"
@@ -974,6 +1052,7 @@ def run_strict_selftest() -> int:
             and google_gemini_ok
             and mentor_visuals_ok
             and universal_api_ok
+            and jarvis_agent_upgrade_ok
         )
 
         parser_ok = (

@@ -52,7 +52,9 @@ _COMMAND_NAMES_PATTERN = (
     r"(underline|ring|point|box|frame|paper|highlight|scroll|"
     r"open_browser|open_url|search_web|open_app|press_keys|type_text|"
     r"open_side_by_side|window_action|set_clipboard|write_file|system_control|"
-    r"run_shell_read|request_admin_permission)"
+    r"run_shell_read|request_admin_permission|"
+    r"write_project_file|read_project_file|run_project_command|open_project|"
+    r"click_ui|inspect_ui|agent_done)"
 )
 
 _CALL_LINE_PATTERN = re.compile(
@@ -681,19 +683,25 @@ def build_vision_system_prompt(
         prompt_sections.extend(
             [
                 "",
-                "Desktop & Browser Assistant Commands:",
-                "When the user asks to open apps/sites, manage windows, copy text, save notes under Desktop/Documents, adjust audio/media, or check read-only Windows stats, emit the matching plain single-line command before speaking (instead of asking the user to do it manually):",
+                "Desktop, UIA & D:\\Projects Builder Commands:",
+                "When the user asks to open apps/sites/projects/folders, build or edit code in D:\\Projects, click/inspect UI controls, manage windows, or run project commands, emit the matching plain single-line command before speaking (never ask the user to do it manually):",
                 "For sensitive or destructive actions (deleting files, uninstalling apps, shutting down, restarting, closing unsaved apps), emit `request_admin_permission(\"action title\", \"risk reason\")` first and wait for confirmation.",
                 "Available commands (one call per line before spoken text):",
-                "open_app(\"app name, system utility like taskmgr/notepad/calc, or settings:<topic>\")",
+                "open_app(\"app name, system utility like taskmgr/notepad/calc, Downloads/Documents/Desktop, or settings:<topic>\")",
+                "open_project(\"project name or path inside D:\\Projects\", \"auto|vscode|explorer|terminal\")",
                 "open_url(\"https://...\")",
                 "search_web(\"search query\")",
                 "open_side_by_side(\"left window/app or site/search\", \"right window/app or site/search\")",
                 "window_action(\"focus|minimize|maximize|restore|snap_left|snap_right|close|minimize_all\", \"window title or app name\")",
+                "click_ui(\"exact button/tab/control name or x,y\")",
+                "inspect_ui(\"optional window query\")",
                 "type_text(\"text to type into focused field\", \"submit\")",
                 "press_keys(\"shortcut such as ctrl+c, ctrl+t, alt+tab, win+e\")",
                 "set_clipboard(\"text to copy to clipboard\")",
-                "write_file(\"Desktop/notes.md\", \"file content to save safely under Desktop or Documents\")",
+                "write_project_file(\"my-app/index.html\", \"file contents saved under D:\\Projects (or Desktop/Documents)\")",
+                "read_project_file(\"my-app/README.md\")",
+                "run_project_command(\"python -m http.server 8000\", \"my-app\")",
+                "write_file(\"Desktop/notes.md\", \"file content to save safely under Desktop, Documents, or D:\\Projects\")",
                 "system_control(\"mute|unmute|volume_up|volume_down|play_pause|next_track|prev_track|show_desktop|screenshot\")",
                 "run_shell_read(\"Get-CimInstance Win32_OperatingSystem | Select FreePhysicalMemory,TotalVisibleMemorySize\", \"System memory status\")",
                 "request_admin_permission(\"action title\", \"risk explanation\")",
@@ -1145,7 +1153,15 @@ def parse_command_line(
             header=right_target,
         )
 
-    if command_name in ("window_action", "write_file", "system_control", "run_shell_read"):
+    if command_name in (
+        "window_action",
+        "write_file",
+        "system_control",
+        "run_shell_read",
+        "write_project_file",
+        "run_project_command",
+        "open_project",
+    ):
         primary_arg = _parse_string(arguments[0], "").strip() if arguments else ""
         if not primary_arg:
             return None
@@ -1155,6 +1171,16 @@ def parse_command_line(
             label=secondary_arg or primary_arg,
             body=primary_arg,
             header=secondary_arg,
+        )
+
+    if command_name in ("read_project_file", "click_ui", "inspect_ui", "agent_done"):
+        single_arg = _parse_string(arguments[0], "").strip() if arguments else ""
+        if not single_arg and command_name not in ("inspect_ui", "agent_done"):
+            return None
+        return DrawingCommand(
+            kind=command_name,
+            label=single_arg or command_name,
+            body=single_arg,
         )
 
     if command_name == "set_clipboard":

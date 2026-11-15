@@ -2960,6 +2960,13 @@ class VisionBrainService(QObject):
                 "system_control",
                 "run_shell_read",
                 "request_admin_permission",
+                "write_project_file",
+                "read_project_file",
+                "run_project_command",
+                "open_project",
+                "click_ui",
+                "inspect_ui",
+                "agent_done",
                 "scroll",
             }
             agent_actions_enabled = bool(self._settings_store.get("agent_actions_enabled", True))
@@ -3217,6 +3224,191 @@ class VisionBrainService(QObject):
             existing_paper_count=0,
         )
         return cards[0] if cards else None
+
+
+    def request_autonomous_agent_step(
+        self,
+        user_goal: str,
+        step_index: int,
+        max_steps: int,
+        observation_text: str,
+        jpeg_b64: str = "",
+        turn_generation: int = 0,
+    ) -> Tuple[bool, jarvis_response_parser.ParsedTurnResponse, str]:
+        """Executes one synchronous Plan-Act-Observe LLM step against any configured endpoint."""
+        vision_endpoints = self.resolve_all_vision_endpoints(self._settings_store)
+        if not vision_endpoints:
+            return (
+                False,
+                jarvis_response_parser.ParsedTurnResponse(),
+                "No API endpoint or key configured in Studio & Keys or .env.",
+            )
+
+        agent_system_prompt = (
+            "You are J.A.R.V.I.S, an ultra-capable Windows & D:\\Projects autonomous builder and desktop agent.\n"
+            "You operate in a strict Plan-Act-Observe loop. On each turn you receive the live OS observation "
+            "(foreground window, UI Automation controls, D:\\Projects folders, and previous step output/exit code).\n\n"
+            "Available single-line tool commands (emit 1 to 4 commands FIRST, followed by one concise natural spoken sentence):\n"
+            '- write_project_file("project-folder/relative/path.ext", "full file content with \\n escapes")\n'
+            '- read_project_file("project-folder/relative/path.ext")\n'
+            '- run_project_command("shell command e.g. python -m pytest or npm run build or python app.py", "project-folder")\n'
+            '- open_project("project-folder", "vscode|explorer|terminal|auto")\n'
+            '- open_app("app name, Downloads/Desktop/Documents, or settings:<topic>")\n'
+            '- open_url("https://... or http://localhost:PORT")\n'
+            '- search_web("query")\n'
+            '- open_side_by_side("left app/site", "right app/site")\n'
+            '- window_action("focus|minimize|maximize|snap_left|snap_right|close", "window title")\n'
+            '- click_ui("exact UI control name or x,y")\n'
+            '- inspect_ui("optional window query")\n'
+            '- type_text("text", "submit")\n'
+            '- press_keys("ctrl+s")\n'
+            '- request_admin_permission("action title", "risk reason")\n'
+            '- agent_done("short completion summary")\n\n'
+            "Rules:\n"
+            "1. ALWAYS create and build new user coding projects inside D:\\Projects\\<project-name> unless Desktop/Documents is requested.\n"
+            "2. Emit real runnable files cleanly with proper \\n escapes inside write_project_file(...) — never leave placeholders.\n"
+            "3. Verify builds/tests with run_project_command(...) when appropriate, and open the result in VS Code/Chrome/Explorer if helpful.\n"
+            "4. Emit agent_done(\"...\") as soon as the goal is verified complete.\n"
+            "5. Spoken text MUST be crisp, polite, direct JARVIS status (1 short sentence, zero raw tool syntax spoken)."
+        )
+        user_step_prompt = (
+            f"User Goal: {user_goal}\n"
+            f"Step: {step_index + 1} of {max_steps}\n\n"
+            f"Live Observation:\n{observation_text}\n\n"
+            "Emit the next command(s) (or agent_done) followed by a short 1-sentence JARVIS status."
+        )
+
+        last_err = "Autonomous step failed."
+        for endpoint_cfg in vision_endpoints:
+            if turn_generation and self._generation_id != turn_generation:
+                return (False, jarvis_response_parser.ParsedTurnResponse(), "Turn cancelled.")
+            wire_proto = endpoint_cfg["wire_protocol"]
+            endpoint_url = endpoint_cfg["endpoint_url"]
+            model_id = endpoint_cfg["model_id"]
+            api_key = endpoint_cfg["api_key"]
+            extractor = jarvis_response_parser.StreamingSentenceExtractor()
+
+            if wire_proto == "google":
+                resolved_url = (
+                    endpoint_url.format(model_id=model_id)
+                    if "{model_id}" in endpoint_url
+                    else jarvis_config.normalize_endpoint_url(endpoint_url, "google", model_id)
+                )
+                req_headers: Dict[str, str] = {"Content-Type": "application/json"}
+                if api_key:
+                    req_headers["x-goog-api-key"] = api_key
+                req_payload = self.build_google_gemini_payload(
+                    system_prompt=agent_system_prompt,
+                    history_messages=[],
+                    request_user_text=user_step_prompt,
+                    jpeg_b64=jpeg_b64,
+                    max_output_tokens=1600,
+                )
+            elif wire_proto == "anthropic":
+                resolved_url = endpoint_url
+                req_headers = {"anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+                if api_key:
+                    req_headers["x-api-key"] = api_key
+                req_payload = self.build_anthropic_messages_payload(
+                    system_prompt=agent_system_prompt,
+                    history_messages=[],
+                    request_user_text=user_step_prompt,
+                    jpeg_b64=jpeg_b64,
+                    max_output_tokens=1600,
+                    model_id=model_id,
+                )
+            else:
+                resolved_url = endpoint_url
+                url_lower = resolved_url.lower()
+                req_headers = {"Content-Type": "application/json"}
+                if api_key:
+                    if ("openai.azure.com" in url_lower) or ("api-version=" in url_lower):
+                        req_headers["api-key"] = api_key
+                    else:
+                        req_headers["Authorization"] = f"Bearer {api_key}"
+                if "openrouter.ai" in url_lower:
+                    req_headers["HTTP-Referer"] = "https://heyclicky.com"
+                    req_headers["X-Title"] = "Jarvis"
+                step_user_content: Any = (
+                    [
+                        {"type": "text", "text": user_step_prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{jpeg_b64}"}},
+                    ]
+                    if jpeg_b64
+                    else user_step_prompt
+                )
+                req_payload = {
+                    "model": model_id,
+                    "messages": [
+                        {"role": "system", "content": agent_system_prompt},
+                        {"role": "user", "content": step_user_content},
+                    ],
+                    "max_tokens": 1600,
+                    "stream": True,
+                }
+                if "api.river.ai" in url_lower:
+                    req_payload["reasoning_effort"] = "none"
+
+            try:
+                with requests.post(
+                    resolved_url,
+                    headers=req_headers,
+                    json=req_payload,
+                    stream=True,
+                    timeout=45,
+                ) as response:
+                    if not response.ok:
+                        last_err = f"{endpoint_cfg['provider_label']} HTTP {response.status_code}: {response.text[:180]}"
+                        continue
+                    response.encoding = "utf-8"
+                    plain_lines: List[str] = []
+                    saw_sse = False
+                    for raw_line in response.iter_lines(decode_unicode=True):
+                        if turn_generation and self._generation_id != turn_generation:
+                            return (False, jarvis_response_parser.ParsedTurnResponse(), "Turn cancelled.")
+                        if not raw_line:
+                            continue
+                        stripped_line = raw_line.strip()
+                        if stripped_line.startswith("data:"):
+                            saw_sse = True
+                            data_str = stripped_line[5:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk_json = json.loads(data_str)
+                            except Exception:
+                                continue
+                        elif stripped_line.startswith("event:"):
+                            saw_sse = True
+                            continue
+                        elif (not saw_sse) and stripped_line.startswith("{"):
+                            try:
+                                chunk_json = json.loads(stripped_line)
+                            except Exception:
+                                plain_lines.append(raw_line)
+                                continue
+                        else:
+                            if not saw_sse:
+                                plain_lines.append(raw_line)
+                            continue
+                        delta_text = self.extract_universal_sse_delta_text(chunk_json, wire_proto)
+                        if delta_text:
+                            extractor.feed_delta(delta_text)
+                    if (not saw_sse) and plain_lines:
+                        try:
+                            full_obj = json.loads("\n".join(plain_lines))
+                            full_text = self.extract_universal_sse_delta_text(full_obj, wire_proto)
+                            if full_text:
+                                extractor.feed_delta(full_text)
+                        except Exception:
+                            pass
+                extractor.flush_remaining()
+                return (True, extractor.build_final_response(), "")
+            except Exception as step_exc:
+                last_err = f"{endpoint_cfg['provider_label']} error: {step_exc}"
+                continue
+
+        return (False, jarvis_response_parser.ParsedTurnResponse(), last_err)
 
 
 # ---------------------------------------------------------------------------
@@ -3798,6 +3990,457 @@ class AgentScreenMonitorService(QObject):
             f"Recent window transitions: {transitions_text}\n"
             f"Last screen change ratio: {last_diff:.3f}"
         )
+
+
+class WindowsUIAService:
+    """Native Windows UI Automation (UIA3 via comtypes) helper for reliable element grounding & clicking.
+
+    Follows the architectural pattern used by Windows-MCP and Microsoft UFO: inspect live
+    interactive OS accessibility elements (buttons, inputs, tabs, links, menu items) instead
+    of relying solely on blind pixel coordinates.
+    """
+
+    INTERACTIVE_CONTROL_TYPES = {
+        50000: "Button",
+        50002: "CheckBox",
+        50003: "ComboBox",
+        50004: "Edit",
+        50005: "Hyperlink",
+        50007: "ListItem",
+        50009: "Menu",
+        50011: "MenuItem",
+        50013: "RadioButton",
+        50019: "TabItem",
+        50024: "TreeItem",
+        50030: "Document",
+    }
+
+    @classmethod
+    def get_active_window_ui_elements(cls, max_elements: int = 24) -> List[Dict[str, Any]]:
+        """Walks the foreground window UIA tree and returns named interactive elements with coordinates."""
+        if sys.platform != "win32":
+            return []
+        try:
+            import comtypes
+            import comtypes.client
+        except Exception:
+            return []
+
+        elements: List[Dict[str, Any]] = []
+        com_initialized = False
+        try:
+            comtypes.CoInitialize()
+            com_initialized = True
+            uia_module = comtypes.client.GetModule("UIAutomationCore.dll")
+            uia_client = comtypes.client.CreateObject(
+                "{ff48dba4-60ef-4201-aa87-54103eef594e}",
+                interface=uia_module.IUIAutomation,
+            )
+            hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+            root_element = uia_client.ElementFromHandle(hwnd) if hwnd else uia_client.GetFocusedElement()
+            if not root_element:
+                return []
+
+            tree_walker = uia_client.ControlViewWalker
+            work_queue: List[Tuple[Any, int]] = [(root_element, 0)]
+            visited_nodes = 0
+            max_nodes_to_visit = 130
+            seen_keys = set()
+
+            while work_queue and len(elements) < max_elements and visited_nodes < max_nodes_to_visit:
+                current_node, depth = work_queue.pop(0)
+                visited_nodes += 1
+                try:
+                    ctrl_type_id = int(getattr(current_node, "CurrentControlType", 0) or 0)
+                    ctrl_name = str(getattr(current_node, "CurrentName", "") or "").strip()
+                    is_offscreen = bool(getattr(current_node, "CurrentIsOffscreen", False))
+                    rect = getattr(current_node, "CurrentBoundingRectangle", None)
+                    if (
+                        (not is_offscreen)
+                        and ctrl_name
+                        and (ctrl_type_id in cls.INTERACTIVE_CONTROL_TYPES)
+                        and rect is not None
+                    ):
+                        width_px = int(rect.right - rect.left)
+                        height_px = int(rect.bottom - rect.top)
+                        if width_px >= 6 and height_px >= 6:
+                            center_x = int(rect.left + width_px / 2)
+                            center_y = int(rect.top + height_px / 2)
+                            dedupe_key = (ctrl_type_id, ctrl_name[:40].lower(), center_x // 8, center_y // 8)
+                            if dedupe_key not in seen_keys:
+                                seen_keys.add(dedupe_key)
+                                elements.append(
+                                    {
+                                        "name": ctrl_name[:64],
+                                        "control_type": cls.INTERACTIVE_CONTROL_TYPES[ctrl_type_id],
+                                        "x": center_x,
+                                        "y": center_y,
+                                        "width": width_px,
+                                        "height": height_px,
+                                    }
+                                )
+                except Exception:
+                    pass
+
+                if depth >= 4:
+                    continue
+                try:
+                    child_node = tree_walker.GetFirstChildElement(current_node)
+                    child_cap = 0
+                    while child_node and child_cap < 28:
+                        work_queue.append((child_node, depth + 1))
+                        child_node = tree_walker.GetNextSiblingElement(child_node)
+                        child_cap += 1
+                except Exception:
+                    continue
+        except Exception:
+            return []
+        finally:
+            if com_initialized:
+                try:
+                    import comtypes
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
+        return elements
+
+    @classmethod
+    def format_ui_summary(cls, max_elements: int = 18) -> str:
+        elements = cls.get_active_window_ui_elements(max_elements=max_elements)
+        if not elements:
+            return "(No interactive UIA controls exposed on current foreground window)"
+        formatted_items = [
+            f"{elem['control_type']} '{elem['name']}' @({elem['x']},{elem['y']})"
+            for elem in elements
+        ]
+        return "; ".join(formatted_items)
+
+    @classmethod
+    def find_and_click_control(cls, target_spec: str) -> Tuple[bool, str]:
+        cleaned_spec = (target_spec or "").strip()
+        if not cleaned_spec:
+            return False, "No UI target specified"
+
+        coord_match = re.match(r"^\s*(\d{1,5})\s*,\s*(\d{1,5})\s*$", cleaned_spec)
+        if coord_match:
+            target_x = int(coord_match.group(1))
+            target_y = int(coord_match.group(2))
+            if pyautogui is not None:
+                pyautogui.click(target_x, target_y)
+                return True, f"Clicked screen coordinates ({target_x}, {target_y})"
+            if sys.platform == "win32":
+                user32 = ctypes.windll.user32
+                user32.SetCursorPos(target_x, target_y)
+                user32.mouse_event(0x0002, 0, 0, 0, 0)
+                user32.mouse_event(0x0004, 0, 0, 0, 0)
+                return True, f"Clicked screen coordinates ({target_x}, {target_y})"
+            return False, "Mouse control unavailable"
+
+        elements = cls.get_active_window_ui_elements(max_elements=40)
+        if not elements:
+            return False, f"Could not inspect active window controls for '{cleaned_spec}'"
+
+        lowered_target = cleaned_spec.lower()
+        exact_hit = next((elem for elem in elements if elem["name"].lower() == lowered_target), None)
+        if exact_hit is None:
+            exact_hit = next((elem for elem in elements if lowered_target in elem["name"].lower()), None)
+        if exact_hit is None:
+            target_words = [word for word in re.findall(r"[a-z0-9]+", lowered_target) if len(word) >= 2]
+            if target_words:
+                exact_hit = next(
+                    (
+                        elem
+                        for elem in elements
+                        if all(word in elem["name"].lower() for word in target_words)
+                    ),
+                    None,
+                )
+        if exact_hit is None:
+            return False, f"Control '{cleaned_spec}' not found on foreground window"
+
+        click_x = int(exact_hit["x"])
+        click_y = int(exact_hit["y"])
+        if pyautogui is not None:
+            pyautogui.click(click_x, click_y)
+            return True, f"Clicked {exact_hit['control_type']} '{exact_hit['name']}' at ({click_x}, {click_y})"
+        if sys.platform == "win32":
+            user32 = ctypes.windll.user32
+            user32.SetCursorPos(click_x, click_y)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            return True, f"Clicked {exact_hit['control_type']} '{exact_hit['name']}' at ({click_x}, {click_y})"
+        return False, "Mouse control unavailable"
+
+
+class ProjectWorkspaceService:
+    """Safe project scaffolding, file reading/writing, and command execution rooted in D:\\Projects."""
+
+    DEFAULT_PROJECTS_ROOT = r"D:\Projects"
+    BLOCKED_BINARY_EXTENSIONS = {
+        ".exe", ".bat", ".cmd", ".ps1", ".vbs", ".msi", ".dll",
+        ".scr", ".com", ".hta", ".reg", ".sys", ".drv", ".lnk",
+    }
+    SENSITIVE_FILENAMES = {
+        ".env", ".env.local", ".env.production", ".env.development",
+        "user_settings.json", "id_rsa", "id_ed25519", "credentials.json",
+    }
+    DESTRUCTIVE_COMMAND_PATTERNS = (
+        "rm -rf", "rm -fr", "remove-item", "rmdir /s", "rd /s", "del /s", "del /q",
+        "format ", "format-", "diskpart", "bcdedit", "cipher /w", "reg delete",
+        "shutdown", "restart-computer", "stop-computer", "taskkill /f",
+        "git push --force", "git reset --hard", "drop database", "drop table",
+    )
+
+    @classmethod
+    def get_projects_root(cls, projects_root: str = "") -> str:
+        raw_root = (projects_root or cls.DEFAULT_PROJECTS_ROOT).strip()
+        return os.path.realpath(raw_root)
+
+    @classmethod
+    def list_projects(cls, projects_root: str = "") -> List[str]:
+        root_dir = cls.get_projects_root(projects_root)
+        if not os.path.isdir(root_dir):
+            return []
+        try:
+            project_names = [
+                entry_name
+                for entry_name in os.listdir(root_dir)
+                if os.path.isdir(os.path.join(root_dir, entry_name)) and (not entry_name.startswith("."))
+            ]
+            return sorted(project_names, key=lambda item_name: item_name.lower())
+        except OSError:
+            return []
+
+    @classmethod
+    def resolve_project_dir(cls, query: str, projects_root: str = "") -> Optional[str]:
+        cleaned_query = (query or "").strip()
+        if not cleaned_query:
+            return None
+        root_dir = cls.get_projects_root(projects_root)
+        if os.path.isdir(cleaned_query):
+            resolved_direct = os.path.realpath(cleaned_query)
+            if resolved_direct.lower().startswith(root_dir.lower()):
+                return resolved_direct
+        candidate_names = cls.list_projects(root_dir)
+        lowered_query = cleaned_query.lower()
+        for folder_name in candidate_names:
+            if folder_name.lower() == lowered_query:
+                return os.path.join(root_dir, folder_name)
+        normalized_query = re.sub(r"[^a-z0-9]+", "", lowered_query)
+        if normalized_query:
+            for folder_name in candidate_names:
+                normalized_folder = re.sub(r"[^a-z0-9]+", "", folder_name.lower())
+                if normalized_folder == normalized_query or normalized_query in normalized_folder:
+                    return os.path.join(root_dir, folder_name)
+        return None
+
+    @classmethod
+    def resolve_safe_workspace_path(
+        cls,
+        raw_path: str,
+        projects_root: str = "",
+        default_to_projects: bool = True,
+    ) -> Tuple[Optional[str], str]:
+        cleaned_path = (raw_path or "").strip()
+        if not cleaned_path:
+            return None, "No file path specified"
+
+        root_dir = cls.get_projects_root(projects_root)
+        user_home = os.path.expanduser("~")
+        desktop_dir = os.path.realpath(os.path.join(user_home, "Desktop"))
+        documents_dir = os.path.realpath(os.path.join(user_home, "Documents"))
+        allowed_roots = [root_dir, desktop_dir, documents_dir]
+
+        slash_normalized = cleaned_path.replace("\\", "/")
+        lowered_slash = slash_normalized.lower()
+        if os.path.isabs(cleaned_path):
+            resolved_candidate = os.path.realpath(cleaned_path)
+        elif lowered_slash.startswith("desktop/"):
+            inner_part = slash_normalized[len("desktop/") :].lstrip("/")
+            resolved_candidate = os.path.realpath(os.path.join(desktop_dir, inner_part))
+        elif lowered_slash.startswith("documents/"):
+            inner_part = slash_normalized[len("documents/") :].lstrip("/")
+            resolved_candidate = os.path.realpath(os.path.join(documents_dir, inner_part))
+        elif lowered_slash.startswith("projects/"):
+            inner_part = slash_normalized[len("projects/") :].lstrip("/")
+            resolved_candidate = os.path.realpath(os.path.join(root_dir, inner_part))
+        elif default_to_projects:
+            resolved_candidate = os.path.realpath(os.path.join(root_dir, slash_normalized.lstrip("/")))
+        else:
+            resolved_candidate = os.path.realpath(os.path.join(desktop_dir, slash_normalized.lstrip("/")))
+
+        if ".." in slash_normalized.split("/"):
+            return None, "Path traversal ('..') is blocked"
+
+        is_inside_allowed = any(
+            resolved_candidate.lower() == allowed_root.lower()
+            or resolved_candidate.lower().startswith(allowed_root.lower() + os.sep)
+            for allowed_root in allowed_roots
+        )
+        if not is_inside_allowed:
+            return None, "Path escapes D:\\Projects / Desktop / Documents workspace"
+
+        basename_lower = os.path.basename(resolved_candidate).lower()
+        if basename_lower in cls.SENSITIVE_FILENAMES or basename_lower.startswith(".env."):
+            return None, f"Refused access to protected config/secret file: {basename_lower}"
+        return resolved_candidate, ""
+
+    @classmethod
+    def write_workspace_file(
+        cls,
+        raw_path: str,
+        content: str,
+        projects_root: str = "",
+        default_to_projects: bool = True,
+    ) -> Tuple[bool, str]:
+        resolved_path, err_msg = cls.resolve_safe_workspace_path(
+            raw_path,
+            projects_root=projects_root,
+            default_to_projects=default_to_projects,
+        )
+        if resolved_path is None:
+            return False, err_msg
+        _, out_ext = os.path.splitext(resolved_path.lower())
+        if out_ext in cls.BLOCKED_BINARY_EXTENSIONS:
+            return False, f"Refused to write executable/binary extension: {out_ext}"
+        if not out_ext:
+            resolved_path += ".txt"
+        decoded_content = (content or "").replace("\\n", "\n") if ("\\n" in (content or "") and "\n" not in (content or "")) else (content or "")
+        try:
+            os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
+            with open(resolved_path, "w", encoding="utf-8") as file_handle:
+                file_handle.write(decoded_content)
+            return True, f"Wrote {resolved_path}"
+        except Exception as exc:
+            return False, str(exc)
+
+    @classmethod
+    def read_workspace_file(
+        cls,
+        raw_path: str,
+        projects_root: str = "",
+        max_chars: int = 3200,
+    ) -> Tuple[bool, str]:
+        resolved_path, err_msg = cls.resolve_safe_workspace_path(
+            raw_path,
+            projects_root=projects_root,
+            default_to_projects=True,
+        )
+        if resolved_path is None:
+            return False, err_msg
+        if not os.path.isfile(resolved_path):
+            return False, f"File not found: {resolved_path}"
+        try:
+            with open(resolved_path, "r", encoding="utf-8", errors="replace") as file_handle:
+                text_data = file_handle.read(max_chars)
+            return True, text_data
+        except Exception as exc:
+            return False, str(exc)
+
+    @classmethod
+    def run_project_command(
+        cls,
+        command_text: str,
+        cwd_rel: str = "",
+        projects_root: str = "",
+    ) -> Tuple[bool, str]:
+        cleaned_cmd = (command_text or "").strip()
+        if not cleaned_cmd:
+            return False, "No project command provided"
+        lowered_cmd = cleaned_cmd.lower()
+        if any(pattern in lowered_cmd for pattern in cls.DESTRUCTIVE_COMMAND_PATTERNS):
+            return False, "Blocked destructive command — explicit admin confirmation required"
+
+        root_dir = cls.get_projects_root(projects_root)
+        if cwd_rel.strip():
+            resolved_cwd, err_msg = cls.resolve_safe_workspace_path(
+                cwd_rel.strip(),
+                projects_root=root_dir,
+                default_to_projects=True,
+            )
+            if resolved_cwd is None:
+                return False, err_msg
+            os.makedirs(resolved_cwd, exist_ok=True)
+        else:
+            resolved_cwd = root_dir
+            os.makedirs(resolved_cwd, exist_ok=True)
+
+        is_background_server = any(
+            server_hint in lowered_cmd
+            for server_hint in ("http.server", "npm run dev", "npm start", "vite", "uvicorn", "flask run")
+        )
+        try:
+            if is_background_server:
+                proc = subprocess.Popen(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", cleaned_cmd],
+                    cwd=resolved_cwd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                return True, f"Started server (PID {proc.pid}) in {resolved_cwd}"
+
+            proc_result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cleaned_cmd],
+                cwd=resolved_cwd,
+                capture_output=True,
+                text=True,
+                timeout=25.0,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            combined_out = ((proc_result.stdout or "") + "\n" + (proc_result.stderr or "")).strip()
+            compact_out = re.sub(r"\s+", " ", combined_out)[:360]
+            if proc_result.returncode == 0:
+                return True, compact_out or f"Command succeeded in {os.path.basename(resolved_cwd)}"
+            return False, f"Exit {proc_result.returncode}: {compact_out}"
+        except subprocess.TimeoutExpired:
+            return False, "Project command timed out after 25s"
+        except Exception as exc:
+            return False, str(exc)
+
+    @classmethod
+    def open_project(
+        cls,
+        project_query: str,
+        tool_name: str = "auto",
+        projects_root: str = "",
+    ) -> Tuple[bool, str]:
+        root_dir = cls.get_projects_root(projects_root)
+        target_dir = cls.resolve_project_dir(project_query, root_dir)
+        if target_dir is None:
+            return False, f"Could not find project '{project_query}' in {root_dir}"
+
+        chosen_tool = (tool_name or "auto").strip().lower()
+        if chosen_tool in ("vscode", "code", "auto"):
+            code_exe = shutil.which("code") or shutil.which("code.cmd")
+            if code_exe or chosen_tool in ("vscode", "code"):
+                try:
+                    subprocess.Popen(
+                        [code_exe or "code", target_dir],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        shell=(code_exe is None),
+                    )
+                    return True, f"Opened {os.path.basename(target_dir)} in VS Code"
+                except Exception:
+                    if chosen_tool in ("vscode", "code"):
+                        return False, f"Could not launch VS Code for {target_dir}"
+
+        if chosen_tool in ("terminal", "powershell", "cmd"):
+            try:
+                subprocess.Popen(
+                    ["powershell", "-NoExit", "-Command", f"Set-Location -LiteralPath '{target_dir}'"],
+                    creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+                )
+                return True, f"Opened terminal at {os.path.basename(target_dir)}"
+            except Exception as exc:
+                return False, str(exc)
+
+        try:
+            os.startfile(target_dir)
+            return True, f"Opened project folder {os.path.basename(target_dir)}"
+        except Exception as exc:
+            return False, str(exc)
 
 
 class DesktopAgentService:
@@ -4700,6 +5343,20 @@ class DesktopAgentService:
             return f"Running {argument_text.replace('_', ' ')}."
         if command.kind == "run_shell_read":
             return f"Checking {(command.header or 'system info')[:28]}."
+        if command.kind == "write_project_file":
+            return f"Writing {os.path.basename(argument_text) or 'project file'}."
+        if command.kind == "read_project_file":
+            return f"Reading {os.path.basename(argument_text) or 'project file'}."
+        if command.kind == "run_project_command":
+            return f"Running {argument_text[:30]}."
+        if command.kind == "open_project":
+            return f"Opening project {argument_text[:28]}."
+        if command.kind == "click_ui":
+            return f"Clicking {argument_text[:28]}."
+        if command.kind == "inspect_ui":
+            return "Inspecting active window."
+        if command.kind == "agent_done":
+            return argument_text or "Completed."
         if command.kind == "search_web":
             return f"Searching for {argument_text[:34]}."
         if command.kind == "type_text":
@@ -4819,6 +5476,31 @@ class DesktopAgentService:
                     jarvis_response_parser.DrawingCommand(kind="open_browser", label=argument_text),
                     block_for_typing=block_for_typing,
                 )
+            folder_aliases = {
+                "downloads": os.path.join(os.path.expanduser("~"), "Downloads"),
+                "documents": os.path.join(os.path.expanduser("~"), "Documents"),
+                "desktop": os.path.join(os.path.expanduser("~"), "Desktop"),
+                "pictures": os.path.join(os.path.expanduser("~"), "Pictures"),
+                "music": os.path.join(os.path.expanduser("~"), "Music"),
+                "videos": os.path.join(os.path.expanduser("~"), "Videos"),
+                "projects": ProjectWorkspaceService.get_projects_root(),
+                "dprojects": ProjectWorkspaceService.get_projects_root(),
+            }
+            if normalized_app in folder_aliases and os.path.isdir(folder_aliases[normalized_app]):
+                try:
+                    os.startfile(folder_aliases[normalized_app])
+                    return True, f"Opened {argument_text}"
+                except Exception as exc:
+                    return False, str(exc)
+            if os.path.exists(argument_text):
+                try:
+                    os.startfile(argument_text)
+                    return True, f"Opened {os.path.basename(argument_text) or argument_text}"
+                except Exception as exc:
+                    return False, str(exc)
+            matched_project_dir = ProjectWorkspaceService.resolve_project_dir(argument_text)
+            if matched_project_dir is not None:
+                return ProjectWorkspaceService.open_project(argument_text, tool_name="auto")
             launch_args = cls.SAFE_APP_LAUNCHERS.get(normalized_app)
             if normalized_app == "chrome":
                 chrome_exe = cls._resolve_chrome_executable()
@@ -4973,48 +5655,42 @@ class DesktopAgentService:
             return False, "Could not write text to clipboard"
 
         if command_kind == "write_file":
-            rel_path_raw = argument_text.replace("\\", "/").strip()
-            file_content = command.header or ""
-            if not rel_path_raw:
-                return False, "No output file path specified"
-            user_home = os.path.expanduser("~")
-            desktop_dir = os.path.realpath(os.path.join(user_home, "Desktop"))
-            documents_dir = os.path.realpath(os.path.join(user_home, "Documents"))
-            lower_rel = rel_path_raw.lower()
-            if lower_rel.startswith("desktop/"):
-                base_dir = desktop_dir
-                inner_rel = rel_path_raw[len("desktop/") :]
-            elif lower_rel.startswith("documents/"):
-                base_dir = documents_dir
-                inner_rel = rel_path_raw[len("documents/") :]
-            elif "/" not in rel_path_raw and not os.path.isabs(rel_path_raw):
-                base_dir = desktop_dir
-                inner_rel = rel_path_raw
-            else:
-                return False, "write_file is scoped strictly under Desktop/ or Documents/"
+            return ProjectWorkspaceService.write_workspace_file(
+                argument_text,
+                command.header or "",
+                default_to_projects=False,
+            )
 
-            clean_inner = os.path.normpath(inner_rel).lstrip("\\/")
-            if not clean_inner or clean_inner.startswith("..") or os.path.isabs(clean_inner):
-                return False, f"Invalid relative path: {rel_path_raw}"
-            resolved_out_path = os.path.realpath(os.path.join(base_dir, clean_inner))
-            if not (resolved_out_path.startswith(base_dir + os.sep)):
-                return False, "Path escapes Desktop/Documents sandbox"
-            blocked_exts = {
-                ".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".msi", ".dll",
-                ".scr", ".com", ".hta", ".reg", ".py", ".sh", ".lnk",
-            }
-            _, out_ext = os.path.splitext(resolved_out_path.lower())
-            if out_ext in blocked_exts:
-                return False, f"Refused to write executable/script extension: {out_ext}"
-            if not out_ext:
-                resolved_out_path += ".txt"
-            try:
-                os.makedirs(os.path.dirname(resolved_out_path), exist_ok=True)
-                with open(resolved_out_path, "w", encoding="utf-8") as file_handle:
-                    file_handle.write(file_content)
-                return True, f"Saved file to {os.path.basename(resolved_out_path)}"
-            except Exception as exc:
-                return False, str(exc)
+        if command_kind == "write_project_file":
+            return ProjectWorkspaceService.write_workspace_file(
+                argument_text,
+                command.header or "",
+                default_to_projects=True,
+            )
+
+        if command_kind == "read_project_file":
+            return ProjectWorkspaceService.read_workspace_file(argument_text)
+
+        if command_kind == "run_project_command":
+            return ProjectWorkspaceService.run_project_command(
+                argument_text,
+                cwd_rel=command.header or "",
+            )
+
+        if command_kind == "open_project":
+            return ProjectWorkspaceService.open_project(
+                argument_text,
+                tool_name=command.header or "auto",
+            )
+
+        if command_kind == "click_ui":
+            return WindowsUIAService.find_and_click_control(argument_text)
+
+        if command_kind == "inspect_ui":
+            return True, WindowsUIAService.format_ui_summary(max_elements=18)
+
+        if command_kind == "agent_done":
+            return True, argument_text or "Completed."
 
         if command_kind == "system_control":
             control_action = argument_text.lower().replace("-", "_").replace(" ", "_")
@@ -5297,14 +5973,50 @@ class DesktopAgentService:
                     )
                 ]
 
+        project_open_match = re.match(
+            r"^(?:please\s+)?(?:open|launch|load)\s+(?:my\s+)?(.+?)\s+project(?:\s+in\s+(vs\s?code|vscode|explorer|terminal|powershell))?$",
+            lowered,
+        )
+        if project_open_match:
+            proj_query = project_open_match.group(1).strip()
+            proj_tool = (project_open_match.group(2) or "auto").replace(" ", "").lower()
+            if proj_tool == "vs code":
+                proj_tool = "vscode"
+            if proj_query and proj_query not in cls._DEICTIC_SCREEN_REFERENCES:
+                return [
+                    jarvis_response_parser.DrawingCommand(
+                        kind="open_project",
+                        body=proj_query,
+                        header=proj_tool,
+                        label=proj_query,
+                    )
+                ]
+
+        click_match = re.match(
+            r"^(?:please\s+)?click\s+(?:on\s+)?(?:the\s+)?(.+?)(?:\s+button|\s+tab|\s+link)?$",
+            lowered,
+        )
+        if click_match:
+            click_target = cleaned[click_match.start(1) : click_match.end(1)].strip(" .!?\"'")
+            if click_target and click_target.lower() not in cls._DEICTIC_SCREEN_REFERENCES:
+                return [
+                    jarvis_response_parser.DrawingCommand(
+                        kind="click_ui",
+                        body=click_target,
+                        label=click_target,
+                    )
+                ]
+
         app_match = re.match(
-            r"^(?:please\s+)?(?:open|launch|start)\s+(?:my\s+)?(chrome|google\s+chrome|edge|firefox|notepad|calculator|calc|paint|explorer|terminal|powershell|cmd|vs\s?code|vscode|settings)$",
+            r"^(?:please\s+)?(?:open|launch|start)\s+(?:my\s+)?(chrome|google\s+chrome|edge|firefox|notepad|calculator|calc|paint|explorer|terminal|powershell|cmd|vs\s?code|vscode|settings|downloads|documents|desktop|pictures|projects|spotify|whatsapp|discord|slack|obs|vlc|postman|task\s+manager)$",
             lowered,
         )
         if app_match:
             app_name = app_match.group(1).strip()
             if app_name == "google chrome":
                 app_name = "chrome"
+            elif app_name == "task manager":
+                app_name = "taskmgr"
             return [
                 jarvis_response_parser.DrawingCommand(
                     kind="open_app",
@@ -5312,6 +6024,34 @@ class DesktopAgentService:
                     label=app_name,
                 )
             ]
+
+        generic_open_match = re.match(
+            r"^(?:please\s+)?(?:open|launch|start)\s+(?:the\s+|my\s+)?([a-zA-Z0-9][a-zA-Z0-9\s\-_.:\\]{1,48})(?:\s+in\s+(vs\s?code|vscode|explorer|terminal))?$",
+            lowered,
+        )
+        if generic_open_match and (not allow_tab_search):
+            candidate_open = generic_open_match.group(1).strip(" .!?")
+            open_tool = (generic_open_match.group(2) or "auto").replace(" ", "").lower()
+            if candidate_open and candidate_open.lower() not in cls._DEICTIC_SCREEN_REFERENCES and (
+                "tab" not in candidate_open.lower() and "stock" not in candidate_open.lower() and "price" not in candidate_open.lower()
+            ):
+                if ProjectWorkspaceService.resolve_project_dir(candidate_open) is not None:
+                    return [
+                        jarvis_response_parser.DrawingCommand(
+                            kind="open_project",
+                            body=candidate_open,
+                            header=open_tool,
+                            label=candidate_open,
+                        )
+                    ]
+                if cls._find_installed_app_target(candidate_open) or os.path.exists(candidate_open):
+                    return [
+                        jarvis_response_parser.DrawingCommand(
+                            kind="open_app",
+                            body=candidate_open,
+                            label=candidate_open,
+                        )
+                    ]
 
         tab_open_match = re.match(
             r"^(?:please\s+)?(?:open|launch|show|find|look\s+up|check)\s+(?:a\s+tab\s+(?:for|of)\s+)?(.+)$",
@@ -5933,6 +6673,25 @@ class DesktopAgentService:
                 intent_kind="web_lookup_and_answer",
                 spoken_step_intro=f"Searching Chrome for {lookup_query[:38]}.",
                 search_query=lookup_query,
+            )
+
+        is_workspace_build_request = bool(
+            re.search(
+                r"\b(?:build|create|scaffold|generate|make|write|develop|setup|set\s+up)\b.*\b(?:project|app|website|webpage|web\s*app|script|api|server|calculator|dashboard|game|tool|portfolio|todo|cli)\b",
+                lowered,
+            )
+            or re.search(r"\bin\s+d:\\projects\b", lowered)
+            or bool(
+                re.search(
+                    r"\b(?:inspect|find|click|fix|debug|test|run)\b.*\b(?:project|tests?|build|ui|window|controls?)\b",
+                    lowered,
+                )
+            )
+        )
+        if is_workspace_build_request:
+            return ContextualIntentPlan(
+                intent_kind="autonomous_workspace_agent",
+                spoken_step_intro="On it, sir. Planning workspace steps now.",
             )
 
         if direct_commands:

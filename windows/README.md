@@ -21,8 +21,8 @@ Native 60 FPS PySide6 (Qt 6) desktop screen companion for Windows, compiled laun
 
 Create a `.env` file in the repository root or `windows/.env` (see `../.env.example`) containing:
 
-- `RIVER_AI_API`
-- `ASSEMBLYAI_API_KEY`
+- `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) for Google Gemini Vision — and/or `RIVER_AI_API`
+- `ASSEMBLYAI_API_KEY` for AssemblyAI Streaming STT and Neural Voice TTS
 
 Settings and UI preferences are saved locally to `windows/user_settings.json` (git-ignored).
 

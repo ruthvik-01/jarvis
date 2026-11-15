@@ -2010,6 +2010,251 @@ class VisionBrainService(QObject):
     turnFailed = Signal(str)
 
     RIVER_CHAT_URL = "https://api.river.ai/v1/chat/completions"
+    GOOGLE_GEMINI_STREAM_URL_TEMPLATE = (
+        "https://generativelanguage.googleapis.com/v1beta/models/{model_id}:streamGenerateContent?alt=sse"
+    )
+
+    @staticmethod
+    def resolve_active_vision_provider_and_model(
+        settings_store: jarvis_config.SettingsStore,
+    ) -> Tuple[str, str, str]:
+        """Returns `(provider_name, model_id, api_key)` based on configured keys and selected model."""
+        selected_model = str(
+            settings_store.get("chat_model", jarvis_config.DEFAULT_SETTINGS["chat_model"]) or ""
+        ).strip()
+        if not selected_model:
+            selected_model = str(jarvis_config.DEFAULT_SETTINGS["chat_model"])
+        google_key = settings_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
+        river_key = settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
+
+        if jarvis_config.is_google_gemini_model(selected_model):
+            if google_key:
+                return ("google", selected_model, google_key)
+            if river_key:
+                return ("river", "deepseek-ai/DeepSeek-V4.1-Flash", river_key)
+            return ("google", selected_model, "")
+
+        if river_key:
+            return ("river", selected_model, river_key)
+        if google_key:
+            return ("google", jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL, google_key)
+        return ("river", selected_model, "")
+
+    @staticmethod
+    def build_google_gemini_payload(
+        system_prompt: str,
+        history_messages: List[Dict[str, str]],
+        request_user_text: str,
+        jpeg_b64: str = "",
+        lasso_crop_b64: str = "",
+        max_output_tokens: int = 1100,
+    ) -> Dict[str, Any]:
+        """Builds a native Gemini `generateContent` JSON request payload with optional screenshots."""
+        gemini_contents: List[Dict[str, Any]] = []
+        for past_msg in history_messages:
+            past_text = str(past_msg.get("content") or "").strip()
+            if not past_text:
+                continue
+            gemini_role = "model" if past_msg.get("role") == "assistant" else "user"
+            gemini_contents.append({"role": gemini_role, "parts": [{"text": past_text}]})
+
+        user_parts: List[Dict[str, Any]] = [{"text": request_user_text}]
+        if jpeg_b64:
+            user_parts.append({"inlineData": {"mimeType": "image/jpeg", "data": jpeg_b64}})
+        if lasso_crop_b64:
+            user_parts.append({"inlineData": {"mimeType": "image/jpeg", "data": lasso_crop_b64}})
+        gemini_contents.append({"role": "user", "parts": user_parts})
+
+        payload: Dict[str, Any] = {
+            "contents": gemini_contents,
+            "generationConfig": {
+                "maxOutputTokens": max_output_tokens,
+                "temperature": 0.35,
+            },
+        }
+        if (system_prompt or "").strip():
+            payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+        return payload
+
+    @staticmethod
+    def extract_google_sse_delta_text(chunk_json: Dict[str, Any]) -> str:
+        """Extracts non-thought text deltas from a Gemini `:streamGenerateContent?alt=sse` event."""
+        candidates = chunk_json.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return ""
+        first_candidate = candidates[0]
+        if not isinstance(first_candidate, dict):
+            return ""
+        content_obj = first_candidate.get("content")
+        if not isinstance(content_obj, dict):
+            return ""
+        parts = content_obj.get("parts")
+        if not isinstance(parts, list):
+            return ""
+        collected_chunks: List[str] = []
+        for part_item in parts:
+            if not isinstance(part_item, dict):
+                continue
+            if part_item.get("thought") is True:
+                continue
+            part_text = part_item.get("text")
+            if isinstance(part_text, str) and part_text:
+                collected_chunks.append(part_text)
+        return "".join(collected_chunks)
+
+    @staticmethod
+    def get_google_model_fallback_chain(model_id: str) -> List[str]:
+        """Returns the requested Google Gemini model first, followed by deduplicated fallbacks."""
+        normalized_model = (model_id or jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL).strip()
+        if normalized_model.startswith("models/"):
+            normalized_model = normalized_model[len("models/") :]
+        elif normalized_model.startswith("google/"):
+            normalized_model = normalized_model[len("google/") :]
+        if not normalized_model:
+            normalized_model = jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL
+
+        lowered_model = normalized_model.lower()
+        if "hydrogen" in lowered_model or "pro" in lowered_model:
+            fallback_candidates = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+        else:
+            fallback_candidates = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"]
+
+        ordered_chain: List[str] = []
+        for candidate_name in [normalized_model] + fallback_candidates:
+            if candidate_name and candidate_name not in ordered_chain:
+                ordered_chain.append(candidate_name)
+        return ordered_chain
+
+    def _stream_vision_provider_once(
+        self,
+        provider_name: str,
+        model_id: str,
+        api_key: str,
+        system_prompt: str,
+        filtered_history: List[Dict[str, str]],
+        request_user_text: str,
+        jpeg_b64: str,
+        lasso_crop_b64: str,
+        extractor: jarvis_response_parser.StreamingSentenceExtractor,
+        turn_generation: int,
+        allow_visual_notes: bool,
+    ) -> Tuple[bool, bool, str]:
+        """Streams one vision turn against either Google Gemini or River AI.
+
+        Returns `(succeeded, emitted_any_chunk, error_message)`.
+        """
+        provider_label = "Google Gemini" if provider_name == "google" else "River AI"
+        candidate_models = (
+            self.get_google_model_fallback_chain(model_id)
+            if provider_name == "google"
+            else [model_id]
+        )
+
+        emitted_any_chunk = False
+        last_error_message = f"{provider_label} request failed."
+        turn_max_tokens = 1100 if allow_visual_notes else 750
+        for candidate_index, candidate_model in enumerate(candidate_models):
+            if self._generation_id != turn_generation:
+                return (False, emitted_any_chunk, "Turn cancelled.")
+
+            if provider_name == "google":
+                request_url = self.GOOGLE_GEMINI_STREAM_URL_TEMPLATE.format(model_id=candidate_model)
+                request_headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+                request_json = self.build_google_gemini_payload(
+                    system_prompt=system_prompt,
+                    history_messages=filtered_history,
+                    request_user_text=request_user_text,
+                    jpeg_b64=jpeg_b64,
+                    lasso_crop_b64=lasso_crop_b64,
+                    max_output_tokens=turn_max_tokens,
+                )
+            else:
+                river_messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+                river_messages.extend(filtered_history)
+                user_content: Any
+                if jpeg_b64:
+                    user_content = [
+                        {"type": "text", "text": request_user_text},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{jpeg_b64}"}},
+                    ]
+                    if lasso_crop_b64:
+                        user_content.append(
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{lasso_crop_b64}"}}
+                        )
+                else:
+                    user_content = request_user_text
+                river_messages.append({"role": "user", "content": user_content})
+                request_url = self.RIVER_CHAT_URL
+                request_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                request_json = {
+                    "model": candidate_model,
+                    "messages": river_messages,
+                    "max_tokens": turn_max_tokens,
+                    "stream": True,
+                    "reasoning_effort": "none",
+                }
+
+            try:
+                with requests.post(
+                    request_url,
+                    headers=request_headers,
+                    json=request_json,
+                    stream=True,
+                    timeout=45,
+                ) as response:
+                    if not response.ok:
+                        error_text = response.text[:240]
+                        last_error_message = f"{provider_label} error {response.status_code}: {error_text}"
+                        has_more_candidates = (candidate_index + 1) < len(candidate_models)
+                        if (
+                            provider_name == "google"
+                            and (not emitted_any_chunk)
+                            and response.status_code in (400, 404)
+                            and has_more_candidates
+                        ):
+                            continue
+                        return (False, emitted_any_chunk, last_error_message)
+
+                    response.encoding = "utf-8"
+                    for raw_line in response.iter_lines(decode_unicode=True):
+                        if self._generation_id != turn_generation:
+                            return (False, emitted_any_chunk, "Turn cancelled.")
+                        if not raw_line or not raw_line.startswith("data: "):
+                            continue
+                        data_str = raw_line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk_json = json.loads(data_str)
+                        except Exception:
+                            continue
+                        if isinstance(chunk_json, dict) and isinstance(chunk_json.get("error"), dict):
+                            api_err_msg = str(chunk_json["error"].get("message") or chunk_json["error"])[:240]
+                            return (False, emitted_any_chunk, f"{provider_label} error: {api_err_msg}")
+                        if provider_name == "google":
+                            delta_text = self.extract_google_sse_delta_text(chunk_json)
+                        else:
+                            delta_text = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if not delta_text:
+                            continue
+
+                        emitted_any_chunk = True
+                        new_sentences, new_commands = extractor.feed_delta(delta_text)
+                        for cmd in new_commands:
+                            if not allow_visual_notes and cmd.kind in ("paper", "underline"):
+                                continue
+                            self.drawingCommandReady.emit(cmd)
+                        for sentence in new_sentences:
+                            self.sentenceReady.emit(sentence)
+                        display_so_far = extractor.current_display_text()
+                        if display_so_far:
+                            self.partialTextUpdated.emit(display_so_far)
+
+                return (True, emitted_any_chunk, "")
+            except Exception as err:
+                return (False, emitted_any_chunk, f"Could not reach {provider_label}: {err}")
+
+        return (False, emitted_any_chunk, last_error_message)
 
     def __init__(self, settings_store: jarvis_config.SettingsStore) -> None:
         super().__init__()
@@ -2092,11 +2337,13 @@ class VisionBrainService(QObject):
         live_screen_context: str = "",
         suppress_visual_notes: bool = False,
     ) -> None:
-        api_key = self._settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
+        provider_name, active_model_id, api_key = self.resolve_active_vision_provider_and_model(
+            self._settings_store
+        )
         if not api_key:
             self._is_running = False
             if self._generation_id == turn_generation:
-                self.turnFailed.emit("River AI API key is missing in .env.")
+                self.turnFailed.emit("Google Gemini or River AI API key is missing in .env.")
             return
 
         jpeg_b64 = ""
@@ -2182,78 +2429,71 @@ class VisionBrainService(QObject):
         if context_notes:
             request_user_text = f"{user_prompt}\n\n[Context]\n" + "\n".join(context_notes)
 
-        messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        filtered_history: List[Dict[str, str]] = []
         for past_message in self._history[-6:]:
             past_content = past_message.get("content", "")
             if isinstance(past_content, str) and JarvisMemoryService.is_polluted_memory_text(past_content):
                 continue
-            messages.append(past_message)
+            filtered_history.append(past_message)
 
-        user_content: Any
-        if jpeg_b64:
-            user_content = [
-                {"type": "text", "text": request_user_text},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{jpeg_b64}"}},
-            ]
-            if lasso_crop_b64:
-                user_content.append(
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{lasso_crop_b64}"}}
-                )
-        else:
-            user_content = request_user_text
-        messages.append({"role": "user", "content": user_content})
-
-        model_id = str(self._settings_store.get("chat_model", "deepseek-ai/DeepSeek-V4.1-Flash"))
         extractor = jarvis_response_parser.StreamingSentenceExtractor(scale_x=scale_x, scale_y=scale_y)
 
         try:
-            with requests.post(
-                self.RIVER_CHAT_URL,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model_id,
-                    "messages": messages,
-                    "max_tokens": 700,
-                    "stream": True,
-                    "reasoning_effort": "none",
-                },
-                stream=True,
-                timeout=45,
-            ) as response:
-                if not response.ok:
-                    error_text = response.text[:240]
-                    if self._generation_id == turn_generation:
-                        self._is_running = False
-                        self.turnFailed.emit(f"River AI error {response.status_code}: {error_text}")
-                    return
+            stream_ok, emitted_any_chunk, stream_error_message = self._stream_vision_provider_once(
+                provider_name=provider_name,
+                model_id=active_model_id,
+                api_key=api_key,
+                system_prompt=system_prompt,
+                filtered_history=filtered_history,
+                request_user_text=request_user_text,
+                jpeg_b64=jpeg_b64,
+                lasso_crop_b64=lasso_crop_b64,
+                extractor=extractor,
+                turn_generation=turn_generation,
+                allow_visual_notes=allow_visual_notes,
+            )
+            if (
+                (not stream_ok)
+                and (not emitted_any_chunk)
+                and self._generation_id == turn_generation
+            ):
+                google_backup_key = self._settings_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
+                river_backup_key = self._settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
+                backup_provider = ""
+                backup_model = ""
+                backup_key = ""
+                if provider_name == "google" and river_backup_key:
+                    backup_provider = "river"
+                    backup_model = "deepseek-ai/DeepSeek-V4.1-Flash"
+                    backup_key = river_backup_key
+                elif provider_name == "river" and google_backup_key:
+                    backup_provider = "google"
+                    backup_model = jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL
+                    backup_key = google_backup_key
 
-                response.encoding = "utf-8"
-                for raw_line in response.iter_lines(decode_unicode=True):
-                    if self._generation_id != turn_generation:
-                        return
-                    if not raw_line or not raw_line.startswith("data: "):
-                        continue
-                    data_str = raw_line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk_json = json.loads(data_str)
-                        delta_text = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                    except Exception:
-                        continue
-                    if not delta_text:
-                        continue
+                if backup_provider and backup_key:
+                    extractor = jarvis_response_parser.StreamingSentenceExtractor(
+                        scale_x=scale_x, scale_y=scale_y
+                    )
+                    stream_ok, _backup_emitted, stream_error_message = self._stream_vision_provider_once(
+                        provider_name=backup_provider,
+                        model_id=backup_model,
+                        api_key=backup_key,
+                        system_prompt=system_prompt,
+                        filtered_history=filtered_history,
+                        request_user_text=request_user_text,
+                        jpeg_b64=jpeg_b64,
+                        lasso_crop_b64=lasso_crop_b64,
+                        extractor=extractor,
+                        turn_generation=turn_generation,
+                        allow_visual_notes=allow_visual_notes,
+                    )
 
-                    new_sentences, new_commands = extractor.feed_delta(delta_text)
-                    for cmd in new_commands:
-                        if not allow_visual_notes and cmd.kind in ("paper", "underline"):
-                            continue
-                        self.drawingCommandReady.emit(cmd)
-                    for sentence in new_sentences:
-                        self.sentenceReady.emit(sentence)
-                    display_so_far = extractor.current_display_text()
-                    if display_so_far:
-                        self.partialTextUpdated.emit(display_so_far)
+            if not stream_ok:
+                if self._generation_id == turn_generation:
+                    self._is_running = False
+                    self.turnFailed.emit(stream_error_message or "Vision request failed.")
+                return
 
             if self._generation_id != turn_generation:
                 return
@@ -2347,6 +2587,7 @@ class VisionBrainService(QObject):
                     screen_height=img_h,
                     underline_labels=underline_labels,
                     existing_paper_count=existing_paper_count,
+                    user_prompt=user_prompt,
                 )
                 for synthesized_card in synthesized_cards:
                     parsed_response.commands.append(synthesized_card)
@@ -2375,7 +2616,7 @@ class VisionBrainService(QObject):
         except Exception as err:
             self._is_running = False
             if self._generation_id == turn_generation:
-                self.turnFailed.emit(f"Could not reach River AI: {err}")
+                self.turnFailed.emit(f"Could not reach vision model: {err}")
 
     @staticmethod
     def _build_visual_note_cards_for_response(
@@ -2385,16 +2626,24 @@ class VisionBrainService(QObject):
         screen_height: int = 864,
         underline_labels: Optional[List[str]] = None,
         existing_paper_count: int = 0,
+        user_prompt: str = "",
     ) -> List[jarvis_response_parser.DrawingCommand]:
         """
         Synthesizes structured visual diagram note cards so every visual answer has 2 to 3
-        complementary topic maps covering overview, breakdown/details, and outcome.
+        complementary topic maps covering overview/archetype visual, connections, and recall clue.
         """
         cleaned_sentences = [sentence.strip() for sentence in spoken_sentences if sentence and sentence.strip()]
         if not cleaned_sentences and spoken_text:
             cleaned_sentences = [spoken_text.strip()]
         if not cleaned_sentences:
             return []
+
+        pattern_meta = jarvis_response_parser.classify_visual_explanation_pattern(
+            user_prompt=user_prompt,
+            spoken_text=spoken_text,
+            labels=underline_labels,
+        )
+        archetype = pattern_meta.get("archetype", "process")
 
         label_topics: List[str] = []
         for raw_label in underline_labels or []:
@@ -2447,36 +2696,64 @@ class VisionBrainService(QObject):
             slot_x, slot_y, slot_w, slot_h = margin_slots[slot_idx]
             if slot_idx == 0:
                 card_title = merged_topics[0]
-                card_header = "Overview Map"
-                card_body = (
-                    f"{merged_topics[0]} -> {merged_topics[1]} | "
-                    f"section:Core Flow | "
-                    f"doc:{merged_topics[1]} -> {merged_topics[2]}"
-                )
+                if archetype == "comparison":
+                    card_header = "Comparison Table"
+                    card_body = (
+                        f"compare: {merged_topics[0]} vs {merged_topics[1]} | "
+                        f"section:Key Contrast | "
+                        f"{merged_topics[2]} -> {merged_topics[3]} | "
+                        f"clue:{pattern_meta['memory_clue']}"
+                    )
+                elif archetype == "hierarchy":
+                    card_header = "Hierarchy Tree"
+                    card_body = (
+                        f"tree: {merged_topics[0]} > {merged_topics[1]}, {merged_topics[2]} | "
+                        f"section:Classification | "
+                        f"doc:{merged_topics[2]} -> {merged_topics[3]} | "
+                        f"clue:{pattern_meta['memory_clue']}"
+                    )
+                elif archetype == "decision":
+                    card_header = "Decision Tree"
+                    card_body = (
+                        f"if: {merged_topics[0]}? -> {merged_topics[1]} / {merged_topics[2]} | "
+                        f"section:Outcome | "
+                        f"doc:{merged_topics[1]} -> {merged_topics[3]} | "
+                        f"clue:{pattern_meta['memory_clue']}"
+                    )
+                else:
+                    card_header = pattern_meta["header_badge"]
+                    card_body = (
+                        f"{merged_topics[0]} -> {merged_topics[1]} | "
+                        f"section:{pattern_meta['pattern_name']} | "
+                        f"doc:{merged_topics[1]} -> {merged_topics[2]} | "
+                        f"clue:{pattern_meta['memory_clue']}"
+                    )
                 target_sentence_idx = 0
             elif slot_idx == 1:
                 pair_start = 2 if len(merged_topics) >= 4 else 1
-                node_a = merged_topics[pair_start]
-                node_b = merged_topics[(pair_start + 1) % len(merged_topics)]
-                node_c = merged_topics[(pair_start + 2) % len(merged_topics)]
-                card_title = f"{node_a} Flow"
-                card_header = "Breakdown"
+                topic_first = merged_topics[pair_start]
+                topic_second = merged_topics[(pair_start + 1) % len(merged_topics)]
+                topic_third = merged_topics[(pair_start + 2) % len(merged_topics)]
+                card_title = f"{topic_first} Link"
+                card_header = "Connections & Example"
                 card_body = (
-                    f"{node_a} -> {node_b} | "
-                    f"section:Key Details | "
-                    f"doc:{node_b} -> {node_c}"
+                    f"{topic_first} -> {topic_second} | "
+                    f"section:Real-Life Example | "
+                    f"doc:{topic_second} -> {topic_third} | "
+                    f"clue:Why -> How -> Effect"
                 )
                 target_sentence_idx = min(total_sentences - 1, max(1, total_sentences // 2))
             else:
-                tail_a = merged_topics[-3]
-                tail_b = merged_topics[-2]
-                tail_c = merged_topics[-1]
-                card_title = "Key Takeaways"
-                card_header = "Summary"
+                tail_first = merged_topics[-3]
+                tail_second = merged_topics[-2]
+                tail_third = merged_topics[-1]
+                card_title = "Pattern & Recall"
+                card_header = "Pattern & Recall"
                 card_body = (
-                    f"{tail_a} -> {tail_b} | "
-                    f"section:Conclusion | "
-                    f"doc:{tail_b} -> {tail_c}"
+                    f"{tail_first} -> {tail_second} | "
+                    f"section:Exam Hook | "
+                    f"doc:{tail_second} -> {tail_third} | "
+                    f"clue:{pattern_meta['pattern_name']}"
                 )
                 target_sentence_idx = total_sentences - 1
 

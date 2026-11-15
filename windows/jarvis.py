@@ -182,11 +182,16 @@ def run_strict_selftest() -> int:
         for relpath in required_asset_relpaths
         if not os.path.exists(os.path.join(jarvis_theme.ASSETS_DIRECTORY, relpath))
     ]
-    missing_secrets = [
-        secret_name
-        for secret_name in jarvis_config.ALL_SECRET_NAMES
-        if not settings_store.get_secret(secret_name)
-    ]
+    has_assembly_key = bool(settings_store.get_secret(jarvis_config.SECRET_ASSEMBLYAI_API_KEY))
+    has_vision_key = bool(
+        settings_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
+        or settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
+    )
+    missing_secrets: List[str] = []
+    if not has_assembly_key:
+        missing_secrets.append(jarvis_config.SECRET_ASSEMBLYAI_API_KEY)
+    if not has_vision_key:
+        missing_secrets.append(f"{jarvis_config.SECRET_GOOGLE_API_KEY}|{jarvis_config.SECRET_RIVER_API_KEY}")
     suite1_ok = (not missing_assets) and (not missing_secrets)
     record_result(
         "Suite 1 (Assets & Secrets)",
@@ -753,6 +758,96 @@ def run_strict_selftest() -> int:
             dsml_extractor.feed_delta(raw_dsml_and_warning[chunk_idx : chunk_idx + 17])
         dsml_extractor.flush_remaining()
         stream_dsml_turn = dsml_extractor.build_final_response()
+        google_alias_ok = False
+        with tempfile.TemporaryDirectory() as google_temp_dir:
+            alias_env_path = os.path.join(google_temp_dir, ".env")
+            alias_settings_path = os.path.join(google_temp_dir, "user_settings.json")
+            with open(alias_env_path, "w", encoding="utf-8") as alias_env_file:
+                alias_env_file.write("GEMINI_API_KEY=AIzaTestAliasKey\nASSEMBLYAI_API_KEY=aai_test_key\n")
+            alias_store = jarvis_config.SettingsStore(
+                settings_file_path=alias_settings_path,
+                env_file_path=alias_env_path,
+            )
+            resolved_tuple = jarvis_services.VisionBrainService.resolve_active_vision_provider_and_model(alias_store)
+            google_alias_ok = (
+                alias_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY) == "AIzaTestAliasKey"
+                and alias_store.get("chat_model") == "gemini-3.8-flash"
+                and resolved_tuple == ("google", "gemini-3.8-flash", "AIzaTestAliasKey")
+            )
+        hydrogen_chain = jarvis_services.VisionBrainService.get_google_model_fallback_chain("gemini-4-hydrogen")
+        gemini_payload = jarvis_services.VisionBrainService.build_google_gemini_payload(
+            system_prompt="System rules",
+            history_messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi there"},
+            ],
+            request_user_text="What is on screen?",
+            jpeg_b64="AAAA",
+            max_output_tokens=256,
+        )
+        gemini_delta_text = jarvis_services.VisionBrainService.extract_google_sse_delta_text(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"thought": True, "text": "internal thought hidden"},
+                                {"text": "Visible answer."},
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        google_gemini_ok = (
+            jarvis_config.is_google_gemini_model("gemini-4-hydrogen")
+            and jarvis_config.is_google_gemini_model("gemini-3.8-flash")
+            and (not jarvis_config.is_google_gemini_model("deepseek-ai/DeepSeek-V4.1-Flash"))
+            and any(choice_item["model_id"] == "gemini-4-hydrogen" for choice_item in jarvis_config.CHAT_MODEL_CHOICES)
+            and any(choice_item["model_id"] == "gemini-3.8-flash" for choice_item in jarvis_config.CHAT_MODEL_CHOICES)
+            and google_alias_ok
+            and (hydrogen_chain[0] == "gemini-4-hydrogen")
+            and ("gemini-3.8-flash" in hydrogen_chain)
+            and ("gemini-2.5-flash" in hydrogen_chain)
+            and ("systemInstruction" in gemini_payload)
+            and (len(gemini_payload["contents"]) == 3)
+            and (gemini_payload["contents"][-1]["parts"][1]["inlineData"]["data"] == "AAAA")
+            and (gemini_payload["generationConfig"]["maxOutputTokens"] == 256)
+            and (gemini_delta_text == "Visible answer.")
+        )
+
+        rich_archetypes_ok = (
+            jarvis_response_parser.classify_visual_explanation_pattern("compare RAM vs ROM")["archetype"] == "comparison"
+            and jarvis_response_parser.classify_visual_explanation_pattern("types of cloud services")["archetype"] == "hierarchy"
+            and jarvis_response_parser.classify_visual_explanation_pattern("when to choose quick sort")["archetype"] == "decision"
+            and jarvis_response_parser.classify_visual_explanation_pattern("explain photosynthesis steps")["archetype"] == "process"
+        )
+        rich_body = "compare: RAM vs ROM | tree: Memory > Primary, Cache | if: Volatile? -> RAM / ROM | clue:R=Reset"
+        rich_parsed_rows = jarvis_overlay_windows._parse_paper_body_rows(rich_body)
+        rich_paper_pixmap = jarvis_overlay_windows._render_paper_card_to_pixmap(
+            jarvis_response_parser.DrawingCommand(
+                kind="paper",
+                x=40.0,
+                y=92.0,
+                width=310.0,
+                height=340.0,
+                label="Memory Map",
+                header="Visual Study",
+                body=rich_body,
+            ),
+            seed_value=7,
+        )
+        mentor_prompt_text = jarvis_response_parser.build_vision_system_prompt(1536, 864)
+        mentor_visuals_ok = (
+            rich_archetypes_ok
+            and [row_item.kind for row_item in rich_parsed_rows] == ["compare", "tree", "decision", "clue"]
+            and (not rich_paper_pixmap.isNull())
+            and ("5-Mark" in mentor_prompt_text)
+            and ("Simple Explanation -> Visual Representation" in mentor_prompt_text)
+            and ("tree:" in mentor_prompt_text)
+            and ("compare:" in mentor_prompt_text)
+        )
+
         regression_safety_ok = (
             len(twitter_cmds) == 1
             and twitter_cmds[0].kind == "open_url"
@@ -776,6 +871,8 @@ def run_strict_selftest() -> int:
             and ("dsml" not in stream_dsml_turn.spoken_text.lower())
             and ("Opening Twitter for you now." in stream_dsml_turn.spoken_text)
             and any(cmd_item.kind == "open_url" and cmd_item.body == "https://x.com" for cmd_item in stream_dsml_turn.commands)
+            and google_gemini_ok
+            and mentor_visuals_ok
         )
 
         parser_ok = (
@@ -843,70 +940,125 @@ def run_strict_selftest() -> int:
         record_result("Suite 5 (AssemblyAI v3 Token)", False, f"Exception: {exc}")
 
     # -----------------------------------------------------------------------
-    # Suite 6: Live River AI Vision SSE + Live AssemblyAI PCM TTS + Controller Smoke
+    # Suite 6: Live Vision SSE (Google Gemini / River AI) + AssemblyAI PCM TTS
     # -----------------------------------------------------------------------
     try:
+        primary_provider, primary_model, primary_key = (
+            jarvis_services.VisionBrainService.resolve_active_vision_provider_and_model(settings_store)
+        )
+        candidate_attempts: List[Tuple[str, str, str]] = []
+        if primary_key:
+            candidate_attempts.append((primary_provider, primary_model, primary_key))
+        google_key = settings_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
         river_key = settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
-        model_id = str(settings_store.get("chat_model", "deepseek-ai/DeepSeek-V4.1-Flash"))
-        test_jpeg_b64 = _build_synthetic_vision_test_jpeg_b64()
-        vision_extractor = jarvis_response_parser.StreamingSentenceExtractor()
+        if primary_provider != "google" and google_key:
+            candidate_attempts.append(("google", jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL, google_key))
+        elif primary_provider != "river" and river_key:
+            candidate_attempts.append(("river", "deepseek-ai/DeepSeek-V4.1-Flash", river_key))
+        if not candidate_attempts:
+            raise RuntimeError("No Google Gemini or River AI key found in .env.")
 
+        test_jpeg_b64 = _build_synthetic_vision_test_jpeg_b64()
+        vision_prompt = "Reply in one short sentence: what colored shape and number do you see?"
         vision_start = time.perf_counter()
-        with requests.post(
-            jarvis_services.VisionBrainService.RIVER_CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {river_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model_id,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Reply in one short sentence: what colored shape and number do you see?",
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{test_jpeg_b64}"},
-                            },
-                        ],
-                    }
-                ],
-                "max_tokens": 120,
-                "stream": True,
-                "reasoning_effort": "none",
-            },
-            stream=True,
-            timeout=30,
-        ) as vision_response:
-            if not vision_response.ok:
-                raise RuntimeError(
-                    f"River AI HTTP {vision_response.status_code}: {vision_response.text[:160]}"
-                )
-            vision_response.encoding = "utf-8"
-            for sse_line in vision_response.iter_lines(decode_unicode=True):
-                if not sse_line or not sse_line.startswith("data: "):
-                    continue
-                payload_text = sse_line[6:].strip()
-                if payload_text == "[DONE]":
-                    break
-                try:
-                    chunk_payload = json.loads(payload_text)
-                    delta_piece = (
-                        chunk_payload.get("choices", [{}])[0]
-                        .get("delta", {})
-                        .get("content", "")
+        vision_answer = ""
+        active_provider_label = ""
+        last_vision_error = ""
+
+        for attempt_provider, attempt_model, attempt_key in candidate_attempts:
+            model_sequence = (
+                jarvis_services.VisionBrainService.get_google_model_fallback_chain(attempt_model)
+                if attempt_provider == "google"
+                else [attempt_model]
+            )
+            attempt_succeeded = False
+            for candidate_idx, candidate_model in enumerate(model_sequence):
+                vision_extractor = jarvis_response_parser.StreamingSentenceExtractor()
+                if attempt_provider == "google":
+                    request_url = jarvis_services.VisionBrainService.GOOGLE_GEMINI_STREAM_URL_TEMPLATE.format(
+                        model_id=candidate_model
                     )
-                except Exception:
-                    continue
-                if delta_piece:
-                    vision_extractor.feed_delta(delta_piece)
-        vision_extractor.flush_remaining()
+                    request_headers = {"x-goog-api-key": attempt_key, "Content-Type": "application/json"}
+                    request_payload = jarvis_services.VisionBrainService.build_google_gemini_payload(
+                        system_prompt="",
+                        history_messages=[],
+                        request_user_text=vision_prompt,
+                        jpeg_b64=test_jpeg_b64,
+                        max_output_tokens=160,
+                    )
+                else:
+                    request_url = jarvis_services.VisionBrainService.RIVER_CHAT_URL
+                    request_headers = {"Authorization": f"Bearer {attempt_key}", "Content-Type": "application/json"}
+                    request_payload = {
+                        "model": candidate_model,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": vision_prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{test_jpeg_b64}"}},
+                                ],
+                            }
+                        ],
+                        "max_tokens": 120,
+                        "stream": True,
+                        "reasoning_effort": "none",
+                    }
+
+                with requests.post(
+                    request_url,
+                    headers=request_headers,
+                    json=request_payload,
+                    stream=True,
+                    timeout=30,
+                ) as vision_response:
+                    if not vision_response.ok:
+                        last_vision_error = (
+                            f"{attempt_provider}:{candidate_model} HTTP {vision_response.status_code}: "
+                            f"{vision_response.text[:160]}"
+                        )
+                        if (
+                            attempt_provider == "google"
+                            and vision_response.status_code in (400, 404)
+                            and (candidate_idx + 1) < len(model_sequence)
+                        ):
+                            continue
+                        break
+                    vision_response.encoding = "utf-8"
+                    for sse_line in vision_response.iter_lines(decode_unicode=True):
+                        if not sse_line or not sse_line.startswith("data: "):
+                            continue
+                        payload_text = sse_line[6:].strip()
+                        if payload_text == "[DONE]":
+                            break
+                        try:
+                            chunk_payload = json.loads(payload_text)
+                            if attempt_provider == "google":
+                                delta_piece = jarvis_services.VisionBrainService.extract_google_sse_delta_text(
+                                    chunk_payload
+                                )
+                            else:
+                                delta_piece = (
+                                    chunk_payload.get("choices", [{}])[0]
+                                    .get("delta", {})
+                                    .get("content", "")
+                                )
+                        except Exception:
+                            continue
+                        if delta_piece:
+                            vision_extractor.feed_delta(delta_piece)
+                vision_extractor.flush_remaining()
+                vision_answer = vision_extractor.build_final_response().spoken_text
+                active_provider_label = f"{attempt_provider}:{candidate_model}"
+                attempt_succeeded = True
+                break
+            if attempt_succeeded:
+                break
+
+        if not vision_answer and last_vision_error:
+            raise RuntimeError(last_vision_error)
+
         vision_latency = time.perf_counter() - vision_start
-        vision_answer = vision_extractor.build_final_response().spoken_text
         vision_ok = ("73" in vision_answer) and ("red" in vision_answer.lower())
 
         tts_service = jarvis_services.StreamingTTSService(settings_store)
@@ -926,7 +1078,7 @@ def run_strict_selftest() -> int:
             "Suite 6 (Vision SSE + AssemblyAI TTS + Controller)",
             suite6_ok,
             (
-                f"vision={vision_answer!r} ({vision_latency:.2f}s), "
+                f"provider={active_provider_label}, vision={vision_answer!r} ({vision_latency:.2f}s), "
                 f"tts_engine={tts_engine} ({tts_seconds:.2f}s)"
             ),
         )

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import math
 import os
 import random
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -94,7 +95,7 @@ class _PaperNode:
 class _PaperRow:
     """Parsed structural row from a `paper` command body."""
 
-    kind: str  # "section" | "flow" | "note"
+    kind: str  # "section" | "flow" | "compare" | "tree" | "decision" | "clue" | "note"
     text: str = ""
     nodes: List[_PaperNode] = field(default_factory=list)
 
@@ -568,7 +569,16 @@ def _parse_paper_body_rows(body_text: str) -> List[_PaperRow]:
         cleaned_segment = jarvis_response_parser.clean_spoken_text(segment)
         if not cleaned_segment:
             continue
-        if cleaned_segment.lower().startswith("section:"):
+        lowered_segment = cleaned_segment.lower()
+
+        if lowered_segment.startswith(("clue:", "memory:", "pattern:", "tip:")):
+            _flush_pending_topics()
+            clue_body = cleaned_segment.split(":", 1)[1].strip()
+            if clue_body:
+                parsed_rows.append(_PaperRow(kind="clue", text=clue_body))
+            continue
+
+        if lowered_segment.startswith("section:"):
             _flush_pending_topics()
             section_title = cleaned_segment.split(":", 1)[1].strip()
             if section_title:
@@ -576,6 +586,84 @@ def _parse_paper_body_rows(body_text: str) -> List[_PaperRow]:
             continue
 
         normalized_arrow_segment = cleaned_segment.replace("→", "->").replace("=>", "->")
+        has_vs_separator = bool(re.search(r"\b(?:vs\.?|versus)\b", cleaned_segment, flags=re.IGNORECASE))
+        if lowered_segment.startswith(("compare:", "vs:")) or has_vs_separator:
+            _flush_pending_topics()
+            compare_body = (
+                cleaned_segment.split(":", 1)[1].strip()
+                if lowered_segment.startswith(("compare:", "vs:"))
+                else cleaned_segment
+            )
+            compare_parts = [
+                part.strip()
+                for part in re.split(r"\s+(?:vs\.?|versus)\s+|/", compare_body, maxsplit=1, flags=re.IGNORECASE)
+                if part.strip()
+            ]
+            if len(compare_parts) < 2 and "," in compare_body:
+                compare_parts = [part.strip() for part in compare_body.split(",", 1) if part.strip()]
+            if len(compare_parts) >= 2:
+                parsed_rows.append(
+                    _PaperRow(
+                        kind="compare",
+                        nodes=[
+                            _PaperNode(label=_compact_diagram_node_label(compare_parts[0]), is_document=False),
+                            _PaperNode(label=_compact_diagram_node_label(compare_parts[1]), is_document=False),
+                        ],
+                    )
+                )
+                continue
+
+        if lowered_segment.startswith(("tree:", "hierarchy:")) or (">" in cleaned_segment and "->" not in normalized_arrow_segment):
+            _flush_pending_topics()
+            tree_body = (
+                cleaned_segment.split(":", 1)[1].strip()
+                if lowered_segment.startswith(("tree:", "hierarchy:"))
+                else cleaned_segment
+            )
+            if ">" in tree_body:
+                parent_raw, children_raw = tree_body.split(">", 1)
+                parent_label = _compact_diagram_node_label(parent_raw)
+                raw_children = [item.strip() for item in children_raw.split(",") if item.strip()]
+                if len(raw_children) < 2 and "/" in children_raw:
+                    raw_children = [item.strip() for item in children_raw.split("/") if item.strip()]
+                child_nodes = [
+                    _PaperNode(label=_compact_diagram_node_label(child_text), is_document=False)
+                    for child_text in raw_children[:3]
+                ]
+                if not child_nodes:
+                    child_nodes = [_PaperNode(label="Type A"), _PaperNode(label="Type B")]
+                parsed_rows.append(_PaperRow(kind="tree", text=parent_label, nodes=child_nodes))
+                continue
+
+        has_decision_branches = ("?" in normalized_arrow_segment and ("/" in normalized_arrow_segment or "yes:" in lowered_segment or "no:" in lowered_segment))
+        if lowered_segment.startswith(("if:", "decision:")) or has_decision_branches:
+            _flush_pending_topics()
+            decision_body = (
+                normalized_arrow_segment.split(":", 1)[1].strip()
+                if lowered_segment.startswith(("if:", "decision:"))
+                else normalized_arrow_segment
+            )
+            condition_raw = decision_body
+            branches_raw = ""
+            if "?" in decision_body:
+                condition_raw, branches_raw = decision_body.split("?", 1)
+                condition_label = _compact_diagram_node_label(condition_raw) + "?"
+            elif "->" in decision_body:
+                condition_raw, branches_raw = decision_body.split("->", 1)
+                condition_label = _compact_diagram_node_label(condition_raw)
+            else:
+                condition_label = _compact_diagram_node_label(condition_raw)
+            branches_raw = branches_raw.lstrip("- >:").strip()
+            branch_tokens = [item.strip() for item in re.split(r"\s*/\s*|\s*,\s*", branches_raw) if item.strip()]
+            branch_nodes: List[_PaperNode] = []
+            for branch_text in branch_tokens[:2]:
+                clean_branch = re.sub(r"^(?:yes|no)\s*:\s*", "", branch_text, flags=re.IGNORECASE).strip()
+                branch_nodes.append(_PaperNode(label=_compact_diagram_node_label(clean_branch or branch_text)))
+            if not branch_nodes:
+                branch_nodes = [_PaperNode(label="Yes Path"), _PaperNode(label="No Path")]
+            parsed_rows.append(_PaperRow(kind="decision", text=condition_label, nodes=branch_nodes))
+            continue
+
         if "->" in normalized_arrow_segment:
             _flush_pending_topics()
             raw_parts = [part.strip() for part in normalized_arrow_segment.split("->") if part.strip()]
@@ -809,6 +897,14 @@ def _render_paper_card_to_pixmap(
             elif row.kind == "flow":
                 has_docs = any(node.is_document for node in row.nodes)
                 natural_heights.append(82.0 if has_docs else 64.0)
+            elif row.kind == "compare":
+                natural_heights.append(58.0)
+            elif row.kind == "tree":
+                natural_heights.append(84.0)
+            elif row.kind == "decision":
+                natural_heights.append(78.0)
+            elif row.kind == "clue":
+                natural_heights.append(36.0)
             else:
                 natural_heights.append(34.0)
 
@@ -846,6 +942,51 @@ def _render_paper_card_to_pixmap(
                     row_height=row_height,
                     accent_color=accent_color,
                     seed_value=seed_value + row_index * 101,
+                )
+            elif row.kind == "compare":
+                _paint_paper_compare_row(
+                    painter=painter,
+                    nodes=row.nodes,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                    seed_value=seed_value + row_index * 107,
+                )
+            elif row.kind == "tree":
+                _paint_paper_tree_row(
+                    painter=painter,
+                    parent_label=row.text,
+                    child_nodes=row.nodes,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                    seed_value=seed_value + row_index * 113,
+                )
+            elif row.kind == "decision":
+                _paint_paper_decision_row(
+                    painter=painter,
+                    condition_label=row.text,
+                    branch_nodes=row.nodes,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                    seed_value=seed_value + row_index * 127,
+                )
+            elif row.kind == "clue":
+                _paint_paper_clue_row(
+                    painter=painter,
+                    clue_text=row.text,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
                 )
             else:
                 note_font = jarvis_theme.barlow_font(11.0, semibold=False)
@@ -984,6 +1125,258 @@ def _paint_paper_flow_row(
                 color=QColor(212, 212, 216, 225),
                 seed_value=seed_value + node_index * 53,
             )
+
+
+def _paint_paper_compare_row(
+    painter: QPainter,
+    nodes: List[_PaperNode],
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+    seed_value: int,
+) -> None:
+    """Draws two side-by-side comparison boxes separated by a crisp `VS` badge."""
+    if not nodes:
+        return
+    left_label = nodes[0].label
+    right_label = nodes[1].label if len(nodes) > 1 else "Contrast"
+
+    center_gap = 40.0
+    box_width = max(56.0, (row_width - center_gap) * 0.5)
+    box_height = min(44.0, max(30.0, row_height - 10.0))
+    box_top_y = origin_y + (row_height - box_height) * 0.5
+
+    left_rect = QRectF(origin_x, box_top_y, box_width, box_height)
+    right_rect = QRectF(origin_x + box_width + center_gap, box_top_y, box_width, box_height)
+
+    _paint_sketched_node_box(
+        painter=painter,
+        box_rect=left_rect,
+        label=left_label,
+        highlighted=False,
+        accent_color=accent_color,
+        seed_value=seed_value + 11,
+    )
+    _paint_sketched_node_box(
+        painter=painter,
+        box_rect=right_rect,
+        label=right_label,
+        highlighted=True,
+        accent_color=accent_color,
+        seed_value=seed_value + 29,
+    )
+
+    pill_width = 28.0
+    pill_height = 20.0
+    pill_x = origin_x + box_width + (center_gap - pill_width) * 0.5
+    pill_y = box_top_y + (box_height - pill_height) * 0.5
+    vs_rect = QRectF(pill_x, pill_y, pill_width, pill_height)
+
+    painter.save()
+    painter.setBrush(QColor(22, 30, 44, 245))
+    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 210), 1.2))
+    painter.drawRoundedRect(vs_rect, 9.0, 9.0)
+    painter.setFont(jarvis_theme.barlow_font(8.5, semibold=True))
+    painter.setPen(QColor(235, 244, 255, 245))
+    painter.drawText(vs_rect, Qt.AlignmentFlag.AlignCenter, "VS")
+    painter.restore()
+
+
+def _paint_paper_tree_row(
+    painter: QPainter,
+    parent_label: str,
+    child_nodes: List[_PaperNode],
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+    seed_value: int,
+) -> None:
+    """Draws a parent concept box branched cleanly to child category boxes below."""
+    children = child_nodes[:3] if child_nodes else [_PaperNode(label="Branch A"), _PaperNode(label="Branch B")]
+    parent_width = min(176.0, max(92.0, row_width * 0.64))
+    parent_height = min(28.0, max(22.0, row_height * 0.34))
+    parent_x = origin_x + (row_width - parent_width) * 0.5
+    parent_y = origin_y + 2.0
+    parent_center_x = parent_x + parent_width * 0.5
+
+    _paint_sketched_node_box(
+        painter=painter,
+        box_rect=QRectF(parent_x, parent_y, parent_width, parent_height),
+        label=parent_label or "Concept",
+        highlighted=True,
+        accent_color=accent_color,
+        seed_value=seed_value + 7,
+    )
+
+    branch_y = parent_y + parent_height + max(6.0, row_height * 0.11)
+    child_top_y = branch_y + max(6.0, row_height * 0.10)
+    child_height = max(24.0, row_height - (child_top_y - origin_y) - 4.0)
+    child_count = len(children)
+    child_gap = 10.0 if child_count > 1 else 0.0
+    child_width = max(50.0, (row_width - child_gap * max(0, child_count - 1)) / float(child_count))
+
+    child_centers_x: List[float] = []
+    for child_index in range(child_count):
+        child_x = origin_x + child_index * (child_width + child_gap)
+        child_centers_x.append(child_x + child_width * 0.5)
+
+    painter.save()
+    branch_pen = QPen(QColor(186, 198, 218, 215), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(branch_pen)
+    painter.drawLine(QPointF(parent_center_x, parent_y + parent_height), QPointF(parent_center_x, branch_y))
+    if len(child_centers_x) >= 2:
+        painter.drawLine(QPointF(child_centers_x[0], branch_y), QPointF(child_centers_x[-1], branch_y))
+    for drop_x in child_centers_x:
+        painter.drawLine(QPointF(drop_x, branch_y), QPointF(drop_x, child_top_y))
+    painter.restore()
+
+    for child_index, child_node in enumerate(children):
+        child_x = origin_x + child_index * (child_width + child_gap)
+        _paint_sketched_node_box(
+            painter=painter,
+            box_rect=QRectF(child_x, child_top_y, child_width, child_height),
+            label=child_node.label,
+            highlighted=False,
+            accent_color=accent_color,
+            seed_value=seed_value + 37 + child_index * 17,
+        )
+
+
+def _paint_paper_decision_row(
+    painter: QPainter,
+    condition_label: str,
+    branch_nodes: List[_PaperNode],
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+    seed_value: int,
+) -> None:
+    """Draws a condition header pill branching into YES (emerald) and NO (amber) outcome boxes."""
+    cond_width = min(row_width - 12.0, 204.0)
+    cond_height = min(26.0, max(20.0, row_height * 0.34))
+    cond_x = origin_x + (row_width - cond_width) * 0.5
+    cond_y = origin_y + 2.0
+    cond_rect = QRectF(cond_x, cond_y, cond_width, cond_height)
+    cond_center_x = cond_rect.center().x()
+
+    painter.save()
+    painter.setBrush(QColor(22, 34, 54, 242))
+    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 215), 1.4))
+    painter.drawRoundedRect(cond_rect, 11.0, 11.0)
+    cond_font = jarvis_theme.barlow_font(9.5, semibold=True)
+    cond_metrics = QFontMetricsF(cond_font)
+    elided_cond = cond_metrics.elidedText(condition_label or "Condition?", Qt.TextElideMode.ElideRight, cond_width - 14.0)
+    painter.setFont(cond_font)
+    painter.setPen(QColor(240, 246, 255, 248))
+    painter.drawText(cond_rect, Qt.AlignmentFlag.AlignCenter, elided_cond)
+    painter.restore()
+
+    outcomes = branch_nodes[:2] if branch_nodes else [_PaperNode(label="Proceed"), _PaperNode(label="Alternative")]
+    split_y = cond_y + cond_height + max(6.0, row_height * 0.11)
+    out_top_y = split_y + max(6.0, row_height * 0.10)
+    out_height = max(24.0, row_height - (out_top_y - origin_y) - 4.0)
+    out_count = len(outcomes)
+    out_gap = 14.0 if out_count == 2 else 0.0
+    out_width = max(58.0, (row_width - out_gap * max(0, out_count - 1)) / float(out_count))
+
+    branch_centers_x = [
+        origin_x + idx * (out_width + out_gap) + out_width * 0.5
+        for idx in range(out_count)
+    ]
+
+    painter.save()
+    painter.setPen(QPen(QColor(186, 198, 218, 215), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    painter.drawLine(QPointF(cond_center_x, cond_y + cond_height), QPointF(cond_center_x, split_y))
+    if len(branch_centers_x) == 2:
+        painter.drawLine(QPointF(branch_centers_x[0], split_y), QPointF(branch_centers_x[1], split_y))
+    for drop_x in branch_centers_x:
+        painter.drawLine(QPointF(drop_x, split_y), QPointF(drop_x, out_top_y))
+    painter.restore()
+
+    for branch_index, branch_node in enumerate(outcomes):
+        box_x = origin_x + branch_index * (out_width + out_gap)
+        box_rect = QRectF(box_x, out_top_y, out_width, out_height)
+        is_yes = branch_index == 0
+        rim_color = QColor("#34D399") if is_yes else QColor("#FB923C")
+        fill_tint = QColor(18, 42, 36, 236) if is_yes else QColor(44, 28, 22, 236)
+        prefix_tag = "YES: " if (is_yes and out_count == 2) else ("NO: " if out_count == 2 else "")
+        display_text = f"{prefix_tag}{branch_node.label}" if prefix_tag else branch_node.label
+
+        outline_points = _build_wobbly_rect_points(
+            box_rect.left(),
+            box_rect.top(),
+            box_rect.width(),
+            box_rect.height(),
+            corner_radius=4.0,
+            seed_value=seed_value + 41 + branch_index * 19,
+        )
+        outline_path = _build_smooth_catmull_rom_path(outline_points, closed=True)
+        painter.save()
+        painter.setBrush(fill_tint)
+        painter.setPen(QPen(rim_color, 1.55, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.drawPath(outline_path)
+        out_font = jarvis_theme.barlow_font(9.5, semibold=True)
+        out_metrics = QFontMetricsF(out_font)
+        text_rect = box_rect.adjusted(6.0, 2.0, -6.0, -2.0)
+        elided_branch = out_metrics.elidedText(display_text, Qt.TextElideMode.ElideRight, text_rect.width())
+        painter.setFont(out_font)
+        painter.setPen(QColor(244, 248, 255, 245))
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, elided_branch)
+        painter.restore()
+
+
+def _paint_paper_clue_row(
+    painter: QPainter,
+    clue_text: str,
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+) -> None:
+    """Draws a crisp bottom memory-clue or pattern callout strip inside a paper card."""
+    strip_height = max(24.0, row_height - 6.0)
+    strip_rect = QRectF(origin_x, origin_y + 3.0, row_width, strip_height)
+
+    painter.save()
+    painter.setBrush(QColor(22, 32, 50, 232))
+    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 175), 1.15))
+    painter.drawRoundedRect(strip_rect, 7.0, 7.0)
+
+    badge_width = 42.0
+    badge_height = min(18.0, strip_height - 6.0)
+    badge_rect = QRectF(
+        strip_rect.left() + 6.0,
+        strip_rect.center().y() - badge_height * 0.5,
+        badge_width,
+        badge_height,
+    )
+    painter.setBrush(jarvis_theme.with_alpha(accent_color, 64))
+    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 215), 1.0))
+    painter.drawRoundedRect(badge_rect, 5.0, 5.0)
+    painter.setFont(jarvis_theme.barlow_font(8.0, semibold=True))
+    painter.setPen(QColor(210, 236, 255, 248))
+    painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "CLUE")
+
+    text_rect = QRectF(
+        badge_rect.right() + 7.0,
+        strip_rect.top(),
+        strip_rect.width() - badge_width - 18.0,
+        strip_rect.height(),
+    )
+    clue_font = jarvis_theme.barlow_font(9.5, semibold=True)
+    clue_metrics = QFontMetricsF(clue_font)
+    elided_clue = clue_metrics.elidedText((clue_text or "").strip(), Qt.TextElideMode.ElideRight, text_rect.width())
+    painter.setFont(clue_font)
+    painter.setPen(jarvis_theme.DRAWING_INK)
+    painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_clue)
+    painter.restore()
 
 
 def _paint_sketched_node_box(

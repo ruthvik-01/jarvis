@@ -21,10 +21,13 @@ USER_SETTINGS_FILE_PATH = os.path.join(WINDOWS_DIRECTORY, "user_settings.json")
 ENV_FILE_PATH = os.path.join(PROJECT_ROOT_DIRECTORY, ".env")
 
 # Names of the secrets the app understands, as they appear in .env.
+SECRET_GOOGLE_API_KEY = "GOOGLE_API_KEY"
+GOOGLE_API_KEY_ALIASES = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_AI_API_KEY")
 SECRET_RIVER_API_KEY = "RIVER_AI_API"
 SECRET_ASSEMBLYAI_API_KEY = "ASSEMBLYAI_API_KEY"
 SECRET_ELEVENLABS_API_KEY = "ELEVENLABS_API_KEY"  # Legacy fallback constant kept only for backward compatibility
-ALL_SECRET_NAMES = [SECRET_RIVER_API_KEY, SECRET_ASSEMBLYAI_API_KEY]
+ALL_SECRET_NAMES = [SECRET_GOOGLE_API_KEY, SECRET_RIVER_API_KEY, SECRET_ASSEMBLYAI_API_KEY]
+DEFAULT_GOOGLE_CHAT_MODEL = "gemini-3.8-flash"
 
 # AssemblyAI Neural TTS voices (`AssemblyAI-TTS-1`, 24 kHz mono WAV via https://tts.us.assemblyai.com/v1/speech).
 ASSEMBLYAI_TTS_VOICES: List[Dict[str, str]] = [
@@ -56,12 +59,21 @@ DRAWING_SPEED_CHOICES: List[Dict[str, str]] = [
     {"speed_id": "normal", "name": "Standard (0.55s stroke)"},
 ]
 
-# Vision-capable chat models on the user's River AI account (verified 15-11-2026:
-# DeepSeek-V4.1-Flash reads images; Kimi/GLM returned empty replies for images).
+# Vision-capable chat models on Google Gemini and River AI.
 CHAT_MODEL_CHOICES: List[Dict[str, str]] = [
-    {"model_id": "deepseek-ai/DeepSeek-V4.1-Flash", "name": "DeepSeek V4.1 Flash (fast, sees screen)"},
-    {"model_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "name": "DeepSeek V4.1 Flash 1017"},
+    {"model_id": "gemini-4-hydrogen", "name": "Google Gemini 4 Hydrogen (vision & reasoning)", "provider": "google"},
+    {"model_id": "gemini-3.8-flash", "name": "Google Gemini 3.8 Flash (fast, sees screen)", "provider": "google"},
+    {"model_id": "gemini-2.5-flash", "name": "Google Gemini 2.5 Flash (sees screen)", "provider": "google"},
+    {"model_id": "gemini-2.5-pro", "name": "Google Gemini 2.5 Pro (reasoning + vision)", "provider": "google"},
+    {"model_id": "deepseek-ai/DeepSeek-V4.1-Flash", "name": "DeepSeek V4.1 Flash — River AI (sees screen)", "provider": "river"},
+    {"model_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "name": "DeepSeek V4.1 Flash 1017 — River AI", "provider": "river"},
 ]
+
+
+def is_google_gemini_model(model_id: str) -> bool:
+    """Returns True when `model_id` targets Google Gemini rather than River AI."""
+    normalized_model = (model_id or "").strip().lower()
+    return normalized_model.startswith(("gemini", "google/", "models/gemini"))
 
 DICTATION_LANGUAGE_CHOICES: List[Dict[str, str]] = [
     {"code": "en", "name": "English"},
@@ -167,11 +179,14 @@ class SettingsStore(QObject):
     # -- preferences -------------------------------------------------------
 
     def _load(self) -> None:
+        explicit_model_saved = False
         if os.path.exists(self._settings_file_path):
             try:
                 with open(self._settings_file_path, "r", encoding="utf-8") as settings_file:
                     stored_values = json.load(settings_file)
                 if isinstance(stored_values, dict):
+                    if stored_values.get("chat_model"):
+                        explicit_model_saved = True
                     for key_name, stored_value in stored_values.items():
                         if key_name in DEFAULT_SETTINGS:
                             self._values[key_name] = stored_value
@@ -182,6 +197,12 @@ class SettingsStore(QObject):
         if self._values.get("voice_id") not in known_voice_ids:
             self._values["voice_id"] = DEFAULT_SETTINGS["voice_id"]
         self._secrets = read_env_file(self._env_file_path)
+        if (
+            (not explicit_model_saved)
+            and self.has_secret(SECRET_GOOGLE_API_KEY)
+            and (not self.has_secret(SECRET_RIVER_API_KEY))
+        ):
+            self._values["chat_model"] = DEFAULT_GOOGLE_CHAT_MODEL
 
     def _save(self) -> None:
         temporary_path = self._settings_file_path + ".tmp"
@@ -214,6 +235,16 @@ class SettingsStore(QObject):
 
     def get_secret(self, secret_name: str) -> str:
         with self._lock:
+            if secret_name == SECRET_GOOGLE_API_KEY:
+                for alias_name in GOOGLE_API_KEY_ALIASES:
+                    stored_secret = self._secrets.get(alias_name, "").strip()
+                    if stored_secret:
+                        return stored_secret
+                for alias_name in GOOGLE_API_KEY_ALIASES:
+                    environment_override = os.environ.get(alias_name, "").strip()
+                    if environment_override:
+                        return environment_override
+                return ""
             environment_override = os.environ.get(secret_name, "").strip()
             return self._secrets.get(secret_name, "") or environment_override
 

@@ -120,6 +120,12 @@ FIVE_CORE_SHORTCUTS: List[Dict[str, Any]] = [
 
 SECRET_FIELD_DEFINITIONS: List[Dict[str, str]] = [
     {
+        "secret_name": jarvis_config.SECRET_GOOGLE_API_KEY,
+        "display_title": "Google Gemini Key",
+        "subtitle": "Gemini 4 Hydrogen & 3.8 Flash Vision (GOOGLE_API_KEY)",
+        "placeholder": "Enter Google AI Studio key (AIza...)...",
+    },
+    {
         "secret_name": jarvis_config.SECRET_RIVER_API_KEY,
         "display_title": "River AI Key",
         "subtitle": "Vision chat & screen reasoning (RIVER_AI_API)",
@@ -1542,9 +1548,11 @@ class JarvisMainWindow(QMainWindow):
 
         status_row = QHBoxLayout()
         status_row.setSpacing(12)
+        self._plan_google_status = self._create_plan_meter_block("Google Gemini (Vision)", "Checking...")
         self._plan_river_status = self._create_plan_meter_block("River AI (Vision)", "Checking...")
         self._plan_assembly_status = self._create_plan_meter_block("AssemblyAI (STT)", "Checking...")
         self._plan_voice_status = self._create_plan_meter_block("AssemblyAI (Voice TTS)", "Checking...")
+        status_row.addWidget(self._plan_google_status["container"], 1)
         status_row.addWidget(self._plan_river_status["container"], 1)
         status_row.addWidget(self._plan_assembly_status["container"], 1)
         status_row.addWidget(self._plan_voice_status["container"], 1)
@@ -2227,6 +2235,10 @@ class JarvisMainWindow(QMainWindow):
             section_title="LOCAL BYOK INTEGRATIONS",
             headline="Direct .env provider pipeline",
             paragraphs=[
+                (
+                    "Google Gemini Vision & Chat",
+                    "Streams multimodal screen reasoning and annotations directly from your GOOGLE_API_KEY (or GEMINI_API_KEY) in .env.",
+                ),
                 (
                     "River AI Vision & Chat",
                     "Streams responses and screen annotations directly from your RIVER_AI_API key in .env.",
@@ -3056,22 +3068,28 @@ class JarvisMainWindow(QMainWindow):
         timing statistics in milliseconds (`mean_ms`, `p95_ms`, `max_ms`, `min_ms`).
         """
         safe_iterations = max(1, int(iterations))
+        previous_top_tab = self._active_top_tab
+        previous_subtab = self._active_settings_subtab
+        self.open_tab("chat")
         self.ensurePolished()
         if self.layout() is not None:
             self.layout().activate()
-        frame_image = QImage(self.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        target_widget = self._main_stack.currentWidget() or self
+        frame_pixmap = QPixmap(target_widget.size())
+        target_widget.render(frame_pixmap)
+        target_widget.render(frame_pixmap)
         frame_samples_ms: List[float] = []
 
-        for iteration_index in range(safe_iterations):
+        for _iteration_index in range(safe_iterations):
             frame_start = time.perf_counter()
-            frame_image.fill(QColor(DARK_PALETTE["background"]))
-            painter = QPainter(frame_image)
-            try:
-                self.render(painter, QPoint(0, 0))
-            finally:
-                painter.end()
+            target_widget.render(frame_pixmap)
             elapsed_ms = (time.perf_counter() - frame_start) * 1000.0
             frame_samples_ms.append(elapsed_ms)
+
+        if previous_top_tab == "chat":
+            self.open_tab("chat")
+        else:
+            self.open_tab(f"settings:{previous_subtab}")
 
         sorted_samples = sorted(frame_samples_ms)
         p95_index = min(len(sorted_samples) - 1, max(0, int(math.ceil(0.95 * len(sorted_samples))) - 1))
@@ -3260,7 +3278,20 @@ class JarvisMainWindow(QMainWindow):
         line_edit = self._secret_inputs.get(secret_name)
         if line_edit is None:
             return
-        self._settings_store.set_secret(secret_name, line_edit.text())
+        saved_secret_value = line_edit.text().strip()
+        self._settings_store.set_secret(secret_name, saved_secret_value)
+        if secret_name == jarvis_config.SECRET_GOOGLE_API_KEY and saved_secret_value:
+            current_model = str(self._settings_store.get("chat_model", ""))
+            if not jarvis_config.is_google_gemini_model(current_model):
+                self._settings_store.set("chat_model", jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL)
+        elif (
+            secret_name == jarvis_config.SECRET_RIVER_API_KEY
+            and saved_secret_value
+            and (not self._settings_store.has_secret(jarvis_config.SECRET_GOOGLE_API_KEY))
+        ):
+            current_model = str(self._settings_store.get("chat_model", ""))
+            if jarvis_config.is_google_gemini_model(current_model):
+                self._settings_store.set("chat_model", "deepseek-ai/DeepSeek-V4.1-Flash")
         self._refresh_secret_statuses()
         save_button = self._secret_save_buttons.get(secret_name)
         if save_button is not None:
@@ -3281,15 +3312,25 @@ class JarvisMainWindow(QMainWindow):
                 badge.style().unpolish(badge)
                 badge.style().polish(badge)
 
+        has_google = self._settings_store.has_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
         has_river = self._settings_store.has_secret(jarvis_config.SECRET_RIVER_API_KEY)
         has_assembly = self._settings_store.has_secret(jarvis_config.SECRET_ASSEMBLYAI_API_KEY)
 
-        self._update_plan_meter(self._plan_river_status, has_river, "Connected" if has_river else "Missing")
+        self._update_plan_meter(
+            self._plan_google_status,
+            has_google,
+            "Connected" if has_google else ("Optional" if has_river else "Missing"),
+        )
+        self._update_plan_meter(
+            self._plan_river_status,
+            has_river,
+            "Connected" if has_river else ("Optional" if has_google else "Missing"),
+        )
         self._update_plan_meter(self._plan_assembly_status, has_assembly, "Connected" if has_assembly else "Missing")
         self._update_plan_meter(self._plan_voice_status, has_assembly, "Connected" if has_assembly else "SAPI Fallback")
 
         total_keys = len(SECRET_FIELD_DEFINITIONS)
-        if configured_count == total_keys:
+        if (has_google or has_river) and has_assembly:
             self._byok_status_pill.setText("Keys Ready")
         else:
             self._byok_status_pill.setText(f"Setup Keys ({configured_count}/{total_keys})")

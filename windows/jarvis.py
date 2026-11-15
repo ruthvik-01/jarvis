@@ -17,6 +17,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 from typing import Dict, List, Optional
@@ -183,15 +184,14 @@ def run_strict_selftest() -> int:
         if not os.path.exists(os.path.join(jarvis_theme.ASSETS_DIRECTORY, relpath))
     ]
     has_assembly_key = bool(settings_store.get_secret(jarvis_config.SECRET_ASSEMBLYAI_API_KEY))
-    has_vision_key = bool(
-        settings_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
-        or settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
-    )
+    has_vision_key = settings_store.has_any_vision_credentials()
     missing_secrets: List[str] = []
     if not has_assembly_key:
         missing_secrets.append(jarvis_config.SECRET_ASSEMBLYAI_API_KEY)
     if not has_vision_key:
-        missing_secrets.append(f"{jarvis_config.SECRET_GOOGLE_API_KEY}|{jarvis_config.SECRET_RIVER_API_KEY}")
+        missing_secrets.append(
+            f"{jarvis_config.SECRET_CUSTOM_API_KEY}|{jarvis_config.SECRET_GOOGLE_API_KEY}|{jarvis_config.SECRET_RIVER_API_KEY}"
+        )
     suite1_ok = (not missing_assets) and (not missing_secrets)
     record_result(
         "Suite 1 (Assets & Secrets)",
@@ -848,6 +848,106 @@ def run_strict_selftest() -> int:
             and ("compare:" in mentor_prompt_text)
         )
 
+        # Universal API endpoints, keys, protocol detection & multi-format SSE delta extraction checks
+        proto_checks_ok = (
+            jarvis_config.detect_wire_protocol("https://api.openai.com/v1", "gpt-4o", "") == "openai"
+            and jarvis_config.detect_wire_protocol("https://openrouter.ai/api/v1", "anthropic/claude-sonnet-4", "") == "openai"
+            and jarvis_config.detect_wire_protocol("https://api.anthropic.com", "claude-sonnet-4-20250514", "") == "anthropic"
+            and jarvis_config.detect_wire_protocol("https://generativelanguage.googleapis.com", "gemini-2.5-flash", "") == "google"
+            and jarvis_config.detect_wire_protocol("http://localhost:11434/v1", "llama3.2-vision", "") == "openai"
+        )
+        url_norm_ok = (
+            jarvis_config.normalize_endpoint_url("https://api.openai.com", "openai", "gpt-4o")
+            == "https://api.openai.com/v1/chat/completions"
+            and jarvis_config.normalize_endpoint_url("http://localhost:11434/v1", "openai", "llama3.2-vision")
+            == "http://localhost:11434/v1/chat/completions"
+            and jarvis_config.normalize_endpoint_url("https://openrouter.ai/api/v1", "openai", "openai/gpt-4o")
+            == "https://openrouter.ai/api/v1/chat/completions"
+            and jarvis_config.normalize_endpoint_url("https://api.anthropic.com", "anthropic", "claude-sonnet-4-20250514")
+            == "https://api.anthropic.com/v1/messages"
+            and jarvis_config.normalize_endpoint_url("https://generativelanguage.googleapis.com", "google", "gemini-2.5-flash")
+            == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+            and jarvis_config.normalize_endpoint_url("https://proxy.example.com/custom/chat", "openai", "gpt-4o")
+            == "https://proxy.example.com/custom/chat"
+        )
+        anthropic_payload = jarvis_services.VisionBrainService.build_anthropic_messages_payload(
+            system_prompt="Help the student.",
+            history_messages=[{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}],
+            request_user_text="Explain this diagram",
+            jpeg_b64="ZmFrZWpwZWc=",
+            max_output_tokens=600,
+            model_id="claude-sonnet-4-20250514",
+        )
+        anthropic_payload_ok = (
+            anthropic_payload.get("model") == "claude-sonnet-4-20250514"
+            and anthropic_payload.get("system") == "Help the student."
+            and len(anthropic_payload.get("messages", [])) == 3
+            and isinstance(anthropic_payload["messages"][2]["content"], list)
+            and anthropic_payload["messages"][2]["content"][0]["type"] == "image"
+        )
+        delta_extract_ok = (
+            jarvis_services.VisionBrainService.extract_universal_sse_delta_text(
+                {"choices": [{"delta": {"content": "OpenAI chunk"}}]}, "openai"
+            ) == "OpenAI chunk"
+            and jarvis_services.VisionBrainService.extract_universal_sse_delta_text(
+                {"choices": [{"message": {"content": "Non-SSE reply"}}]}, "openai"
+            ) == "Non-SSE reply"
+            and jarvis_services.VisionBrainService.extract_universal_sse_delta_text(
+                {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Claude chunk"}}, "anthropic"
+            ) == "Claude chunk"
+            and jarvis_services.VisionBrainService.extract_universal_sse_delta_text(
+                {"content": [{"type": "text", "text": "Claude full"}]}, "anthropic"
+            ) == "Claude full"
+            and jarvis_services.VisionBrainService.extract_universal_sse_delta_text(
+                {"candidates": [{"content": {"parts": [{"text": "skip", "thought": True}, {"text": "Gemini chunk"}]}}]},
+                "google",
+            ) == "Gemini chunk"
+            and jarvis_services.VisionBrainService.extract_universal_sse_delta_text(
+                {"message": {"role": "assistant", "content": "Ollama chunk"}}, "openai"
+            ) == "Ollama chunk"
+        )
+        env_endpoint_resolution_ok = False
+        with tempfile.TemporaryDirectory() as temp_config_dir:
+            temp_env_file = os.path.join(temp_config_dir, ".env")
+            temp_settings_file = os.path.join(temp_config_dir, "user_settings.json")
+            with open(temp_env_file, "w", encoding="utf-8") as temp_env_handle:
+                temp_env_handle.write(
+                    "CUSTOM_API_BASE_URL=http://localhost:11434/v1\n"
+                    "CUSTOM_MODEL=llama3.2-vision\n"
+                )
+            temp_store_local = jarvis_config.SettingsStore(
+                settings_file_path=temp_settings_file,
+                env_file_path=temp_env_file,
+                use_process_env=False,
+            )
+            local_endpoints = jarvis_services.VisionBrainService.resolve_all_vision_endpoints(temp_store_local)
+            with open(temp_env_file, "w", encoding="utf-8") as temp_env_handle:
+                temp_env_handle.write("ANTHROPIC_API_KEY=sk-ant-test1234567890\n")
+            temp_store_anthropic = jarvis_config.SettingsStore(
+                settings_file_path=os.path.join(temp_config_dir, "settings_anth.json"),
+                env_file_path=temp_env_file,
+                use_process_env=False,
+            )
+            anth_endpoints = jarvis_services.VisionBrainService.resolve_all_vision_endpoints(temp_store_anthropic)
+            env_endpoint_resolution_ok = (
+                temp_store_local.has_any_vision_credentials()
+                and bool(local_endpoints)
+                and local_endpoints[0]["endpoint_url"] == "http://localhost:11434/v1/chat/completions"
+                and local_endpoints[0]["model_id"] == "llama3.2-vision"
+                and local_endpoints[0]["wire_protocol"] == "openai"
+                and bool(anth_endpoints)
+                and anth_endpoints[0]["wire_protocol"] == "anthropic"
+                and anth_endpoints[0]["endpoint_url"] == "https://api.anthropic.com/v1/messages"
+                and "claude-" in anth_endpoints[0]["model_id"]
+            )
+        universal_api_ok = (
+            proto_checks_ok
+            and url_norm_ok
+            and anthropic_payload_ok
+            and delta_extract_ok
+            and env_endpoint_resolution_ok
+        )
+
         regression_safety_ok = (
             len(twitter_cmds) == 1
             and twitter_cmds[0].kind == "open_url"
@@ -873,6 +973,7 @@ def run_strict_selftest() -> int:
             and any(cmd_item.kind == "open_url" and cmd_item.body == "https://x.com" for cmd_item in stream_dsml_turn.commands)
             and google_gemini_ok
             and mentor_visuals_ok
+            and universal_api_ok
         )
 
         parser_ok = (
@@ -940,23 +1041,12 @@ def run_strict_selftest() -> int:
         record_result("Suite 5 (AssemblyAI v3 Token)", False, f"Exception: {exc}")
 
     # -----------------------------------------------------------------------
-    # Suite 6: Live Vision SSE (Google Gemini / River AI) + AssemblyAI PCM TTS
+    # Suite 6: Live Vision SSE (Any Configured Endpoint) + AssemblyAI PCM TTS
     # -----------------------------------------------------------------------
     try:
-        primary_provider, primary_model, primary_key = (
-            jarvis_services.VisionBrainService.resolve_active_vision_provider_and_model(settings_store)
-        )
-        candidate_attempts: List[Tuple[str, str, str]] = []
-        if primary_key:
-            candidate_attempts.append((primary_provider, primary_model, primary_key))
-        google_key = settings_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
-        river_key = settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
-        if primary_provider != "google" and google_key:
-            candidate_attempts.append(("google", jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL, google_key))
-        elif primary_provider != "river" and river_key:
-            candidate_attempts.append(("river", "deepseek-ai/DeepSeek-V4.1-Flash", river_key))
+        candidate_attempts = jarvis_services.VisionBrainService.resolve_all_vision_endpoints(settings_store)
         if not candidate_attempts:
-            raise RuntimeError("No Google Gemini or River AI key found in .env.")
+            raise RuntimeError("No Vision/Chat API endpoint or key found in .env or Studio & Keys.")
 
         test_jpeg_b64 = _build_synthetic_vision_test_jpeg_b64()
         vision_prompt = "Reply in one short sentence: what colored shape and number do you see?"
@@ -965,20 +1055,29 @@ def run_strict_selftest() -> int:
         active_provider_label = ""
         last_vision_error = ""
 
-        for attempt_provider, attempt_model, attempt_key in candidate_attempts:
+        for attempt_cfg in candidate_attempts:
+            attempt_provider = attempt_cfg["provider_label"]
+            attempt_wire = attempt_cfg["wire_protocol"]
+            attempt_endpoint = attempt_cfg["endpoint_url"]
+            attempt_model = attempt_cfg["model_id"]
+            attempt_key = attempt_cfg["api_key"]
             model_sequence = (
                 jarvis_services.VisionBrainService.get_google_model_fallback_chain(attempt_model)
-                if attempt_provider == "google"
+                if (attempt_wire == "google" and "generativelanguage.googleapis.com" in attempt_endpoint.lower())
                 else [attempt_model]
             )
             attempt_succeeded = False
             for candidate_idx, candidate_model in enumerate(model_sequence):
                 vision_extractor = jarvis_response_parser.StreamingSentenceExtractor()
-                if attempt_provider == "google":
-                    request_url = jarvis_services.VisionBrainService.GOOGLE_GEMINI_STREAM_URL_TEMPLATE.format(
-                        model_id=candidate_model
+                if attempt_wire == "google":
+                    request_url = (
+                        attempt_endpoint.format(model_id=candidate_model)
+                        if "{model_id}" in attempt_endpoint
+                        else jarvis_config.normalize_endpoint_url(attempt_endpoint, "google", candidate_model)
                     )
-                    request_headers = {"x-goog-api-key": attempt_key, "Content-Type": "application/json"}
+                    request_headers: Dict[str, str] = {"Content-Type": "application/json"}
+                    if attempt_key:
+                        request_headers["x-goog-api-key"] = attempt_key
                     request_payload = jarvis_services.VisionBrainService.build_google_gemini_payload(
                         system_prompt="",
                         history_messages=[],
@@ -986,9 +1085,34 @@ def run_strict_selftest() -> int:
                         jpeg_b64=test_jpeg_b64,
                         max_output_tokens=160,
                     )
+                elif attempt_wire == "anthropic":
+                    request_url = attempt_endpoint
+                    request_headers = {
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    }
+                    if attempt_key:
+                        request_headers["x-api-key"] = attempt_key
+                    request_payload = jarvis_services.VisionBrainService.build_anthropic_messages_payload(
+                        system_prompt="",
+                        history_messages=[],
+                        request_user_text=vision_prompt,
+                        jpeg_b64=test_jpeg_b64,
+                        max_output_tokens=160,
+                        model_id=candidate_model,
+                    )
                 else:
-                    request_url = jarvis_services.VisionBrainService.RIVER_CHAT_URL
-                    request_headers = {"Authorization": f"Bearer {attempt_key}", "Content-Type": "application/json"}
+                    request_url = attempt_endpoint
+                    endpoint_lower = request_url.lower()
+                    request_headers = {"Content-Type": "application/json"}
+                    if attempt_key:
+                        if ("openai.azure.com" in endpoint_lower) or ("api-version=" in endpoint_lower):
+                            request_headers["api-key"] = attempt_key
+                        else:
+                            request_headers["Authorization"] = f"Bearer {attempt_key}"
+                    if "openrouter.ai" in endpoint_lower:
+                        request_headers["HTTP-Referer"] = "https://heyclicky.com"
+                        request_headers["X-Title"] = "Jarvis"
                     request_payload = {
                         "model": candidate_model,
                         "messages": [
@@ -1002,56 +1126,84 @@ def run_strict_selftest() -> int:
                         ],
                         "max_tokens": 120,
                         "stream": True,
-                        "reasoning_effort": "none",
                     }
+                    if "api.river.ai" in endpoint_lower:
+                        request_payload["reasoning_effort"] = "none"
 
-                with requests.post(
-                    request_url,
-                    headers=request_headers,
-                    json=request_payload,
-                    stream=True,
-                    timeout=30,
-                ) as vision_response:
-                    if not vision_response.ok:
-                        last_vision_error = (
-                            f"{attempt_provider}:{candidate_model} HTTP {vision_response.status_code}: "
-                            f"{vision_response.text[:160]}"
-                        )
-                        if (
-                            attempt_provider == "google"
-                            and vision_response.status_code in (400, 404)
-                            and (candidate_idx + 1) < len(model_sequence)
-                        ):
-                            continue
-                        break
-                    vision_response.encoding = "utf-8"
-                    for sse_line in vision_response.iter_lines(decode_unicode=True):
-                        if not sse_line or not sse_line.startswith("data: "):
-                            continue
-                        payload_text = sse_line[6:].strip()
-                        if payload_text == "[DONE]":
+                try:
+                    with requests.post(
+                        request_url,
+                        headers=request_headers,
+                        json=request_payload,
+                        stream=True,
+                        timeout=30,
+                    ) as vision_response:
+                        if not vision_response.ok:
+                            last_vision_error = (
+                                f"{attempt_provider}:{candidate_model} HTTP {vision_response.status_code}: "
+                                f"{vision_response.text[:160]}"
+                            )
+                            if (
+                                attempt_wire == "google"
+                                and vision_response.status_code in (400, 404)
+                                and (candidate_idx + 1) < len(model_sequence)
+                            ):
+                                continue
                             break
-                        try:
-                            chunk_payload = json.loads(payload_text)
-                            if attempt_provider == "google":
-                                delta_piece = jarvis_services.VisionBrainService.extract_google_sse_delta_text(
-                                    chunk_payload
-                                )
+                        vision_response.encoding = "utf-8"
+                        plain_json_lines: List[str] = []
+                        saw_sse_prefix = False
+                        for sse_line in vision_response.iter_lines(decode_unicode=True):
+                            if not sse_line:
+                                continue
+                            stripped_sse = sse_line.strip()
+                            if stripped_sse.startswith("data:"):
+                                saw_sse_prefix = True
+                                payload_text = stripped_sse[5:].strip()
+                                if payload_text == "[DONE]":
+                                    break
+                                try:
+                                    chunk_payload = json.loads(payload_text)
+                                except Exception:
+                                    continue
+                            elif stripped_sse.startswith("event:"):
+                                saw_sse_prefix = True
+                                continue
+                            elif (not saw_sse_prefix) and stripped_sse.startswith("{"):
+                                try:
+                                    chunk_payload = json.loads(stripped_sse)
+                                except Exception:
+                                    plain_json_lines.append(sse_line)
+                                    continue
                             else:
-                                delta_piece = (
-                                    chunk_payload.get("choices", [{}])[0]
-                                    .get("delta", {})
-                                    .get("content", "")
+                                if not saw_sse_prefix:
+                                    plain_json_lines.append(sse_line)
+                                continue
+                            delta_piece = jarvis_services.VisionBrainService.extract_universal_sse_delta_text(
+                                chunk_payload,
+                                attempt_wire,
+                            )
+                            if delta_piece:
+                                vision_extractor.feed_delta(delta_piece)
+                        if (not saw_sse_prefix) and plain_json_lines:
+                            try:
+                                full_json_payload = json.loads("\n".join(plain_json_lines))
+                                full_text_piece = jarvis_services.VisionBrainService.extract_universal_sse_delta_text(
+                                    full_json_payload,
+                                    attempt_wire,
                                 )
-                        except Exception:
-                            continue
-                        if delta_piece:
-                            vision_extractor.feed_delta(delta_piece)
-                vision_extractor.flush_remaining()
-                vision_answer = vision_extractor.build_final_response().spoken_text
-                active_provider_label = f"{attempt_provider}:{candidate_model}"
-                attempt_succeeded = True
-                break
+                                if full_text_piece:
+                                    vision_extractor.feed_delta(full_text_piece)
+                            except Exception:
+                                pass
+                    vision_extractor.flush_remaining()
+                    vision_answer = vision_extractor.build_final_response().spoken_text
+                    active_provider_label = f"{attempt_provider}:{candidate_model}"
+                    attempt_succeeded = True
+                    break
+                except Exception as request_exc:
+                    last_vision_error = f"{attempt_provider}:{candidate_model} error: {request_exc}"
+                    break
             if attempt_succeeded:
                 break
 

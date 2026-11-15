@@ -120,6 +120,12 @@ FIVE_CORE_SHORTCUTS: List[Dict[str, Any]] = [
 
 SECRET_FIELD_DEFINITIONS: List[Dict[str, str]] = [
     {
+        "secret_name": jarvis_config.SECRET_CUSTOM_API_KEY,
+        "display_title": "Universal / Custom API Key",
+        "subtitle": "OpenAI, Anthropic, OpenRouter, Groq, DeepSeek, Azure, Ollama (CUSTOM_API_KEY)",
+        "placeholder": "Enter any LLM API key (sk-..., sk-ant-..., sk-or-..., gsk_...)...",
+    },
+    {
         "secret_name": jarvis_config.SECRET_GOOGLE_API_KEY,
         "display_title": "Google Gemini Key",
         "subtitle": "Gemini 4 Hydrogen & 3.8 Flash Vision (GOOGLE_API_KEY)",
@@ -1546,17 +1552,23 @@ class JarvisMainWindow(QMainWindow):
         studio_actions_row.addStretch(1)
         plan_layout.addLayout(studio_actions_row)
 
-        status_row = QHBoxLayout()
-        status_row.setSpacing(12)
+        status_row_primary = QHBoxLayout()
+        status_row_primary.setSpacing(12)
+        self._plan_custom_status = self._create_plan_meter_block("Universal / Custom", "Checking...")
         self._plan_google_status = self._create_plan_meter_block("Google Gemini (Vision)", "Checking...")
         self._plan_river_status = self._create_plan_meter_block("River AI (Vision)", "Checking...")
+        status_row_primary.addWidget(self._plan_custom_status["container"], 1)
+        status_row_primary.addWidget(self._plan_google_status["container"], 1)
+        status_row_primary.addWidget(self._plan_river_status["container"], 1)
+        plan_layout.addLayout(status_row_primary)
+
+        status_row_voice = QHBoxLayout()
+        status_row_voice.setSpacing(12)
         self._plan_assembly_status = self._create_plan_meter_block("AssemblyAI (STT)", "Checking...")
         self._plan_voice_status = self._create_plan_meter_block("AssemblyAI (Voice TTS)", "Checking...")
-        status_row.addWidget(self._plan_google_status["container"], 1)
-        status_row.addWidget(self._plan_river_status["container"], 1)
-        status_row.addWidget(self._plan_assembly_status["container"], 1)
-        status_row.addWidget(self._plan_voice_status["container"], 1)
-        plan_layout.addLayout(status_row)
+        status_row_voice.addWidget(self._plan_assembly_status["container"], 1)
+        status_row_voice.addWidget(self._plan_voice_status["container"], 1)
+        plan_layout.addLayout(status_row_voice)
         page_layout.addWidget(plan_card)
 
         # API KEYS (.ENV) card with masked EchoMode.Password fields + eye toggle + Save
@@ -1626,6 +1638,67 @@ class JarvisMainWindow(QMainWindow):
             keys_layout.addWidget(row_container)
 
         page_layout.addWidget(keys_card)
+
+        # CUSTOM ENDPOINT & MODEL (ANY API) card for arbitrary base URLs and custom model IDs
+        page_layout.addSpacing(2)
+        page_layout.addWidget(_build_section_label("CUSTOM ENDPOINT & MODEL (ANY API)"))
+        custom_endpoint_card = _build_card_frame()
+        custom_endpoint_layout = QVBoxLayout(custom_endpoint_card)
+        custom_endpoint_layout.setContentsMargins(14, 10, 14, 10)
+        custom_endpoint_layout.setSpacing(7)
+
+        endpoint_title = QLabel("Custom Base URL / Endpoint")
+        endpoint_title.setObjectName("RowTitleLabel")
+        endpoint_subtitle = QLabel(
+            "Supports any OpenAI-compat, Gemini, Anthropic, Azure, OpenRouter, Groq, DeepSeek, or local Ollama URL"
+        )
+        endpoint_subtitle.setObjectName("RowSubtitleLabel")
+        endpoint_subtitle.setWordWrap(True)
+        custom_endpoint_layout.addWidget(endpoint_title)
+        custom_endpoint_layout.addWidget(endpoint_subtitle)
+
+        self._custom_endpoint_input = QLineEdit()
+        self._custom_endpoint_input.setObjectName("SettingsLineEdit")
+        self._custom_endpoint_input.setPlaceholderText(
+            "https://api.openai.com/v1 or http://localhost:11434/v1 (leave blank for auto)"
+        )
+        self._custom_endpoint_input.returnPressed.connect(self._save_custom_endpoint_and_model)
+        custom_endpoint_layout.addWidget(self._custom_endpoint_input)
+
+        custom_endpoint_layout.addWidget(_build_hairline_divider())
+
+        custom_model_title = QLabel("Custom Model ID")
+        custom_model_title.setObjectName("RowTitleLabel")
+        custom_model_subtitle = QLabel(
+            "Any model string sent to your endpoint (e.g. gpt-4o, claude-sonnet-4-20250514, llama3.2-vision)"
+        )
+        custom_model_subtitle.setObjectName("RowSubtitleLabel")
+        custom_model_subtitle.setWordWrap(True)
+        custom_endpoint_layout.addWidget(custom_model_title)
+        custom_endpoint_layout.addWidget(custom_model_subtitle)
+
+        custom_model_row = QHBoxLayout()
+        custom_model_row.setSpacing(6)
+        self._custom_model_input = QLineEdit()
+        self._custom_model_input.setObjectName("SettingsLineEdit")
+        self._custom_model_input.setPlaceholderText("e.g. gpt-4o, claude-sonnet-4-20250514, gemini-3.8-flash")
+        self._custom_model_input.returnPressed.connect(self._save_custom_endpoint_and_model)
+        custom_model_row.addWidget(self._custom_model_input, 1)
+
+        self._custom_endpoint_save_btn = QPushButton("Save")
+        self._custom_endpoint_save_btn.setObjectName("SecondaryActionButton")
+        self._custom_endpoint_save_btn.setFixedWidth(68)
+        self._custom_endpoint_save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._custom_endpoint_save_btn.clicked.connect(self._save_custom_endpoint_and_model)
+        custom_model_row.addWidget(self._custom_endpoint_save_btn)
+        custom_endpoint_layout.addLayout(custom_model_row)
+
+        self._custom_endpoint_preview_label = QLabel("Auto-routing enabled")
+        self._custom_endpoint_preview_label.setObjectName("RowSubtitleLabel")
+        self._custom_endpoint_preview_label.setWordWrap(True)
+        custom_endpoint_layout.addWidget(self._custom_endpoint_preview_label)
+
+        page_layout.addWidget(custom_endpoint_card)
 
         # ACCOUNT card matching bottom card in 2.15.41 AM.jpeg
         page_layout.addSpacing(4)
@@ -3112,9 +3185,9 @@ class JarvisMainWindow(QMainWindow):
             self._refresh_account_avatar(display_name)
 
             model_id = str(self._settings_store.get("chat_model", ""))
-            model_index = self._vision_model_combo.findData(model_id)
-            if model_index >= 0:
-                self._vision_model_combo.setCurrentIndex(model_index)
+            self._select_vision_model_in_combo(model_id)
+            self._custom_endpoint_input.setText(self._settings_store.get_effective_endpoint_url())
+            self._custom_model_input.setText(model_id)
 
             self._typed_voice_toggle.setCheckedInstant(
                 bool(self._settings_store.get("typed_turns_respond_with_voice", False))
@@ -3193,9 +3266,13 @@ class JarvisMainWindow(QMainWindow):
                 self._account_display_name_input.setText(text_value)
                 self._refresh_account_avatar(text_value)
             elif key_name == "chat_model":
-                model_index = self._vision_model_combo.findData(str(new_value))
-                if model_index >= 0:
-                    self._vision_model_combo.setCurrentIndex(model_index)
+                model_text = str(new_value or "")
+                self._select_vision_model_in_combo(model_text)
+                self._custom_model_input.setText(model_text)
+                self._refresh_secret_statuses()
+            elif key_name == "custom_api_base_url":
+                self._custom_endpoint_input.setText(self._settings_store.get_effective_endpoint_url())
+                self._refresh_secret_statuses()
             elif key_name == "typed_turns_respond_with_voice":
                 self._typed_voice_toggle.setCheckedInstant(bool(new_value))
             elif key_name == "show_in_screen_recordings":
@@ -3268,6 +3345,28 @@ class JarvisMainWindow(QMainWindow):
             self._updating_from_store = False
         self._settings_store.set("user_display_name", cleaned_name)
 
+    def _select_vision_model_in_combo(self, model_id: str) -> None:
+        clean_model = (model_id or "").strip()
+        if not clean_model:
+            return
+        model_index = self._vision_model_combo.findData(clean_model)
+        if model_index < 0:
+            self._vision_model_combo.addItem(f"Custom: {clean_model}", clean_model)
+            model_index = self._vision_model_combo.findData(clean_model)
+        if model_index >= 0:
+            self._vision_model_combo.setCurrentIndex(model_index)
+
+    def _save_custom_endpoint_and_model(self) -> None:
+        endpoint_text = self._custom_endpoint_input.text().strip()
+        custom_model_text = self._custom_model_input.text().strip()
+        self._settings_store.set("custom_api_base_url", endpoint_text)
+        if custom_model_text:
+            self._settings_store.set("chat_model", custom_model_text)
+            self._select_vision_model_in_combo(custom_model_text)
+        self._refresh_secret_statuses()
+        self._custom_endpoint_save_btn.setText("Saved")
+        QTimer.singleShot(1400, lambda target_button=self._custom_endpoint_save_btn: target_button.setText("Save"))
+
     def _refresh_account_avatar(self, display_name: str) -> None:
         account_button = self._sidebar_buttons.get("account")
         if account_button is not None:
@@ -3280,18 +3379,31 @@ class JarvisMainWindow(QMainWindow):
             return
         saved_secret_value = line_edit.text().strip()
         self._settings_store.set_secret(secret_name, saved_secret_value)
-        if secret_name == jarvis_config.SECRET_GOOGLE_API_KEY and saved_secret_value:
-            current_model = str(self._settings_store.get("chat_model", ""))
+        current_model = str(self._settings_store.get("chat_model", ""))
+        if secret_name == jarvis_config.SECRET_CUSTOM_API_KEY and saved_secret_value:
+            custom_url = self._settings_store.get_effective_endpoint_url()
+            if saved_secret_value.startswith("sk-ant-") and not jarvis_config.is_anthropic_model(current_model):
+                self._settings_store.set("chat_model", "claude-sonnet-4-20250514")
+            elif saved_secret_value.startswith("AIza") and not jarvis_config.is_google_gemini_model(current_model):
+                self._settings_store.set("chat_model", jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL)
+            elif saved_secret_value.startswith("sk-or-v1-") and current_model.startswith("deepseek-ai/"):
+                self._settings_store.set("chat_model", "openai/gpt-4o")
+            elif saved_secret_value.startswith("sk-") and (not custom_url) and current_model.startswith("deepseek-ai/"):
+                self._settings_store.set("chat_model", "gpt-4o")
+        elif secret_name == jarvis_config.SECRET_GOOGLE_API_KEY and saved_secret_value:
             if not jarvis_config.is_google_gemini_model(current_model):
                 self._settings_store.set("chat_model", jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL)
         elif (
             secret_name == jarvis_config.SECRET_RIVER_API_KEY
             and saved_secret_value
             and (not self._settings_store.has_secret(jarvis_config.SECRET_GOOGLE_API_KEY))
+            and (not self._settings_store.has_secret(jarvis_config.SECRET_CUSTOM_API_KEY))
         ):
-            current_model = str(self._settings_store.get("chat_model", ""))
             if jarvis_config.is_google_gemini_model(current_model):
                 self._settings_store.set("chat_model", "deepseek-ai/DeepSeek-V4.1-Flash")
+        updated_model = str(self._settings_store.get("chat_model", ""))
+        self._select_vision_model_in_combo(updated_model)
+        self._custom_model_input.setText(updated_model)
         self._refresh_secret_statuses()
         save_button = self._secret_save_buttons.get(secret_name)
         if save_button is not None:
@@ -3312,25 +3424,52 @@ class JarvisMainWindow(QMainWindow):
                 badge.style().unpolish(badge)
                 badge.style().polish(badge)
 
+        custom_key, custom_alias = self._settings_store.get_custom_secret_with_name()
+        effective_endpoint = self._settings_store.get_effective_endpoint_url()
+        has_custom = bool(custom_key or effective_endpoint)
         has_google = self._settings_store.has_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
         has_river = self._settings_store.has_secret(jarvis_config.SECRET_RIVER_API_KEY)
         has_assembly = self._settings_store.has_secret(jarvis_config.SECRET_ASSEMBLYAI_API_KEY)
+        has_any_vision = self._settings_store.has_any_vision_credentials()
 
+        current_model = str(self._settings_store.get("chat_model", ""))
+        custom_provider_name = jarvis_config.infer_provider_name(effective_endpoint, current_model, custom_alias)
+        custom_protocol = jarvis_config.detect_wire_protocol(effective_endpoint, current_model, custom_alias)
+
+        self._update_plan_meter(
+            self._plan_custom_status,
+            has_custom,
+            custom_provider_name if has_custom else ("Optional" if has_any_vision else "Missing"),
+        )
         self._update_plan_meter(
             self._plan_google_status,
             has_google,
-            "Connected" if has_google else ("Optional" if has_river else "Missing"),
+            "Connected" if has_google else ("Optional" if has_any_vision else "Missing"),
         )
         self._update_plan_meter(
             self._plan_river_status,
             has_river,
-            "Connected" if has_river else ("Optional" if has_google else "Missing"),
+            "Connected" if has_river else ("Optional" if has_any_vision else "Missing"),
         )
         self._update_plan_meter(self._plan_assembly_status, has_assembly, "Connected" if has_assembly else "Missing")
         self._update_plan_meter(self._plan_voice_status, has_assembly, "Connected" if has_assembly else "SAPI Fallback")
 
+        if effective_endpoint:
+            preview_url = jarvis_config.normalize_endpoint_url(effective_endpoint, custom_protocol, current_model)
+            self._custom_endpoint_preview_label.setText(
+                f"Active route: {custom_provider_name} ({custom_protocol.upper()}) -> {preview_url}"
+            )
+        elif custom_key:
+            self._custom_endpoint_preview_label.setText(
+                f"Auto-routed via {custom_alias or 'CUSTOM_API_KEY'} ({custom_provider_name} / {custom_protocol.upper()})"
+            )
+        else:
+            self._custom_endpoint_preview_label.setText(
+                "Using Google Gemini / River AI auto-routing unless a custom base URL is entered above."
+            )
+
         total_keys = len(SECRET_FIELD_DEFINITIONS)
-        if (has_google or has_river) and has_assembly:
+        if has_any_vision and has_assembly:
             self._byok_status_pill.setText("Keys Ready")
         else:
             self._byok_status_pill.setText(f"Setup Keys ({configured_count}/{total_keys})")
@@ -3348,7 +3487,10 @@ class JarvisMainWindow(QMainWindow):
             return
         selected_model_id = self._vision_model_combo.itemData(combo_index)
         if selected_model_id:
-            self._settings_store.set("chat_model", str(selected_model_id))
+            clean_model = str(selected_model_id)
+            self._settings_store.set("chat_model", clean_model)
+            self._custom_model_input.setText(clean_model)
+            self._refresh_secret_statuses()
 
     def _on_speech_speed_slider_changed(self, slider_value: int) -> None:
         speed_float = round(slider_value / 100.0, 2)

@@ -2014,31 +2014,235 @@ class VisionBrainService(QObject):
         "https://generativelanguage.googleapis.com/v1beta/models/{model_id}:streamGenerateContent?alt=sse"
     )
 
+    @classmethod
+    def _infer_universal_key_endpoint(
+        cls,
+        api_key: str,
+        key_alias: str,
+        selected_model: str,
+    ) -> Tuple[str, str]:
+        """Returns `(endpoint_url, provider_label)` for an API key when no explicit base URL is set."""
+        key_trimmed = (api_key or "").strip()
+        if key_alias in jarvis_config.KNOWN_PROVIDER_ENDPOINTS:
+            endpoint_url = jarvis_config.KNOWN_PROVIDER_ENDPOINTS[key_alias]
+            provider_label = jarvis_config.infer_provider_name(endpoint_url, selected_model, key_alias)
+            return (endpoint_url, provider_label)
+        if key_trimmed.startswith("sk-or-v1-"):
+            return ("https://openrouter.ai/api/v1/chat/completions", "OpenRouter")
+        if key_trimmed.startswith("sk-ant-"):
+            return ("https://api.anthropic.com/v1/messages", "Anthropic")
+        if key_trimmed.startswith("gsk_"):
+            return ("https://api.groq.com/openai/v1/chat/completions", "Groq")
+        if key_trimmed.startswith("AIza"):
+            return (cls.GOOGLE_GEMINI_STREAM_URL_TEMPLATE, "Google Gemini")
+        if key_trimmed.startswith("xai-"):
+            return ("https://api.x.ai/v1/chat/completions", "xAI")
+        if jarvis_config.is_anthropic_model(selected_model):
+            return ("https://api.anthropic.com/v1/messages", "Anthropic")
+        if jarvis_config.is_google_gemini_model(selected_model):
+            return (cls.GOOGLE_GEMINI_STREAM_URL_TEMPLATE, "Google Gemini")
+        return ("https://api.openai.com/v1/chat/completions", "OpenAI")
+
     @staticmethod
-    def resolve_active_vision_provider_and_model(
+    def _adapt_model_for_provider(
+        selected_model: str,
+        wire_protocol: str,
+        provider_label: str,
+        fallback_alias: str = "",
+    ) -> str:
+        """Keeps user's model if compatible, otherwise picks a safe default for the target endpoint."""
+        clean_model = (selected_model or "").strip()
+        if wire_protocol == "google":
+            return (
+                clean_model
+                if jarvis_config.is_google_gemini_model(clean_model)
+                else jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL
+            )
+        if wire_protocol == "anthropic":
+            return (
+                clean_model
+                if jarvis_config.is_anthropic_model(clean_model)
+                else "claude-sonnet-4-20250514"
+            )
+        if provider_label == "River AI":
+            if clean_model and ("/" in clean_model) and (not jarvis_config.is_google_gemini_model(clean_model)) and (not jarvis_config.is_anthropic_model(clean_model)):
+                return clean_model
+            return "deepseek-ai/DeepSeek-V4.1-Flash"
+        if provider_label == "OpenAI" and (
+            not clean_model
+            or clean_model.startswith("deepseek-ai/")
+            or jarvis_config.is_google_gemini_model(clean_model)
+            or jarvis_config.is_anthropic_model(clean_model)
+        ):
+            return "gpt-4o"
+        if clean_model:
+            return clean_model
+        if fallback_alias and fallback_alias in jarvis_config.DEFAULT_MODEL_FOR_KEY_ALIAS:
+            return jarvis_config.DEFAULT_MODEL_FOR_KEY_ALIAS[fallback_alias]
+        return "gpt-4o"
+
+    @classmethod
+    def resolve_all_vision_endpoints(
+        cls,
         settings_store: jarvis_config.SettingsStore,
-    ) -> Tuple[str, str, str]:
-        """Returns `(provider_name, model_id, api_key)` based on configured keys and selected model."""
+    ) -> List[Dict[str, str]]:
+        """Builds an ordered list of primary and fallback vision endpoints from UI settings and .env."""
         selected_model = str(
             settings_store.get("chat_model", jarvis_config.DEFAULT_SETTINGS["chat_model"]) or ""
         ).strip()
         if not selected_model:
             selected_model = str(jarvis_config.DEFAULT_SETTINGS["chat_model"])
+
+        custom_endpoint_raw = settings_store.get_effective_endpoint_url()
+        custom_key, custom_key_alias = settings_store.get_custom_secret_with_name()
         google_key = settings_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
         river_key = settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
 
-        if jarvis_config.is_google_gemini_model(selected_model):
-            if google_key:
-                return ("google", selected_model, google_key)
-            if river_key:
-                return ("river", "deepseek-ai/DeepSeek-V4.1-Flash", river_key)
-            return ("google", selected_model, "")
+        custom_url_entry: Optional[Dict[str, str]] = None
+        if custom_endpoint_raw:
+            url_lower = custom_endpoint_raw.lower()
+            is_local_host = ("localhost" in url_lower) or ("127.0.0.1" in url_lower) or ("0.0.0.0" in url_lower)
+            hint_alias = custom_key_alias
+            chosen_key = custom_key
+            if not chosen_key:
+                if ("generativelanguage.googleapis.com" in url_lower) and google_key:
+                    chosen_key = google_key
+                    hint_alias = "GOOGLE_API_KEY"
+                elif ("api.river.ai" in url_lower) and river_key:
+                    chosen_key = river_key
+                    hint_alias = "RIVER_AI_API"
+                elif (not is_local_host) and google_key and jarvis_config.detect_wire_protocol(custom_endpoint_raw, selected_model, "") == "google":
+                    chosen_key = google_key
+                    hint_alias = "GOOGLE_API_KEY"
 
-        if river_key:
-            return ("river", selected_model, river_key)
+            custom_wire = jarvis_config.detect_wire_protocol(custom_endpoint_raw, selected_model, hint_alias)
+            custom_label = jarvis_config.infer_provider_name(custom_endpoint_raw, selected_model, hint_alias)
+            custom_model = cls._adapt_model_for_provider(selected_model, custom_wire, custom_label, fallback_alias=hint_alias)
+            custom_url_final = (
+                custom_endpoint_raw
+                if (custom_wire == "google" and "{model_id}" in custom_endpoint_raw)
+                else jarvis_config.normalize_endpoint_url(custom_endpoint_raw, custom_wire, custom_model)
+            )
+            custom_url_entry = {
+                "provider_label": custom_label,
+                "wire_protocol": custom_wire,
+                "endpoint_url": custom_url_final,
+                "model_id": custom_model,
+                "api_key": chosen_key,
+            }
+
+        custom_key_entry: Optional[Dict[str, str]] = None
+        if custom_key:
+            inferred_url, inferred_label = cls._infer_universal_key_endpoint(
+                custom_key,
+                custom_key_alias,
+                selected_model,
+            )
+            inferred_wire = jarvis_config.detect_wire_protocol(inferred_url, selected_model, custom_key_alias)
+            inferred_model = cls._adapt_model_for_provider(
+                selected_model,
+                inferred_wire,
+                inferred_label,
+                fallback_alias=custom_key_alias,
+            )
+            if custom_key_alias and custom_key_alias in jarvis_config.DEFAULT_MODEL_FOR_KEY_ALIAS and selected_model.startswith("deepseek-ai/"):
+                inferred_model = jarvis_config.DEFAULT_MODEL_FOR_KEY_ALIAS[custom_key_alias]
+            normalized_key_url = (
+                inferred_url
+                if (inferred_wire == "google" and "{model_id}" in inferred_url)
+                else jarvis_config.normalize_endpoint_url(inferred_url, inferred_wire, inferred_model)
+            )
+            custom_key_entry = {
+                "provider_label": inferred_label,
+                "wire_protocol": inferred_wire,
+                "endpoint_url": normalized_key_url,
+                "model_id": inferred_model,
+                "api_key": custom_key,
+            }
+
+        google_entry: Optional[Dict[str, str]] = None
         if google_key:
-            return ("google", jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL, google_key)
-        return ("river", selected_model, "")
+            google_model = (
+                selected_model
+                if jarvis_config.is_google_gemini_model(selected_model)
+                else jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL
+            )
+            google_entry = {
+                "provider_label": "Google Gemini",
+                "wire_protocol": "google",
+                "endpoint_url": cls.GOOGLE_GEMINI_STREAM_URL_TEMPLATE,
+                "model_id": google_model,
+                "api_key": google_key,
+            }
+
+        river_entry: Optional[Dict[str, str]] = None
+        if river_key:
+            river_model = cls._adapt_model_for_provider(selected_model, "openai", "River AI")
+            river_entry = {
+                "provider_label": "River AI",
+                "wire_protocol": "openai",
+                "endpoint_url": cls.RIVER_CHAT_URL,
+                "model_id": river_model,
+                "api_key": river_key,
+            }
+
+        ordered_candidates: List[Dict[str, str]] = []
+        if custom_url_entry is not None:
+            ordered_candidates.append(custom_url_entry)
+
+        if jarvis_config.is_google_gemini_model(selected_model):
+            priority_list = [google_entry, custom_key_entry, river_entry]
+        elif selected_model.startswith("deepseek-ai/"):
+            priority_list = [river_entry, custom_key_entry, google_entry]
+        else:
+            priority_list = [custom_key_entry, google_entry, river_entry]
+
+        for entry in priority_list:
+            if entry is not None:
+                ordered_candidates.append(entry)
+
+        deduped_endpoints: List[Dict[str, str]] = []
+        seen_signatures = set()
+        for candidate_entry in ordered_candidates:
+            signature = (
+                candidate_entry["wire_protocol"],
+                candidate_entry["endpoint_url"],
+                candidate_entry["model_id"],
+                candidate_entry["api_key"],
+            )
+            if signature not in seen_signatures:
+                seen_signatures.add(signature)
+                deduped_endpoints.append(candidate_entry)
+        return deduped_endpoints
+
+    @classmethod
+    def resolve_active_vision_provider_and_model(
+        cls,
+        settings_store: jarvis_config.SettingsStore,
+    ) -> Tuple[str, str, str]:
+        """Returns `(provider_name, model_id, api_key)` for the highest-priority configured endpoint."""
+        endpoints = cls.resolve_all_vision_endpoints(settings_store)
+        if not endpoints:
+            selected_model = str(
+                settings_store.get("chat_model", jarvis_config.DEFAULT_SETTINGS["chat_model"]) or ""
+            ).strip() or str(jarvis_config.DEFAULT_SETTINGS["chat_model"])
+            fallback_provider = (
+                "google"
+                if jarvis_config.is_google_gemini_model(selected_model)
+                else ("anthropic" if jarvis_config.is_anthropic_model(selected_model) else "river")
+            )
+            return (fallback_provider, selected_model, "")
+        primary_entry = endpoints[0]
+        label_lower = primary_entry["provider_label"].lower()
+        if primary_entry["wire_protocol"] == "google" or "google" in label_lower:
+            provider_slug = "google"
+        elif "river" in label_lower:
+            provider_slug = "river"
+        elif primary_entry["wire_protocol"] == "anthropic":
+            provider_slug = "anthropic"
+        else:
+            provider_slug = "custom"
+        return (provider_slug, primary_entry["model_id"], primary_entry["api_key"])
 
     @staticmethod
     def build_google_gemini_payload(
@@ -2103,6 +2307,139 @@ class VisionBrainService(QObject):
         return "".join(collected_chunks)
 
     @staticmethod
+    def build_anthropic_messages_payload(
+        system_prompt: str,
+        history_messages: List[Dict[str, str]],
+        request_user_text: str,
+        jpeg_b64: str = "",
+        lasso_crop_b64: str = "",
+        max_output_tokens: int = 1100,
+        model_id: str = "claude-sonnet-4-20250514",
+    ) -> Dict[str, Any]:
+        """Builds an Anthropic `/v1/messages` SSE JSON payload with optional vision attachments."""
+        anthropic_messages: List[Dict[str, Any]] = []
+        for past_msg in history_messages:
+            past_text = str(past_msg.get("content") or "").strip()
+            if not past_text:
+                continue
+            anthropic_role = "assistant" if past_msg.get("role") == "assistant" else "user"
+            anthropic_messages.append({"role": anthropic_role, "content": past_text})
+
+        user_blocks: List[Dict[str, Any]] = []
+        if jpeg_b64:
+            user_blocks.append(
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": jpeg_b64},
+                }
+            )
+        if lasso_crop_b64:
+            user_blocks.append(
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": lasso_crop_b64},
+                }
+            )
+        user_blocks.append({"type": "text", "text": request_user_text})
+        anthropic_messages.append({"role": "user", "content": user_blocks if jpeg_b64 else request_user_text})
+
+        payload: Dict[str, Any] = {
+            "model": model_id,
+            "max_tokens": max_output_tokens,
+            "stream": True,
+            "messages": anthropic_messages,
+        }
+        if (system_prompt or "").strip():
+            payload["system"] = system_prompt
+        return payload
+
+    @staticmethod
+    def extract_anthropic_sse_delta_text(chunk_json: Dict[str, Any]) -> str:
+        """Extracts text deltas from Anthropic Messages SSE chunks or complete JSON responses."""
+        event_type = str(chunk_json.get("type") or "")
+        if event_type == "content_block_delta":
+            delta_obj = chunk_json.get("delta")
+            if isinstance(delta_obj, dict) and delta_obj.get("type") in ("text_delta", None):
+                return str(delta_obj.get("text") or "")
+        if event_type == "content_block_start":
+            content_block = chunk_json.get("content_block")
+            if isinstance(content_block, dict) and content_block.get("type") == "text":
+                return str(content_block.get("text") or "")
+        content_list = chunk_json.get("content")
+        if isinstance(content_list, list):
+            text_fragments: List[str] = []
+            for block_item in content_list:
+                if isinstance(block_item, dict) and block_item.get("type") == "text":
+                    block_text = block_item.get("text")
+                    if isinstance(block_text, str) and block_text:
+                        text_fragments.append(block_text)
+            return "".join(text_fragments)
+        return ""
+
+    @classmethod
+    def extract_universal_sse_delta_text(
+        cls,
+        chunk_json: Any,
+        wire_protocol: str = "openai",
+    ) -> str:
+        """Extracts streamed or complete text across OpenAI-compat, Google Gemini, Anthropic, and Ollama."""
+        if not isinstance(chunk_json, dict):
+            return ""
+        if wire_protocol == "google" or ("candidates" in chunk_json):
+            return cls.extract_google_sse_delta_text(chunk_json)
+        if wire_protocol == "anthropic" or chunk_json.get("type") in (
+            "content_block_delta",
+            "content_block_start",
+            "message_start",
+            "message_delta",
+        ):
+            anthropic_text = cls.extract_anthropic_sse_delta_text(chunk_json)
+            if anthropic_text or wire_protocol == "anthropic":
+                return anthropic_text
+        if isinstance(chunk_json.get("content"), list) and ("choices" not in chunk_json):
+            return cls.extract_anthropic_sse_delta_text(chunk_json)
+
+        choices = chunk_json.get("choices")
+        if isinstance(choices, list) and choices:
+            first_choice = choices[0]
+            if isinstance(first_choice, dict):
+                delta_obj = first_choice.get("delta")
+                if isinstance(delta_obj, dict):
+                    delta_content = delta_obj.get("content")
+                    if isinstance(delta_content, str):
+                        return delta_content
+                    if isinstance(delta_content, list):
+                        return "".join(
+                            str(part_item.get("text") or "")
+                            for part_item in delta_content
+                            if isinstance(part_item, dict)
+                        )
+                message_obj = first_choice.get("message")
+                if isinstance(message_obj, dict):
+                    message_content = message_obj.get("content")
+                    if isinstance(message_content, str):
+                        return message_content
+                    if isinstance(message_content, list):
+                        return "".join(
+                            str(part_item.get("text") or "")
+                            for part_item in message_content
+                            if isinstance(part_item, dict)
+                        )
+                legacy_text = first_choice.get("text")
+                if isinstance(legacy_text, str):
+                    return legacy_text
+
+        if chunk_json.get("type") == "response.output_text.delta":
+            return str(chunk_json.get("delta") or "")
+
+        ollama_message = chunk_json.get("message")
+        if isinstance(ollama_message, dict) and isinstance(ollama_message.get("content"), str):
+            return ollama_message["content"]
+        if isinstance(chunk_json.get("response"), str):
+            return chunk_json["response"]
+        return ""
+
+    @staticmethod
     def get_google_model_fallback_chain(model_id: str) -> List[str]:
         """Returns the requested Google Gemini model first, followed by deduplicated fallbacks."""
         normalized_model = (model_id or jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL).strip()
@@ -2138,121 +2475,233 @@ class VisionBrainService(QObject):
         extractor: jarvis_response_parser.StreamingSentenceExtractor,
         turn_generation: int,
         allow_visual_notes: bool,
+        endpoint_url: str = "",
+        wire_protocol: str = "",
     ) -> Tuple[bool, bool, str]:
-        """Streams one vision turn against either Google Gemini or River AI.
+        """Streams one vision turn against any OpenAI-compatible, Google Gemini, or Anthropic endpoint.
 
         Returns `(succeeded, emitted_any_chunk, error_message)`.
         """
-        provider_label = "Google Gemini" if provider_name == "google" else "River AI"
+        active_protocol = wire_protocol or (
+            "google"
+            if provider_name == "google"
+            else (
+                "anthropic"
+                if provider_name == "anthropic"
+                else jarvis_config.detect_wire_protocol(endpoint_url, model_id, "")
+            )
+        )
+        if endpoint_url:
+            provider_label = jarvis_config.infer_provider_name(endpoint_url, model_id, "")
+        else:
+            provider_label = (
+                "Google Gemini"
+                if active_protocol == "google"
+                else ("Anthropic" if active_protocol == "anthropic" else "River AI")
+            )
+
         candidate_models = (
             self.get_google_model_fallback_chain(model_id)
-            if provider_name == "google"
+            if (active_protocol == "google" and (not endpoint_url or "generativelanguage.googleapis.com" in endpoint_url.lower()))
             else [model_id]
         )
 
         emitted_any_chunk = False
         last_error_message = f"{provider_label} request failed."
         turn_max_tokens = 1100 if allow_visual_notes else 750
+
         for candidate_index, candidate_model in enumerate(candidate_models):
-            if self._generation_id != turn_generation:
-                return (False, emitted_any_chunk, "Turn cancelled.")
+            attachment_modes = [True, False] if jpeg_b64 else [False]
+            for include_images in attachment_modes:
+                if self._generation_id != turn_generation:
+                    return (False, emitted_any_chunk, "Turn cancelled.")
 
-            if provider_name == "google":
-                request_url = self.GOOGLE_GEMINI_STREAM_URL_TEMPLATE.format(model_id=candidate_model)
-                request_headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
-                request_json = self.build_google_gemini_payload(
-                    system_prompt=system_prompt,
-                    history_messages=filtered_history,
-                    request_user_text=request_user_text,
-                    jpeg_b64=jpeg_b64,
-                    lasso_crop_b64=lasso_crop_b64,
-                    max_output_tokens=turn_max_tokens,
-                )
-            else:
-                river_messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-                river_messages.extend(filtered_history)
-                user_content: Any
-                if jpeg_b64:
-                    user_content = [
-                        {"type": "text", "text": request_user_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{jpeg_b64}"}},
-                    ]
-                    if lasso_crop_b64:
-                        user_content.append(
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{lasso_crop_b64}"}}
+                step_jpeg = jpeg_b64 if include_images else ""
+                step_lasso = lasso_crop_b64 if include_images else ""
+
+                if active_protocol == "google":
+                    base_google_template = endpoint_url or self.GOOGLE_GEMINI_STREAM_URL_TEMPLATE
+                    if "{model_id}" in base_google_template:
+                        request_url = base_google_template.format(model_id=candidate_model)
+                    else:
+                        request_url = jarvis_config.normalize_endpoint_url(
+                            base_google_template,
+                            "google",
+                            candidate_model,
                         )
+                    request_headers: Dict[str, str] = {"Content-Type": "application/json"}
+                    if api_key:
+                        request_headers["x-goog-api-key"] = api_key
+                    request_json = self.build_google_gemini_payload(
+                        system_prompt=system_prompt,
+                        history_messages=filtered_history,
+                        request_user_text=request_user_text,
+                        jpeg_b64=step_jpeg,
+                        lasso_crop_b64=step_lasso,
+                        max_output_tokens=turn_max_tokens,
+                    )
+                elif active_protocol == "anthropic":
+                    request_url = endpoint_url or "https://api.anthropic.com/v1/messages"
+                    request_headers = {
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    }
+                    if api_key:
+                        request_headers["x-api-key"] = api_key
+                    request_json = self.build_anthropic_messages_payload(
+                        system_prompt=system_prompt,
+                        history_messages=filtered_history,
+                        request_user_text=request_user_text,
+                        jpeg_b64=step_jpeg,
+                        lasso_crop_b64=step_lasso,
+                        max_output_tokens=turn_max_tokens,
+                        model_id=candidate_model,
+                    )
                 else:
-                    user_content = request_user_text
-                river_messages.append({"role": "user", "content": user_content})
-                request_url = self.RIVER_CHAT_URL
-                request_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-                request_json = {
-                    "model": candidate_model,
-                    "messages": river_messages,
-                    "max_tokens": turn_max_tokens,
-                    "stream": True,
-                    "reasoning_effort": "none",
-                }
+                    openai_messages: List[Dict[str, Any]] = []
+                    if (system_prompt or "").strip():
+                        openai_messages.append({"role": "system", "content": system_prompt})
+                    openai_messages.extend(filtered_history)
+                    if step_jpeg:
+                        user_content: Any = [
+                            {"type": "text", "text": request_user_text},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{step_jpeg}"}},
+                        ]
+                        if step_lasso:
+                            user_content.append(
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{step_lasso}"}}
+                            )
+                    else:
+                        user_content = request_user_text
+                    openai_messages.append({"role": "user", "content": user_content})
 
-            try:
-                with requests.post(
-                    request_url,
-                    headers=request_headers,
-                    json=request_json,
-                    stream=True,
-                    timeout=45,
-                ) as response:
-                    if not response.ok:
-                        error_text = response.text[:240]
-                        last_error_message = f"{provider_label} error {response.status_code}: {error_text}"
-                        has_more_candidates = (candidate_index + 1) < len(candidate_models)
-                        if (
-                            provider_name == "google"
-                            and (not emitted_any_chunk)
-                            and response.status_code in (400, 404)
-                            and has_more_candidates
-                        ):
-                            continue
-                        return (False, emitted_any_chunk, last_error_message)
-
-                    response.encoding = "utf-8"
-                    for raw_line in response.iter_lines(decode_unicode=True):
-                        if self._generation_id != turn_generation:
-                            return (False, emitted_any_chunk, "Turn cancelled.")
-                        if not raw_line or not raw_line.startswith("data: "):
-                            continue
-                        data_str = raw_line[6:].strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            chunk_json = json.loads(data_str)
-                        except Exception:
-                            continue
-                        if isinstance(chunk_json, dict) and isinstance(chunk_json.get("error"), dict):
-                            api_err_msg = str(chunk_json["error"].get("message") or chunk_json["error"])[:240]
-                            return (False, emitted_any_chunk, f"{provider_label} error: {api_err_msg}")
-                        if provider_name == "google":
-                            delta_text = self.extract_google_sse_delta_text(chunk_json)
+                    request_url = endpoint_url or self.RIVER_CHAT_URL
+                    url_lower = request_url.lower()
+                    request_headers = {"Content-Type": "application/json"}
+                    if api_key:
+                        if ("openai.azure.com" in url_lower) or ("api-version=" in url_lower):
+                            request_headers["api-key"] = api_key
                         else:
-                            delta_text = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        if not delta_text:
-                            continue
+                            request_headers["Authorization"] = f"Bearer {api_key}"
+                    if "openrouter.ai" in url_lower:
+                        request_headers["HTTP-Referer"] = "https://heyclicky.com"
+                        request_headers["X-Title"] = "Jarvis"
+                    request_json = {
+                        "model": candidate_model,
+                        "messages": openai_messages,
+                        "max_tokens": turn_max_tokens,
+                        "stream": True,
+                    }
+                    if "api.river.ai" in url_lower:
+                        request_json["reasoning_effort"] = "none"
 
-                        emitted_any_chunk = True
-                        new_sentences, new_commands = extractor.feed_delta(delta_text)
-                        for cmd in new_commands:
-                            if not allow_visual_notes and cmd.kind in ("paper", "underline"):
+                try:
+                    with requests.post(
+                        request_url,
+                        headers=request_headers,
+                        json=request_json,
+                        stream=True,
+                        timeout=45,
+                    ) as response:
+                        if not response.ok:
+                            error_text = response.text[:240]
+                            last_error_message = f"{provider_label} error {response.status_code}: {error_text}"
+                            if (not emitted_any_chunk) and include_images and response.status_code in (400, 422):
+                                # Text-only models (e.g. DeepSeek direct, some Groq/Ollama models) reject image_url; retry text-only once
                                 continue
-                            self.drawingCommandReady.emit(cmd)
-                        for sentence in new_sentences:
-                            self.sentenceReady.emit(sentence)
-                        display_so_far = extractor.current_display_text()
-                        if display_so_far:
-                            self.partialTextUpdated.emit(display_so_far)
+                            has_more_candidates = (candidate_index + 1) < len(candidate_models)
+                            if (
+                                active_protocol == "google"
+                                and (not emitted_any_chunk)
+                                and response.status_code in (400, 404)
+                                and has_more_candidates
+                            ):
+                                break
+                            return (False, emitted_any_chunk, last_error_message)
 
-                return (True, emitted_any_chunk, "")
-            except Exception as err:
-                return (False, emitted_any_chunk, f"Could not reach {provider_label}: {err}")
+                        response.encoding = "utf-8"
+                        plain_json_lines: List[str] = []
+                        saw_sse_prefix = False
+                        for raw_line in response.iter_lines(decode_unicode=True):
+                            if self._generation_id != turn_generation:
+                                return (False, emitted_any_chunk, "Turn cancelled.")
+                            if not raw_line:
+                                continue
+                            stripped_line = raw_line.strip()
+                            if stripped_line.startswith("data:"):
+                                saw_sse_prefix = True
+                                data_str = stripped_line[5:].strip()
+                                if data_str == "[DONE]":
+                                    break
+                            elif stripped_line.startswith("event:"):
+                                saw_sse_prefix = True
+                                continue
+                            elif (not saw_sse_prefix) and stripped_line.startswith("{"):
+                                try:
+                                    chunk_json = json.loads(stripped_line)
+                                except Exception:
+                                    plain_json_lines.append(raw_line)
+                                    continue
+                                data_str = ""
+                            else:
+                                if not saw_sse_prefix:
+                                    plain_json_lines.append(raw_line)
+                                continue
+
+                            if stripped_line.startswith("data:"):
+                                try:
+                                    chunk_json = json.loads(data_str)
+                                except Exception:
+                                    continue
+
+                            if isinstance(chunk_json, dict) and isinstance(chunk_json.get("error"), dict):
+                                api_err_msg = str(chunk_json["error"].get("message") or chunk_json["error"])[:240]
+                                return (False, emitted_any_chunk, f"{provider_label} error: {api_err_msg}")
+
+                            delta_text = self.extract_universal_sse_delta_text(chunk_json, active_protocol)
+                            if not delta_text:
+                                continue
+
+                            emitted_any_chunk = True
+                            new_sentences, new_commands = extractor.feed_delta(delta_text)
+                            for cmd in new_commands:
+                                if not allow_visual_notes and cmd.kind in ("paper", "underline"):
+                                    continue
+                                self.drawingCommandReady.emit(cmd)
+                            for sentence in new_sentences:
+                                self.sentenceReady.emit(sentence)
+                            display_so_far = extractor.current_display_text()
+                            if display_so_far:
+                                self.partialTextUpdated.emit(display_so_far)
+
+                        if (not emitted_any_chunk) and (not saw_sse_prefix) and plain_json_lines:
+                            try:
+                                complete_payload = json.loads("\n".join(plain_json_lines))
+                            except Exception:
+                                complete_payload = None
+                            if isinstance(complete_payload, dict):
+                                if isinstance(complete_payload.get("error"), dict):
+                                    api_err_msg = str(
+                                        complete_payload["error"].get("message") or complete_payload["error"]
+                                    )[:240]
+                                    return (False, emitted_any_chunk, f"{provider_label} error: {api_err_msg}")
+                                fallback_text = self.extract_universal_sse_delta_text(complete_payload, active_protocol)
+                                if fallback_text:
+                                    emitted_any_chunk = True
+                                    new_sentences, new_commands = extractor.feed_delta(fallback_text)
+                                    for cmd in new_commands:
+                                        if not allow_visual_notes and cmd.kind in ("paper", "underline"):
+                                            continue
+                                        self.drawingCommandReady.emit(cmd)
+                                    for sentence in new_sentences:
+                                        self.sentenceReady.emit(sentence)
+                                    display_so_far = extractor.current_display_text()
+                                    if display_so_far:
+                                        self.partialTextUpdated.emit(display_so_far)
+
+                    return (True, emitted_any_chunk, "")
+                except Exception as err:
+                    return (False, emitted_any_chunk, f"Could not reach {provider_label}: {err}")
 
         return (False, emitted_any_chunk, last_error_message)
 
@@ -2337,13 +2786,13 @@ class VisionBrainService(QObject):
         live_screen_context: str = "",
         suppress_visual_notes: bool = False,
     ) -> None:
-        provider_name, active_model_id, api_key = self.resolve_active_vision_provider_and_model(
-            self._settings_store
-        )
-        if not api_key:
+        vision_endpoints = self.resolve_all_vision_endpoints(self._settings_store)
+        if not vision_endpoints:
             self._is_running = False
             if self._generation_id == turn_generation:
-                self.turnFailed.emit("Google Gemini or River AI API key is missing in .env.")
+                self.turnFailed.emit(
+                    "No chat/vision API endpoint or key is configured in Studio & Keys or .env."
+                )
             return
 
         jpeg_b64 = ""
@@ -2439,55 +2888,32 @@ class VisionBrainService(QObject):
         extractor = jarvis_response_parser.StreamingSentenceExtractor(scale_x=scale_x, scale_y=scale_y)
 
         try:
-            stream_ok, emitted_any_chunk, stream_error_message = self._stream_vision_provider_once(
-                provider_name=provider_name,
-                model_id=active_model_id,
-                api_key=api_key,
-                system_prompt=system_prompt,
-                filtered_history=filtered_history,
-                request_user_text=request_user_text,
-                jpeg_b64=jpeg_b64,
-                lasso_crop_b64=lasso_crop_b64,
-                extractor=extractor,
-                turn_generation=turn_generation,
-                allow_visual_notes=allow_visual_notes,
-            )
-            if (
-                (not stream_ok)
-                and (not emitted_any_chunk)
-                and self._generation_id == turn_generation
-            ):
-                google_backup_key = self._settings_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
-                river_backup_key = self._settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
-                backup_provider = ""
-                backup_model = ""
-                backup_key = ""
-                if provider_name == "google" and river_backup_key:
-                    backup_provider = "river"
-                    backup_model = "deepseek-ai/DeepSeek-V4.1-Flash"
-                    backup_key = river_backup_key
-                elif provider_name == "river" and google_backup_key:
-                    backup_provider = "google"
-                    backup_model = jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL
-                    backup_key = google_backup_key
-
-                if backup_provider and backup_key:
+            stream_ok = False
+            stream_error_message = "Vision request failed."
+            for endpoint_index, endpoint_cfg in enumerate(vision_endpoints):
+                if self._generation_id != turn_generation:
+                    return
+                if endpoint_index > 0:
                     extractor = jarvis_response_parser.StreamingSentenceExtractor(
                         scale_x=scale_x, scale_y=scale_y
                     )
-                    stream_ok, _backup_emitted, stream_error_message = self._stream_vision_provider_once(
-                        provider_name=backup_provider,
-                        model_id=backup_model,
-                        api_key=backup_key,
-                        system_prompt=system_prompt,
-                        filtered_history=filtered_history,
-                        request_user_text=request_user_text,
-                        jpeg_b64=jpeg_b64,
-                        lasso_crop_b64=lasso_crop_b64,
-                        extractor=extractor,
-                        turn_generation=turn_generation,
-                        allow_visual_notes=allow_visual_notes,
-                    )
+                stream_ok, emitted_any_chunk, stream_error_message = self._stream_vision_provider_once(
+                    provider_name=endpoint_cfg["provider_label"],
+                    model_id=endpoint_cfg["model_id"],
+                    api_key=endpoint_cfg["api_key"],
+                    system_prompt=system_prompt,
+                    filtered_history=filtered_history,
+                    request_user_text=request_user_text,
+                    jpeg_b64=jpeg_b64,
+                    lasso_crop_b64=lasso_crop_b64,
+                    extractor=extractor,
+                    turn_generation=turn_generation,
+                    allow_visual_notes=allow_visual_notes,
+                    endpoint_url=endpoint_cfg["endpoint_url"],
+                    wire_protocol=endpoint_cfg["wire_protocol"],
+                )
+                if stream_ok or emitted_any_chunk or self._generation_id != turn_generation:
+                    break
 
             if not stream_ok:
                 if self._generation_id == turn_generation:

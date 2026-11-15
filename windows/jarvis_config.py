@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QObject, Signal
 
@@ -21,13 +21,89 @@ USER_SETTINGS_FILE_PATH = os.path.join(WINDOWS_DIRECTORY, "user_settings.json")
 ENV_FILE_PATH = os.path.join(PROJECT_ROOT_DIRECTORY, ".env")
 
 # Names of the secrets the app understands, as they appear in .env.
+SECRET_CUSTOM_API_KEY = "CUSTOM_API_KEY"
+CUSTOM_API_KEY_ALIASES = (
+    "CUSTOM_API_KEY",
+    "LLM_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GROQ_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "TOGETHER_API_KEY",
+    "MISTRAL_API_KEY",
+    "XAI_API_KEY",
+    "FIREWORKS_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "NVIDIA_API_KEY",
+    "API_KEY",
+)
+ENV_ENDPOINT_URL_ALIASES = (
+    "CUSTOM_API_BASE_URL",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "LLM_BASE_URL",
+    "LLM_API_BASE",
+    "API_BASE_URL",
+    "API_ENDPOINT",
+    "OPENROUTER_BASE_URL",
+    "OLLAMA_BASE_URL",
+    "ANTHROPIC_BASE_URL",
+    "GEMINI_BASE_URL",
+    "BASE_URL",
+)
+ENV_CUSTOM_MODEL_ALIASES = (
+    "CUSTOM_MODEL",
+    "LLM_MODEL",
+    "OPENAI_MODEL",
+    "MODEL_NAME",
+    "MODEL_ID",
+)
 SECRET_GOOGLE_API_KEY = "GOOGLE_API_KEY"
 GOOGLE_API_KEY_ALIASES = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_AI_API_KEY")
 SECRET_RIVER_API_KEY = "RIVER_AI_API"
 SECRET_ASSEMBLYAI_API_KEY = "ASSEMBLYAI_API_KEY"
 SECRET_ELEVENLABS_API_KEY = "ELEVENLABS_API_KEY"  # Legacy fallback constant kept only for backward compatibility
-ALL_SECRET_NAMES = [SECRET_GOOGLE_API_KEY, SECRET_RIVER_API_KEY, SECRET_ASSEMBLYAI_API_KEY]
+ALL_SECRET_NAMES = [
+    SECRET_CUSTOM_API_KEY,
+    SECRET_GOOGLE_API_KEY,
+    SECRET_RIVER_API_KEY,
+    SECRET_ASSEMBLYAI_API_KEY,
+]
 DEFAULT_GOOGLE_CHAT_MODEL = "gemini-3.8-flash"
+
+KNOWN_PROVIDER_ENDPOINTS: Dict[str, str] = {
+    "OPENAI_API_KEY": "https://api.openai.com/v1/chat/completions",
+    "OPENROUTER_API_KEY": "https://openrouter.ai/api/v1/chat/completions",
+    "GROQ_API_KEY": "https://api.groq.com/openai/v1/chat/completions",
+    "DEEPSEEK_API_KEY": "https://api.deepseek.com/v1/chat/completions",
+    "ANTHROPIC_API_KEY": "https://api.anthropic.com/v1/messages",
+    "TOGETHER_API_KEY": "https://api.together.xyz/v1/chat/completions",
+    "MISTRAL_API_KEY": "https://api.mistral.ai/v1/chat/completions",
+    "XAI_API_KEY": "https://api.x.ai/v1/chat/completions",
+    "FIREWORKS_API_KEY": "https://api.fireworks.ai/inference/v1/chat/completions",
+    "PERPLEXITY_API_KEY": "https://api.perplexity.ai/chat/completions",
+    "NVIDIA_API_KEY": "https://integrate.api.nvidia.com/v1/chat/completions",
+    "RIVER_AI_API": "https://api.river.ai/v1/chat/completions",
+    "GOOGLE_API_KEY": "https://generativelanguage.googleapis.com/v1beta/models/{model_id}:streamGenerateContent?alt=sse",
+    "GEMINI_API_KEY": "https://generativelanguage.googleapis.com/v1beta/models/{model_id}:streamGenerateContent?alt=sse",
+    "GOOGLE_AI_API_KEY": "https://generativelanguage.googleapis.com/v1beta/models/{model_id}:streamGenerateContent?alt=sse",
+}
+
+DEFAULT_MODEL_FOR_KEY_ALIAS: Dict[str, str] = {
+    "OPENAI_API_KEY": "gpt-4o",
+    "OPENROUTER_API_KEY": "openai/gpt-4o",
+    "GROQ_API_KEY": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "DEEPSEEK_API_KEY": "deepseek-chat",
+    "ANTHROPIC_API_KEY": "claude-sonnet-4-20250514",
+    "TOGETHER_API_KEY": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "MISTRAL_API_KEY": "pixtral-large-latest",
+    "XAI_API_KEY": "grok-2-vision-1212",
+    "FIREWORKS_API_KEY": "accounts/fireworks/models/llama4-maverick-instruct-basic",
+    "PERPLEXITY_API_KEY": "sonar",
+    "NVIDIA_API_KEY": "meta/llama-3.2-90b-vision-instruct",
+}
 
 # AssemblyAI Neural TTS voices (`AssemblyAI-TTS-1`, 24 kHz mono WAV via https://tts.us.assemblyai.com/v1/speech).
 ASSEMBLYAI_TTS_VOICES: List[Dict[str, str]] = [
@@ -59,21 +135,205 @@ DRAWING_SPEED_CHOICES: List[Dict[str, str]] = [
     {"speed_id": "normal", "name": "Standard (0.55s stroke)"},
 ]
 
-# Vision-capable chat models on Google Gemini and River AI.
+# Vision-capable chat models across Google Gemini, OpenAI, Anthropic, River AI, and custom endpoints.
 CHAT_MODEL_CHOICES: List[Dict[str, str]] = [
     {"model_id": "gemini-4-hydrogen", "name": "Google Gemini 4 Hydrogen (vision & reasoning)", "provider": "google"},
     {"model_id": "gemini-3.8-flash", "name": "Google Gemini 3.8 Flash (fast, sees screen)", "provider": "google"},
     {"model_id": "gemini-2.5-flash", "name": "Google Gemini 2.5 Flash (sees screen)", "provider": "google"},
     {"model_id": "gemini-2.5-pro", "name": "Google Gemini 2.5 Pro (reasoning + vision)", "provider": "google"},
+    {"model_id": "gpt-4o", "name": "OpenAI GPT-4o (vision & agent)", "provider": "openai"},
+    {"model_id": "gpt-4.1-mini", "name": "OpenAI GPT-4.1 Mini (fast vision)", "provider": "openai"},
+    {"model_id": "claude-sonnet-4-20250514", "name": "Anthropic Claude Sonnet 4 (vision)", "provider": "anthropic"},
+    {"model_id": "claude-3-7-sonnet-latest", "name": "Anthropic Claude 3.7 Sonnet (vision)", "provider": "anthropic"},
+    {"model_id": "deepseek-chat", "name": "DeepSeek Chat (universal / Direct API)", "provider": "deepseek"},
     {"model_id": "deepseek-ai/DeepSeek-V4.1-Flash", "name": "DeepSeek V4.1 Flash — River AI (sees screen)", "provider": "river"},
     {"model_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "name": "DeepSeek V4.1 Flash 1017 — River AI", "provider": "river"},
 ]
 
 
 def is_google_gemini_model(model_id: str) -> bool:
-    """Returns True when `model_id` targets Google Gemini rather than River AI."""
+    """Returns True when `model_id` targets Google Gemini directly."""
     normalized_model = (model_id or "").strip().lower()
     return normalized_model.startswith(("gemini", "google/", "models/gemini"))
+
+
+def is_anthropic_model(model_id: str) -> bool:
+    """Returns True when `model_id` targets Anthropic Claude Messages API."""
+    normalized_model = (model_id or "").strip().lower()
+    return normalized_model.startswith(("claude", "anthropic/")) or ("claude-" in normalized_model)
+
+
+def detect_wire_protocol(
+    endpoint_url: str,
+    model_id: str = "",
+    key_source_name: str = "",
+) -> str:
+    """Infers wire protocol ('google', 'anthropic', or 'openai') from URL, key alias, and model ID."""
+    url_lower = (endpoint_url or "").strip().lower()
+    model_lower = (model_id or "").strip().lower()
+    alias_upper = (key_source_name or "").strip().upper()
+
+    openai_proxy_hosts = (
+        "openrouter.ai",
+        "api.river.ai",
+        "together.xyz",
+        "fireworks.ai",
+        "groq.com",
+        "api.openai.com",
+        "openai.azure.com",
+        "api.deepseek.com",
+        "api.mistral.ai",
+        "api.x.ai",
+        "api.perplexity.ai",
+        "integrate.api.nvidia.com",
+        "/v1beta/openai",
+    )
+    if any(proxy_host in url_lower for proxy_host in openai_proxy_hosts):
+        return "openai"
+
+    if (
+        ("generativelanguage.googleapis.com" in url_lower)
+        or (":generatecontent" in url_lower)
+        or (":streamgeneratecontent" in url_lower)
+    ):
+        return "google"
+
+    if ("api.anthropic.com" in url_lower) or url_lower.endswith("/v1/messages") or ("/messages" in url_lower):
+        return "anthropic"
+
+    if url_lower.endswith("/chat/completions") or ("/chat/completions" in url_lower):
+        return "openai"
+
+    if alias_upper == "ANTHROPIC_API_KEY":
+        return "anthropic"
+    if alias_upper in GOOGLE_API_KEY_ALIASES:
+        return "google"
+
+    if not url_lower:
+        if is_anthropic_model(model_lower):
+            return "anthropic"
+        if is_google_gemini_model(model_lower):
+            return "google"
+    else:
+        if is_anthropic_model(model_lower):
+            return "anthropic"
+        if "gemini" in url_lower and is_google_gemini_model(model_lower):
+            return "google"
+
+    return "openai"
+
+
+def infer_provider_name(
+    endpoint_url: str = "",
+    model_id: str = "",
+    key_source_name: str = "",
+) -> str:
+    """Returns a friendly provider label inferred from URL, key alias, or model ID."""
+    url_lower = (endpoint_url or "").strip().lower()
+    alias_upper = (key_source_name or "").strip().upper()
+    if "generativelanguage.googleapis.com" in url_lower or alias_upper in GOOGLE_API_KEY_ALIASES:
+        return "Google Gemini"
+    if "api.anthropic.com" in url_lower or alias_upper == "ANTHROPIC_API_KEY":
+        return "Anthropic"
+    if "api.river.ai" in url_lower or alias_upper == "RIVER_AI_API":
+        return "River AI"
+    if "openrouter.ai" in url_lower or alias_upper == "OPENROUTER_API_KEY":
+        return "OpenRouter"
+    if "api.openai.com" in url_lower or alias_upper == "OPENAI_API_KEY":
+        return "OpenAI"
+    if "openai.azure.com" in url_lower or alias_upper == "AZURE_OPENAI_API_KEY":
+        return "Azure OpenAI"
+    if "groq.com" in url_lower or alias_upper == "GROQ_API_KEY":
+        return "Groq"
+    if "api.deepseek.com" in url_lower or alias_upper == "DEEPSEEK_API_KEY":
+        return "DeepSeek"
+    if "together.xyz" in url_lower or alias_upper == "TOGETHER_API_KEY":
+        return "Together AI"
+    if "mistral.ai" in url_lower or alias_upper == "MISTRAL_API_KEY":
+        return "Mistral"
+    if "api.x.ai" in url_lower or alias_upper == "XAI_API_KEY":
+        return "xAI"
+    if "fireworks.ai" in url_lower or alias_upper == "FIREWORKS_API_KEY":
+        return "Fireworks"
+    if "perplexity.ai" in url_lower or alias_upper == "PERPLEXITY_API_KEY":
+        return "Perplexity"
+    if "nvidia.com" in url_lower or alias_upper == "NVIDIA_API_KEY":
+        return "NVIDIA NIM"
+    if ("11434" in url_lower) or ("ollama" in url_lower):
+        return "Ollama"
+    if "1234" in url_lower:
+        return "LM Studio"
+    if url_lower:
+        return "Custom API"
+    if is_google_gemini_model(model_id):
+        return "Google Gemini"
+    if is_anthropic_model(model_id):
+        return "Anthropic"
+    return "Custom API"
+
+
+def normalize_endpoint_url(
+    raw_url: str,
+    wire_protocol: str = "openai",
+    model_id: str = "",
+) -> str:
+    """Normalizes a base URL or full endpoint URL into an executable chat/vision endpoint."""
+    cleaned_url = (raw_url or "").strip().rstrip("/")
+    if not cleaned_url:
+        return ""
+    clean_model = (model_id or "gpt-4o").strip()
+    if clean_model.startswith("models/"):
+        clean_model = clean_model[len("models/"):]
+    url_lower = cleaned_url.lower()
+
+    if wire_protocol == "google":
+        if "{model_id}" in cleaned_url:
+            cleaned_url = cleaned_url.replace("{model_id}", clean_model)
+            url_lower = cleaned_url.lower()
+        if (":streamgeneratecontent" in url_lower) or (":generatecontent" in url_lower):
+            if (":streamgeneratecontent" in url_lower) and ("alt=" not in url_lower):
+                separator = "&" if ("?" in cleaned_url) else "?"
+                return f"{cleaned_url}{separator}alt=sse"
+            return cleaned_url
+        if url_lower.endswith("/models"):
+            return f"{cleaned_url}/{clean_model}:streamGenerateContent?alt=sse"
+        if url_lower.endswith(("/v1beta", "/v1")):
+            return f"{cleaned_url}/models/{clean_model}:streamGenerateContent?alt=sse"
+        return f"{cleaned_url}/v1beta/models/{clean_model}:streamGenerateContent?alt=sse"
+
+    if wire_protocol == "anthropic":
+        if url_lower.endswith("/messages"):
+            return cleaned_url
+        if url_lower.endswith("/v1"):
+            return f"{cleaned_url}/messages"
+        return f"{cleaned_url}/v1/messages"
+
+    # OpenAI-compatible wire protocol
+    if ("openai.azure.com" in url_lower) or ("api-version=" in url_lower):
+        if "/chat/completions" in url_lower:
+            return cleaned_url
+        if "/deployments/" not in url_lower:
+            return f"{cleaned_url}/openai/deployments/{clean_model}/chat/completions?api-version=2024-10-21"
+        return f"{cleaned_url}/chat/completions?api-version=2024-10-21"
+
+    if url_lower.endswith(("/chat/completions", "/completions", "/responses")):
+        return cleaned_url
+
+    if ("api.groq.com" in url_lower) and url_lower.endswith("/openai"):
+        return f"{cleaned_url}/v1/chat/completions"
+
+    if url_lower.endswith(("/v1", "/v2", "/v3", "/v4", "/api/v1", "/inference/v1", "/openai", "/v1beta/openai", "/compatible-mode/v1")):
+        return f"{cleaned_url}/chat/completions"
+
+    scheme_split = cleaned_url.split("://", 1)
+    host_and_path = scheme_split[1] if len(scheme_split) == 2 else cleaned_url
+    has_non_empty_path = ("/" in host_and_path) and bool(host_and_path.split("/", 1)[1].strip("/"))
+    if not has_non_empty_path:
+        if "api.perplexity.ai" in url_lower:
+            return f"{cleaned_url}/chat/completions"
+        return f"{cleaned_url}/v1/chat/completions"
+
+    return cleaned_url
 
 DICTATION_LANGUAGE_CHOICES: List[Dict[str, str]] = [
     {"code": "en", "name": "English"},
@@ -113,6 +373,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "dictation_custom_words": ["Jarvis", "Jarvis"],
     # Brain & Agent
     "chat_model": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "custom_api_base_url": "",
     "remember_style_notes": [],
     "agent_actions_enabled": True,
     # General
@@ -167,10 +428,16 @@ class SettingsStore(QObject):
     settingChanged = Signal(str, object)
     secretChanged = Signal(str)
 
-    def __init__(self, settings_file_path: str = USER_SETTINGS_FILE_PATH, env_file_path: str = ENV_FILE_PATH) -> None:
+    def __init__(
+        self,
+        settings_file_path: str = USER_SETTINGS_FILE_PATH,
+        env_file_path: str = ENV_FILE_PATH,
+        use_process_env: bool = True,
+    ) -> None:
         super().__init__()
         self._settings_file_path = settings_file_path
         self._env_file_path = env_file_path
+        self._use_process_env = use_process_env
         self._lock = threading.RLock()
         self._values: Dict[str, Any] = dict(DEFAULT_SETTINGS)
         self._secrets: Dict[str, str] = {}
@@ -197,12 +464,19 @@ class SettingsStore(QObject):
         if self._values.get("voice_id") not in known_voice_ids:
             self._values["voice_id"] = DEFAULT_SETTINGS["voice_id"]
         self._secrets = read_env_file(self._env_file_path)
-        if (
-            (not explicit_model_saved)
-            and self.has_secret(SECRET_GOOGLE_API_KEY)
-            and (not self.has_secret(SECRET_RIVER_API_KEY))
-        ):
-            self._values["chat_model"] = DEFAULT_GOOGLE_CHAT_MODEL
+        env_model_override = self.get_env_custom_model()
+        if (not explicit_model_saved) and env_model_override:
+            self._values["chat_model"] = env_model_override
+        elif not explicit_model_saved:
+            custom_key_value, custom_key_alias = self.get_custom_secret_with_name()
+            if (
+                self.has_secret(SECRET_GOOGLE_API_KEY)
+                and (not self.has_secret(SECRET_RIVER_API_KEY))
+                and (not custom_key_value)
+            ):
+                self._values["chat_model"] = DEFAULT_GOOGLE_CHAT_MODEL
+            elif custom_key_value and (not self.has_secret(SECRET_RIVER_API_KEY)) and (not self.has_secret(SECRET_GOOGLE_API_KEY)):
+                self._values["chat_model"] = DEFAULT_MODEL_FOR_KEY_ALIAS.get(custom_key_alias, "gpt-4o")
 
     def _save(self) -> None:
         temporary_path = self._settings_file_path + ".tmp"
@@ -233,20 +507,95 @@ class SettingsStore(QObject):
 
     # -- secrets -------------------------------------------------------------
 
+    def _has_dotenv_vision_config_locked(self) -> bool:
+        if str(self._values.get("custom_api_base_url", "") or "").strip():
+            return True
+        all_dotenv_vision_keys = (
+            CUSTOM_API_KEY_ALIASES
+            + GOOGLE_API_KEY_ALIASES
+            + ENV_ENDPOINT_URL_ALIASES
+            + (SECRET_RIVER_API_KEY,)
+        )
+        return any(bool(self._secrets.get(alias_name, "").strip()) for alias_name in all_dotenv_vision_keys)
+
     def get_secret(self, secret_name: str) -> str:
         with self._lock:
+            allow_env_vision_fallback = self._use_process_env and (not self._has_dotenv_vision_config_locked())
             if secret_name == SECRET_GOOGLE_API_KEY:
                 for alias_name in GOOGLE_API_KEY_ALIASES:
                     stored_secret = self._secrets.get(alias_name, "").strip()
                     if stored_secret:
                         return stored_secret
-                for alias_name in GOOGLE_API_KEY_ALIASES:
+                if allow_env_vision_fallback:
+                    for alias_name in GOOGLE_API_KEY_ALIASES:
+                        environment_override = os.environ.get(alias_name, "").strip()
+                        if environment_override:
+                            return environment_override
+                return ""
+            if secret_name == SECRET_CUSTOM_API_KEY:
+                custom_secret, _matched_alias = self._lookup_custom_secret_locked()
+                return custom_secret
+            stored_direct = self._secrets.get(secret_name, "").strip()
+            if stored_direct:
+                return stored_direct
+            if secret_name == SECRET_RIVER_API_KEY and not allow_env_vision_fallback:
+                return ""
+            if self._use_process_env:
+                return os.environ.get(secret_name, "").strip()
+            return ""
+
+    def _lookup_custom_secret_locked(self) -> Tuple[str, str]:
+        for alias_name in CUSTOM_API_KEY_ALIASES:
+            stored_secret = self._secrets.get(alias_name, "").strip()
+            if stored_secret:
+                return stored_secret, alias_name
+        if self._use_process_env and (not self._has_dotenv_vision_config_locked()):
+            for alias_name in CUSTOM_API_KEY_ALIASES:
+                environment_override = os.environ.get(alias_name, "").strip()
+                if environment_override:
+                    return environment_override, alias_name
+        return "", ""
+
+    def get_custom_secret_with_name(self) -> Tuple[str, str]:
+        with self._lock:
+            return self._lookup_custom_secret_locked()
+
+    def get_effective_endpoint_url(self) -> str:
+        with self._lock:
+            configured_url = str(self._values.get("custom_api_base_url", "") or "").strip()
+            if configured_url:
+                return configured_url
+            for alias_name in ENV_ENDPOINT_URL_ALIASES:
+                stored_url = self._secrets.get(alias_name, "").strip()
+                if stored_url:
+                    return stored_url
+            if self._use_process_env and (not self._has_dotenv_vision_config_locked()):
+                for alias_name in ENV_ENDPOINT_URL_ALIASES:
                     environment_override = os.environ.get(alias_name, "").strip()
                     if environment_override:
                         return environment_override
-                return ""
-            environment_override = os.environ.get(secret_name, "").strip()
-            return self._secrets.get(secret_name, "") or environment_override
+            return ""
+
+    def get_env_custom_model(self) -> str:
+        with self._lock:
+            for alias_name in ENV_CUSTOM_MODEL_ALIASES:
+                stored_model = self._secrets.get(alias_name, "").strip()
+                if stored_model:
+                    return stored_model
+            if self._use_process_env and (not self._has_dotenv_vision_config_locked()):
+                for alias_name in ENV_CUSTOM_MODEL_ALIASES:
+                    environment_override = os.environ.get(alias_name, "").strip()
+                    if environment_override:
+                        return environment_override
+            return ""
+
+    def has_any_vision_credentials(self) -> bool:
+        return bool(
+            self.get_secret(SECRET_CUSTOM_API_KEY)
+            or self.get_secret(SECRET_GOOGLE_API_KEY)
+            or self.get_secret(SECRET_RIVER_API_KEY)
+            or self.get_effective_endpoint_url()
+        )
 
     def set_secret(self, secret_name: str, secret_value: str) -> None:
         secret_value = secret_value.strip()

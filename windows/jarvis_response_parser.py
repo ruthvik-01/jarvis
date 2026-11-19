@@ -11,14 +11,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import re
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import jarvis_roamies_core
 
 
 @dataclass
 class DrawingCommand:
-    """Single 2D drawing instruction emitted by the vision model."""
+    """Single 2D/3D drawing or companion action instruction emitted by the vision model."""
 
-    kind: str  # "underline" | "ring" | "point" | "box" | "paper" | "highlight" | "scroll" | agent action
+    kind: str  # "underline" | "ring" | "point" | "box" | "paper" | "highlight" | "scroll" | agent action | Roamies card
     x: float = 0.0
     y: float = 0.0
     width: float = 0.0
@@ -29,6 +31,7 @@ class DrawingCommand:
     body: str = ""
     tone: str = "blue"
     sentence_index: int = -1
+    extra_data: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -41,6 +44,9 @@ class ParsedTurnResponse:
     primary_point_target: Optional[Tuple[float, float, str]] = None
     scroll_direction: Optional[str] = None
     scroll_amount: int = 0
+    last_emotion_feel: Optional[str] = None
+    sentence_emotions: Dict[int, str] = field(default_factory=dict)
+    sentence_spoken_raw: Dict[int, str] = field(default_factory=dict)
 
 
 _POINT_TAG_PATTERN = re.compile(
@@ -51,6 +57,8 @@ _POINT_TAG_PATTERN = re.compile(
 _COMMAND_NAMES_PATTERN = (
     r"(underline|ring|point|box|frame|paper|highlight|scroll|"
     r"target|strike|check|cross|num|connect|spotlight|edit_drawing|photo|"
+    r"hover|trace|line|curve|arrow|circle|rect|write|label|emote|sfx|button|walkthrough_step|"
+    r"model3d|molecule|graph|map|geometry|sources|clip|legend|ticket|medal|"
     r"open_browser|open_url|search_web|open_app|press_keys|type_text|"
     r"open_side_by_side|window_action|set_clipboard|write_file|system_control|"
     r"run_shell_read|request_admin_permission|"
@@ -59,7 +67,9 @@ _COMMAND_NAMES_PATTERN = (
     r"read_window|list_windows|act_in_app|find_text_on_screen|search_files|list_files|"
     r"plan_steps|remember_commitment|snooze_reminder|list_commitments|show_list|"
     r"start_focus|stop_focus|save_skill|use_skill|forget_skill|install_skill|"
-    r"schedule_job|list_jobs|learn_fact|forget_fact)"
+    r"schedule_job|list_jobs|learn_fact|forget_fact|"
+    r"add_connection|remove_connection|connection_tools|use_connection|"
+    r"send_agent|tell_agent|stop_agent|answer_agent|agent_report|about_jarvis)"
 )
 
 _CALL_LINE_PATTERN = re.compile(
@@ -619,6 +629,12 @@ def build_vision_system_prompt(
     live_screen_context: str = "",
     suppress_visual_notes: bool = False,
     system_telemetry_summary: str = "",
+    companion_look: str = "jarvis",
+    lite_mode: bool = False,
+    mcp_live_text: str = "",
+    subagent_crew_text: str = "",
+    morning_briefing_note: str = "",
+    voice_cues_enabled: bool = True,
 ) -> str:
     """
     Constructs the system prompt for Jarvis's single-brain screen companion.
@@ -627,9 +643,22 @@ def build_vision_system_prompt(
     (`0..screen_width` x `0..screen_height`) so drawing coordinates align accurately
     with visible text, equations, ChatGPT sections, and buttons.
     """
+    if lite_mode:
+        lite_sections = [jarvis_roamies_core.build_lite_system_prompt(look_id=companion_look)]
+        if morning_briefing_note:
+            lite_sections.append(morning_briefing_note)
+        if memory_context and memory_context.strip():
+            lite_sections.append("Session Notes:\n" + memory_context.strip())
+        return "\n\n".join(lite_sections)
+
+    persona = jarvis_roamies_core.LOOK_PERSONAS.get(
+        (companion_look or "jarvis").strip().lower(),
+        jarvis_roamies_core.LOOK_PERSONAS["jarvis"],
+    )
     normalized_mode = (drawing_mode or "lines_and_card").strip().lower()
     prompt_sections: List[str] = [
-        "You are J.A.R.V.I.S. — the user's personal AI assistant, study mentor, problem-solving partner, and visual-thinking tutor on Windows.",
+        f"You are {persona['name']} ({persona['body']}) — the user's personal AI assistant, study mentor, problem-solving partner, and visual-thinking tutor on Windows.",
+        f"Persona Tone: {persona['style_prompt']}",
         "Communication Style: explain everything in simple, natural, human English like a helpful friend rather than a strict professor. Avoid corporate jargon; expand abbreviations into full forms on first use (e.g., Human Resource Management (HRM)). Be honest and verify facts carefully — politely correct misconceptions and preserve the exact terminology and topic order of the user's visible syllabus, question bank, notes, or code. If the user says 'next 2 topics', continue in order from the next two topics.",
         "Preferred Teaching Sequence & Depth: Simple Explanation -> Visual Representation -> Explain Connections (What, Why, When, Who, How, What happens next) -> Practical Real-Life Example -> Pattern Recognition / Exam-Ready Structure -> Quick Memory Clue.",
         "Exam & Coding Modes: For 2-mark questions give a tight definition + key points + memory hook. For 5-Mark questions give exact question/meaning, side headings, numbered points, practical example, and short conclusion. For 10-Mark questions give deep structured sections with examples and takeaways. For programming/DSA, explain the logic and pattern first, then show clean minimal fixes preserving the user's original approach.",
@@ -648,6 +677,15 @@ def build_vision_system_prompt(
         "",
         "Visual-Thinking & Screen Drawing Commands:",
     ]
+
+    if voice_cues_enabled:
+        prompt_sections.insert(
+            3,
+            "Voice Delivery Cues: You may optionally begin spoken sentences with a short emotion cue like [warm], [excited], [thoughtful], [curious], or [encouraging] so Jarvis inflects its voice and facial expression; they are stripped automatically from displayed text.",
+        )
+
+    if morning_briefing_note:
+        prompt_sections.insert(4, morning_briefing_note)
 
     if suppress_visual_notes:
         prompt_sections.extend(
@@ -680,6 +718,12 @@ def build_vision_system_prompt(
                 "- Clickable quiz question (for 'test me' requests): `quiz: What is LIFO? ? Stack | Queue | Heap *Stack :: Last In First Out`",
                 "- Interactive checklist: `list: [ ] Review OS notes ; [x] Finish labs`",
                 "- Photo illustration: `photo: Human heart anatomy :: Cross-section diagram`",
+                "- Animated 3D model: `3d: Internal Combustion Piston` or `model3d(x, y, width, height, \"Title\", json_parts)`",
+                "- 2D SMILES molecule: `molecule: c1ccccc1 :: Benzene Ring` or `molecule(x, y, w, h, \"Caffeine\", \"CN1C=NC2=C1C(=O)N(C(=O)N2C)C\")`",
+                "- 2D Graph / Chart: `graph(x, y, w, h, \"Growth\", \"{\\\"plots\\\":[{\\\"points\\\":[[0,1],[1,4],[2,9]]}]}\")`",
+                "- World/Region Map: `map(x, y, w, h, \"Europe\", \"{\\\"region\\\":\\\"europe\\\",\\\"pins\\\":[{\\\"name\\\":\\\"Paris\\\",\\\"lat\\\":48.85,\\\"lon\\\":2.35}]}\")`",
+                "- Euclidean Geometry: `geometry(x, y, w, h, \"Triangle\", \"{\\\"vertices\\\":[{\\\"id\\\":\\\"A\\\",\\\"x\\\":0,\\\"y\\\":0},{\\\"id\\\":\\\"B\\\",\\\"x\\\":4,\\\"y\\\":0},{\\\"id\\\":\\\"C\\\",\\\"x\\\":2,\\\"y\\\":3}],\\\"lines\\\":[{\\\"from\\\":\\\"A\\\",\\\"to\\\":\\\"B\\\"},{\\\"from\\\":\\\"B\\\",\\\"to\\\":\\\"C\\\"},{\\\"from\\\":\\\"C\\\",\\\"to\\\":\\\"A\\\"}]}\")`",
+                "- Interactive cards & actions: `button(x, y, \"Try demo\", \"ask|Explain more\")`, `walkthrough_step(x, y, radius, \"Click Export\", \"click\")`, `emote(\"hype|wave|remind\")`, `sfx(\"pop|done|focus\")`",
                 "- Section header: `section: Section Title` and Document icon node: `doc: Real Example`",
                 "- Memory clue / pattern footer: `clue: Short Memory Trick or Pattern (e.g. I-P-O)`",
                 "Card 1 (`top-left`): paper(24, 92, 310, 270, \"Structure Visual\", \"Visual Map\", \"Input -> Process -> Output | tree: Concept > Part A, Part B | clue:I-P-O\")",
@@ -732,6 +776,8 @@ def build_vision_system_prompt(
                 "save_skill(\"Skill Name\", \"When to use it\", \"1. Step one\\n2. Step two\") / use_skill(\"Skill Name\") / forget_skill(\"Skill Name\") / install_skill(\"owner/repo\", \"skill\")",
                 "schedule_job(\"Morning summary\", \"Check AI news\", \"at 9am\", \"daily\") / list_jobs()",
                 "learn_fact(\"User is studying BTech CSE\") / forget_fact(\"CSE\")",
+                "add_connection(\"linear\", \"https://mcp.linear.app/mcp\") / connection_tools(\"linear\") / use_connection(\"linear\", \"list_issues\", \"{}\") / remove_connection(\"linear\")",
+                "send_agent(\"Research latest Python 3.13 JIT benchmarks\", \"scout\") / tell_agent(\"id\", \"focus on Windows\") / stop_agent(\"id\")",
                 "request_admin_permission(\"action title\", \"risk explanation\")",
                 "Example when user says 'put VS Code and Edge side by side':",
                 "open_side_by_side(\"Visual Studio Code\", \"Microsoft Edge\")",
@@ -793,6 +839,15 @@ def build_vision_system_prompt(
         prompt_sections.append("")
         prompt_sections.append("Windows System Telemetry:")
         prompt_sections.append(system_telemetry_summary.strip())
+
+    if subagent_crew_text and subagent_crew_text.strip():
+        prompt_sections.append("")
+        prompt_sections.append(subagent_crew_text.strip())
+
+    if mcp_live_text and mcp_live_text.strip():
+        prompt_sections.append("")
+        prompt_sections.append("Connected MCP Tools:")
+        prompt_sections.append(mcp_live_text.strip())
 
     if memory_context and memory_context.strip():
         prompt_sections.append("")
@@ -1285,6 +1340,72 @@ def parse_command_line(
             body=primary_value,
         )
 
+    if command_name in ("emote", "sfx", "about_jarvis", "agent_report", "stop_agent", "connection_tools"):
+        primary_arg = _parse_string(arguments[0], "").strip() if arguments else ""
+        secondary_arg = _parse_string(arguments[1], "").strip() if len(arguments) >= 2 else ""
+        return DrawingCommand(
+            kind=command_name,
+            label=primary_arg or command_name,
+            body=primary_arg,
+            header=secondary_arg,
+        )
+
+    if command_name in ("add_connection", "remove_connection", "use_connection", "send_agent", "tell_agent", "answer_agent"):
+        arg_one = _parse_string(arguments[0], "").strip() if arguments else ""
+        arg_two = _parse_string(arguments[1], "").strip() if len(arguments) >= 2 else ""
+        arg_three = _parse_string(arguments[2], "").strip() if len(arguments) >= 3 else ""
+        if not arg_one:
+            return None
+        return DrawingCommand(
+            kind=command_name,
+            label=arg_one,
+            header=arg_two,
+            body=arg_three,
+            extra_data={"subagent": arg_two, "args_json": arg_three},
+        )
+
+    if command_name in ("model3d", "molecule", "graph", "map", "geometry", "sources", "clip", "legend", "ticket", "medal"):
+        if len(arguments) >= 6:
+            card_x = _parse_float(arguments[0], 40.0) * scale_x
+            card_y = _parse_float(arguments[1], 92.0) * scale_y
+            card_w = max(220.0, _parse_float(arguments[2], 340.0) * scale_x)
+            card_h = max(180.0, _parse_float(arguments[3], 270.0) * scale_y)
+            card_title = _parse_string(arguments[4], command_name.title())
+            payload_str = _parse_string(arguments[5], "")
+            tone_val = _parse_string(arguments[6], "blue").lower() if len(arguments) >= 7 else "blue"
+        else:
+            card_x = 1140.0 * scale_x
+            card_y = 92.0 * scale_y
+            card_w = 340.0 * scale_x
+            card_h = 270.0 * scale_y
+            card_title = _parse_string(arguments[0], command_name.title()) if len(arguments) >= 1 else command_name.title()
+            payload_str = _parse_string(arguments[1], arguments[0] if arguments else "") if len(arguments) >= 2 else (_parse_string(arguments[0], "") if arguments else "")
+            tone_val = "blue"
+        directive_tag = {
+            "model3d": "3d",
+            "molecule": "molecule",
+            "graph": "graph",
+            "map": "map",
+            "geometry": "geometry",
+            "sources": "sources",
+            "clip": "clip",
+            "legend": "legend",
+            "ticket": "ticket",
+            "medal": "medal",
+        }[command_name]
+        return DrawingCommand(
+            kind="paper",
+            x=card_x,
+            y=card_y,
+            width=card_w,
+            height=card_h,
+            label=card_title,
+            header=command_name.upper(),
+            body=f"{directive_tag}: {payload_str}",
+            tone=tone_val,
+            extra_data={"card_subtype": directive_tag, "raw_payload": payload_str, "keep_card": True},
+        )
+
     if len(arguments) < 2:
         return None
 
@@ -1295,7 +1416,8 @@ def parse_command_line(
         width = max(24.0, _parse_float(arguments[2], 180.0) * scale_x) if len(arguments) >= 3 else 180.0
         label = _parse_string(arguments[3]) if len(arguments) >= 4 else ""
         tone = _parse_string(arguments[4], "blue").lower() if len(arguments) >= 5 else "blue"
-        return DrawingCommand(kind="underline", x=coord_x, y=coord_y, width=width, label=label, tone=tone)
+        every_flag = any(str(opt_arg).strip().lower() in ("every", "every=true", "all") for opt_arg in arguments[4:])
+        return DrawingCommand(kind="underline", x=coord_x, y=coord_y, width=width, label=label, tone=tone, extra_data={"every": every_flag})
 
     if command_name == "strike":
         width = max(24.0, _parse_float(arguments[2], 160.0) * scale_x) if len(arguments) >= 3 else 160.0
@@ -1307,7 +1429,8 @@ def parse_command_line(
         radius = max(14.0, _parse_float(arguments[2], 32.0) * ((scale_x + scale_y) * 0.5)) if len(arguments) >= 3 else 32.0
         label = _parse_string(arguments[3]) if len(arguments) >= 4 else ""
         tone = _parse_string(arguments[4], "blue").lower() if len(arguments) >= 5 else "blue"
-        return DrawingCommand(kind=command_name, x=coord_x, y=coord_y, radius=radius, label=label, tone=tone)
+        every_flag = any(str(opt_arg).strip().lower() in ("every", "every=true", "all") for opt_arg in arguments[4:])
+        return DrawingCommand(kind=command_name, x=coord_x, y=coord_y, radius=radius, label=label, tone=tone, extra_data={"every": every_flag})
 
     if command_name in ("point", "check", "cross", "num"):
         label = _parse_string(arguments[2]) if len(arguments) >= 3 else ""
@@ -1346,6 +1469,69 @@ def parse_command_line(
             tone=tone,
         )
 
+    if command_name in (
+        "hover",
+        "trace",
+        "line",
+        "curve",
+        "arrow",
+        "circle",
+        "rect",
+        "write",
+        "label",
+    ):
+        arg_x = _parse_float(arguments[0], 400.0) * scale_x if len(arguments) >= 1 else 400.0
+        arg_y = _parse_float(arguments[1], 300.0) * scale_y if len(arguments) >= 2 else 300.0
+        if command_name in ("hover", "write", "label"):
+            text_val = _parse_string(arguments[2], "") if len(arguments) >= 3 else ""
+            tone_val = _parse_string(arguments[3], "blue").lower() if len(arguments) >= 4 else "blue"
+            return DrawingCommand(kind=command_name, x=arg_x, y=arg_y, label=text_val, body=text_val, tone=tone_val)
+        arg_w = _parse_float(arguments[2], 140.0) * scale_x if len(arguments) >= 3 else 140.0
+        arg_h = _parse_float(arguments[3], 60.0) * scale_y if len(arguments) >= 4 else 60.0
+        text_val = _parse_string(arguments[4], "") if len(arguments) >= 5 else ""
+        tone_val = _parse_string(arguments[5], "blue").lower() if len(arguments) >= 6 else "blue"
+        return DrawingCommand(
+            kind=command_name,
+            x=arg_x,
+            y=arg_y,
+            width=arg_w,
+            height=arg_h,
+            label=text_val,
+            tone=tone_val,
+        )
+
+    if command_name == "button":
+        arg_x = _parse_float(arguments[0], 400.0) * scale_x if len(arguments) >= 1 else 400.0
+        arg_y = _parse_float(arguments[1], 300.0) * scale_y if len(arguments) >= 2 else 300.0
+        btn_text = _parse_string(arguments[2], "Continue") if len(arguments) >= 3 else "Continue"
+        btn_action = _parse_string(arguments[3], f"ask|{btn_text}") if len(arguments) >= 4 else f"ask|{btn_text}"
+        return DrawingCommand(
+            kind="button",
+            x=arg_x,
+            y=arg_y,
+            width=max(110.0, len(btn_text) * 8.5 + 32.0),
+            height=34.0,
+            label=btn_text,
+            body=btn_action,
+            extra_data={"action_spec": btn_action},
+        )
+
+    if command_name == "walkthrough_step":
+        arg_x = _parse_float(arguments[0], 400.0) * scale_x if len(arguments) >= 1 else 400.0
+        arg_y = _parse_float(arguments[1], 300.0) * scale_y if len(arguments) >= 2 else 300.0
+        rad_val = max(16.0, _parse_float(arguments[2], 32.0) * ((scale_x + scale_y) * 0.5)) if len(arguments) >= 3 else 32.0
+        lbl_val = _parse_string(arguments[3], "Click here") if len(arguments) >= 4 else "Click here"
+        wait_val = _parse_string(arguments[4], "click").lower() if len(arguments) >= 5 else "click"
+        return DrawingCommand(
+            kind="walkthrough_step",
+            x=arg_x,
+            y=arg_y,
+            radius=rad_val,
+            label=lbl_val,
+            body=wait_val,
+            extra_data={"wait_mode": wait_val},
+        )
+
     if command_name == "paper":
         width = max(200.0, _parse_float(arguments[2], 330.0) * scale_x) if len(arguments) >= 3 else 330.0
         height = max(180.0, _parse_float(arguments[3], 360.0) * scale_y) if len(arguments) >= 4 else 360.0
@@ -1353,6 +1539,7 @@ def parse_command_line(
         header = _parse_string(arguments[5], "") if len(arguments) >= 6 else ""
         body = _parse_string(arguments[6], "") if len(arguments) >= 7 else ""
         tone = _parse_string(arguments[7], "blue").lower() if len(arguments) >= 8 else "blue"
+        keep_flag = any(str(opt_arg).strip().lower() in ("keep", "keep=true", "pin") for opt_arg in arguments[8:])
         return DrawingCommand(
             kind="paper",
             x=coord_x,
@@ -1363,6 +1550,7 @@ def parse_command_line(
             header=header,
             body=body,
             tone=tone,
+            extra_data={"keep_card": keep_flag},
         )
 
     return None
@@ -1585,20 +1773,35 @@ def parse_model_response(
             done_sentences, pending_prose_buffer = _split_complete_sentences(combined_prose)
             sentences_completed_so_far.extend(done_sentences)
 
-    full_spoken = " ".join(spoken_lines).strip()
-    sentences, remainder = _split_complete_sentences(full_spoken)
-    if remainder:
-        sentences.append(remainder)
+    raw_spoken = " ".join(spoken_lines).strip()
+    display_spoken = jarvis_roamies_core.strip_voice_cues_for_display(raw_spoken) or raw_spoken
+    raw_sentences, raw_rem = _split_complete_sentences(raw_spoken)
+    if raw_rem:
+        raw_sentences.append(raw_rem)
+    sentences: List[str] = []
+    sent_emotions: Dict[int, str] = {}
+    sent_raw_map: Dict[int, str] = {}
+    last_feel: Optional[str] = None
+    for s_idx, raw_sent in enumerate(raw_sentences):
+        feel_val = jarvis_roamies_core.cue_feel(raw_sent)
+        if feel_val:
+            sent_emotions[s_idx] = feel_val
+            last_feel = feel_val
+        sent_raw_map[s_idx] = raw_sent
+        sentences.append(jarvis_roamies_core.strip_voice_cues_for_display(raw_sent) or raw_sent)
 
     align_commands_with_sentences(commands, sentences)
     scroll_direction, scroll_amount = _extract_scroll_intent(commands)
     return ParsedTurnResponse(
-        spoken_text=full_spoken,
+        spoken_text=display_spoken,
         sentences=sentences,
         commands=commands,
         primary_point_target=_choose_primary_point_target(commands),
         scroll_direction=scroll_direction,
         scroll_amount=scroll_amount,
+        last_emotion_feel=last_feel,
+        sentence_emotions=sent_emotions,
+        sentence_spoken_raw=sent_raw_map,
     )
 
 
@@ -1642,6 +1845,9 @@ class StreamingSentenceExtractor:
         self._next_unassigned_underline_sentence_index = 0
         self.all_commands: List[DrawingCommand] = []
         self.all_sentences: List[str] = []
+        self.sentence_emotions: Dict[int, str] = {}
+        self.sentence_spoken_raw: Dict[int, str] = {}
+        self.last_emotion_feel: Optional[str] = None
         self.spoken_text = ""
 
     def _assign_sentence_index_to_command(self, cmd_item: DrawingCommand) -> None:
@@ -1868,6 +2074,9 @@ class StreamingSentenceExtractor:
             primary_point_target=_choose_primary_point_target(self.all_commands),
             scroll_direction=scroll_direction,
             scroll_amount=scroll_amount,
+            last_emotion_feel=self.last_emotion_feel,
+            sentence_emotions=dict(self.sentence_emotions),
+            sentence_spoken_raw=dict(self.sentence_spoken_raw),
         )
 
     def _consume_complete_line(self, raw_line: str) -> Tuple[List[str], List[DrawingCommand]]:
@@ -1900,9 +2109,16 @@ class StreamingSentenceExtractor:
         return new_sentences, inline_commands
 
     def _record_sentence(self, sentence: str, output_list: List[str]) -> None:
-        cleaned = sentence.strip()
-        if not cleaned:
+        raw_cleaned = sentence.strip()
+        if not raw_cleaned:
             return
-        output_list.append(cleaned)
-        self.all_sentences.append(cleaned)
-        self.spoken_text = f"{self.spoken_text} {cleaned}".strip() if self.spoken_text else cleaned
+        detected_feel = jarvis_roamies_core.cue_feel(raw_cleaned)
+        display_cleaned = jarvis_roamies_core.strip_voice_cues_for_display(raw_cleaned) or raw_cleaned
+        sent_idx = len(self.all_sentences)
+        if detected_feel:
+            self.sentence_emotions[sent_idx] = detected_feel
+            self.last_emotion_feel = detected_feel
+        self.sentence_spoken_raw[sent_idx] = raw_cleaned
+        output_list.append(display_cleaned)
+        self.all_sentences.append(display_cleaned)
+        self.spoken_text = f"{self.spoken_text} {display_cleaned}".strip() if self.spoken_text else display_cleaned

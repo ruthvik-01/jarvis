@@ -17,8 +17,8 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QObject, QTimer, Signal
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtCore import QObject, QPointF, QRectF, QTimer, Signal
+from PySide6.QtGui import QAction, QCursor, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 import jarvis_config
@@ -26,6 +26,8 @@ import jarvis_main_window
 import jarvis_notch_window
 import jarvis_overlay_windows
 import jarvis_response_parser
+import jarvis_roamies_core
+import jarvis_roamies_visuals
 import jarvis_services
 import jarvis_theme
 
@@ -38,6 +40,7 @@ class JarvisApplicationController(QObject):
     _agentSequenceCompleted = Signal(str)
     _webLookupContextReady = Signal(str, str, int)
     _brainAgentResultReady = Signal(str, str, str, bool)
+    _subagentArtifactReady = Signal(str, str, list)
 
     def __init__(self, settings_store: Optional[jarvis_config.SettingsStore] = None) -> None:
         super().__init__()
@@ -53,6 +56,10 @@ class JarvisApplicationController(QObject):
         self.skills_service = jarvis_services.SkillsManagerService()
         self.jobs_service = jarvis_services.ScheduledJobsService()
         self.facts_service = jarvis_services.LearnedFactsService()
+        self.dpapi_store = jarvis_roamies_core.WindowsDPAPISecretStore()
+        self.mcp_manager = jarvis_roamies_core.MCPConnectionManager(dpapi_store=self.dpapi_store)
+        self.subagent_manager = jarvis_roamies_core.SubagentCrewManager()
+        self.wake_word_service = jarvis_services.WakeWordService(self.settings_store)
         self.mic_service = jarvis_services.MicrophoneStreamService(self.settings_store)
         self.tts_service = jarvis_services.StreamingTTSService(self.settings_store)
         self.brain_service = jarvis_services.VisionBrainService(self.settings_store)
@@ -61,6 +68,10 @@ class JarvisApplicationController(QObject):
         self.notch_window = jarvis_notch_window.NotchWindow(self.settings_store)
         self.overlay_window = jarvis_overlay_windows.OverlayCanvasWindow(self.settings_store)
         self.main_window = jarvis_main_window.JarvisMainWindow(self.settings_store)
+        self.cursor_ask_bar = jarvis_roamies_visuals.CursorAskBarWindow()
+        self.risky_approval_bar = jarvis_roamies_visuals.RiskyActionApprovalBar()
+        self.artifact_toast = jarvis_roamies_visuals.AgentArtifactToastWindow()
+        jarvis_services.DesktopAgentService.configure_safety_settings(self.settings_store)
 
         self._tray_icon: Optional[QSystemTrayIcon] = None
         self._agent_monitor_timer = QTimer(self)
@@ -94,6 +105,18 @@ class JarvisApplicationController(QObject):
         self._executed_agent_command_in_turn = False
         self._pending_admin_request: Optional[jarvis_services.AdminPermissionRequest] = None
         self._brain_agent_queue: queue.Queue = queue.Queue()
+        self._pending_approval_command: Optional[jarvis_response_parser.DrawingCommand] = None
+        self._pending_approval_key: str = ""
+        self._last_queued_agent_command: Optional[jarvis_response_parser.DrawingCommand] = None
+        self._walkthrough_queue: List[jarvis_response_parser.DrawingCommand] = []
+        self._keep_listening_timer = QTimer(self)
+        self._keep_listening_timer.setSingleShot(True)
+        self._keep_listening_timer.timeout.connect(self._on_keep_listening_timeout)
+        self._last_sync_ts: float = 0.0
+        self._executed_agent_kinds_in_turn: List[str] = []
+        self._companion_hidden_override: bool = False
+        self._last_turn_ended_with_question: bool = False
+        self._last_due_commitment_id: str = ""
         self._quitting = False
 
         self._populate_microphone_devices()
@@ -121,6 +144,15 @@ class JarvisApplicationController(QObject):
         self.hotkey_service.escapePressed.connect(self._on_escape_pressed)
         self.hotkey_service.leftArrowPressed.connect(self._on_left_arrow_pressed)
         self.hotkey_service.rightArrowPressed.connect(self._on_right_arrow_pressed)
+        self.hotkey_service.askBarTapped.connect(self._on_ask_bar_tapped)
+        self.hotkey_service.askAreaPressed.connect(self.start_interactive_lasso_session)
+        self.hotkey_service.showHidePressed.connect(self._on_show_hide_companion_toggled)
+
+        # Wake word & floating interactive visuals
+        self.wake_word_service.wakeWordHeard.connect(self._on_wake_word_heard)
+        self.cursor_ask_bar.promptSubmitted.connect(self._on_cursor_ask_bar_submitted)
+        self.risky_approval_bar.decisionMade.connect(self._on_risky_approval_decision)
+        self._subagentArtifactReady.connect(self._on_subagent_artifact_ready)
 
         # Microphone STT
         self.mic_service.audioLevelChanged.connect(self._on_mic_audio_level)
@@ -137,6 +169,9 @@ class JarvisApplicationController(QObject):
 
         # Streaming TTS
         self.tts_service.sentenceStarted.connect(self._on_tts_sentence_started)
+        self.tts_service.sentenceEmotionDetected.connect(
+            lambda feel_name: self.overlay_window.set_emotion_feel(feel_name, hold_seconds=4.5)
+        )
         self.tts_service.audioLevelChanged.connect(self._on_tts_audio_level)
         self.tts_service.speechWordProgress.connect(self._on_tts_word_progress)
         self.tts_service.speechFinished.connect(self._on_tts_finished)
@@ -163,6 +198,11 @@ class JarvisApplicationController(QObject):
         self.overlay_window.interactiveLassoCompleted.connect(self._on_interactive_lasso_completed)
         self.overlay_window.strokeAnimationStarted.connect(self._on_stroke_animation_started)
         self.overlay_window.strokeAnimationFinished.connect(self.sound_player.stop_drawing_sound)
+        self.overlay_window.cardSavedAsImage.connect(self._on_card_saved_as_image)
+        self.overlay_window.checklistItemToggled.connect(self._on_overlay_checklist_toggled)
+        self.overlay_window.actionPillTriggered.connect(self._on_overlay_action_pill_triggered)
+        self.overlay_window.quizAnswered.connect(self._on_overlay_quiz_answered)
+        self.overlay_window.walkthroughStepCompleted.connect(self._on_walkthrough_step_completed)
 
         # Main Window
         self.main_window.promptSubmitted.connect(self._on_main_window_prompt_submitted)
@@ -254,6 +294,7 @@ class JarvisApplicationController(QObject):
         if not auto_demo:
             self._agent_monitor_timer.start()
             self._companion_tick_timer.start()
+            self.wake_word_service.start()
         self.sound_player.play_earcon("reveal-boot", volume=0.45)
 
         if auto_demo:
@@ -268,14 +309,20 @@ class JarvisApplicationController(QObject):
             return
         self._quitting = True
         self._agent_worker_generation += 1
+        self._keep_listening_timer.stop()
         self._agent_monitor_timer.stop()
         self._companion_tick_timer.stop()
+        self.wake_word_service.stop()
         self.memory_service.record_action("shutdown", "Jarvis", "Application session ended")
         self.aboutToQuit.emit()
 
         self.hotkey_service.stop()
         self.brain_service.stop_current_turn()
         self.tts_service.stop_speaking()
+        try:
+            self._brain_agent_queue.put_nowait(None)
+        except Exception:
+            pass
 
         if self._tray_icon is not None:
             self._tray_icon.hide()
@@ -283,8 +330,18 @@ class JarvisApplicationController(QObject):
         self.main_window.allow_real_close()
         self.main_window.close()
         self.notch_window.close()
+        self.cursor_ask_bar.close()
+        self.risky_approval_bar.close()
+        self.artifact_toast.close()
         self.overlay_window.clear_button_window.close()
         self.overlay_window.close()
+        self.main_window.deleteLater()
+        self.notch_window.deleteLater()
+        self.cursor_ask_bar.deleteLater()
+        self.risky_approval_bar.deleteLater()
+        self.artifact_toast.deleteLater()
+        self.overlay_window.clear_button_window.deleteLater()
+        self.overlay_window.deleteLater()
 
         qt_app = QApplication.instance()
         if qt_app is not None:
@@ -339,10 +396,13 @@ class JarvisApplicationController(QObject):
     def _on_screen_monitor_tick(self) -> None:
         if self._quitting or not bool(self.settings_store.get("agent_actions_enabled", True)):
             return
+        self.overlay_window.set_game_mode_parked(jarvis_services.is_fullscreen_game_active())
         self.screen_monitor.poll_once()
 
     def _on_foreground_window_changed(self, window_title: str) -> None:
         self.memory_service.record_screen_observation(window_title, "Foreground window active")
+        if bool(self.settings_store.get("auto_clear_drawings_on_app_switch", False)):
+            self.overlay_window.clear_unpinned_drawings()
 
     def _cancel_scroll_explain_sequence(self) -> None:
         """Stop any multi-step scroll-and-explain walkthrough and invalidate pending timers."""
@@ -436,16 +496,25 @@ class JarvisApplicationController(QObject):
 
     def _on_setting_changed(self, key_name: str, new_value: object) -> None:
         self.overlay_window.on_setting_changed(key_name, new_value)
+        if key_name in (
+            "allow_file_edits",
+            "allow_shell_commands",
+            "allow_app_control",
+            "skip_allow_prompts",
+        ):
+            jarvis_services.DesktopAgentService.configure_safety_settings(self.settings_store)
 
     # -----------------------------------------------------------------------
     # Hotkey Handlers
     # -----------------------------------------------------------------------
 
     def _on_ptt_pressed(self) -> None:
+        self._keep_listening_timer.stop()
         self._cancel_scroll_explain_sequence()
         self.overlay_window.cancel_interactive_lasso_mode()
         self.tts_service.stop_speaking()
         self.brain_service.stop_current_turn()
+        self.wake_word_service.set_paused(True)
         self.sound_player.play_earcon("jarvis-question", volume=0.5)
 
         self._active_voice_mode = "ptt"
@@ -455,19 +524,35 @@ class JarvisApplicationController(QObject):
         self.overlay_window.set_cursor_visual_state(listening=True, thinking=False, speaking=False)
         if self.settings_store.get("screen_highlight_enabled", True):
             self.overlay_window.begin_highlight_stroke()
+        if self.settings_store.get("circle_while_talking_enabled", True):
+            self.overlay_window.start_circle_talk_trace()
         self.mic_service.start_streaming()
 
     def _on_ptt_released(self) -> None:
         if self._active_voice_mode != "ptt":
             return
+        self._keep_listening_timer.stop()
         self.overlay_window.set_cursor_visual_state(listening=False, thinking=False, speaking=False)
         self._last_highlight_points = self.overlay_window.end_highlight_stroke()
+        circle_bounds = self.overlay_window.finish_circle_talk_trace()
+        if circle_bounds is not None and len(self._last_highlight_points) < 4:
+            bound_x, bound_y, bound_w, bound_h = [float(coord) for coord in circle_bounds]
+            self._last_highlight_points = [
+                (bound_x, bound_y),
+                (bound_x + bound_w, bound_y),
+                (bound_x + bound_w, bound_y + bound_h),
+                (bound_x, bound_y + bound_h),
+                (bound_x, bound_y),
+            ]
+        self.wake_word_service.set_paused(False)
         self.mic_service.stop_and_finalize()
 
     def _on_dictate_pressed(self) -> None:
+        self._keep_listening_timer.stop()
         self._cancel_scroll_explain_sequence()
         self.overlay_window.cancel_interactive_lasso_mode()
         self.tts_service.stop_speaking()
+        self.wake_word_service.set_paused(True)
         self.sound_player.play_earcon("jarvis-text-open", volume=0.45)
         self._active_voice_mode = "dictate"
         self.notch_window.set_live_transcript("")
@@ -477,6 +562,7 @@ class JarvisApplicationController(QObject):
     def _on_dictate_released(self) -> None:
         if self._active_voice_mode != "dictate":
             return
+        self.wake_word_service.set_paused(False)
         self.mic_service.stop_and_finalize()
 
     def _on_left_arrow_pressed(self) -> None:
@@ -487,12 +573,61 @@ class JarvisApplicationController(QObject):
         if self.notch_window.current_mode() == jarvis_notch_window.NotchVisualMode.HOME_PEEK:
             self.notch_window.cycle_arc_card(1)
 
+    def _on_ask_bar_tapped(self) -> None:
+        if not bool(self.settings_store.get("ask_bar_tap_enabled", True)):
+            return
+        screen_rect = QRectF(self.overlay_window.geometry())
+        cursor_pos = QPointF(QCursor.pos())
+        self.cursor_ask_bar.open_at_cursor(cursor_pos, screen_rect)
+
+    def _on_cursor_ask_bar_submitted(self, prompt_text: str) -> None:
+        cleaned_prompt = (prompt_text or "").strip()
+        if not cleaned_prompt:
+            return
+        speak = bool(self.settings_store.get("typed_turns_respond_with_voice", False))
+        self._start_turn(prompt_text=cleaned_prompt, speak_reply=speak, from_typed_notch=False)
+
+    def _on_show_hide_companion_toggled(self) -> None:
+        self._companion_hidden_override = not self._companion_hidden_override
+        if self._companion_hidden_override:
+            self.overlay_window.hide()
+            if bool(self.settings_store.get("quiet_when_hidden", True)):
+                self.tts_service.stop_speaking()
+            self.notch_window.set_mode(jarvis_notch_window.NotchVisualMode.IDLE)
+        else:
+            self.overlay_window.show()
+            self.overlay_window.raise_()
+            self.sound_player.play_earcon("jarvis-text-open", volume=0.35)
+
+    def _on_wake_word_heard(self, remainder_text: str) -> None:
+        if self._quitting or self._active_voice_mode != "idle":
+            return
+        cleaned = (remainder_text or "").strip()
+        if cleaned and len(cleaned.split()) >= 2:
+            self.sound_player.play_earcon("jarvis-question", volume=0.45)
+            self._start_turn(prompt_text=cleaned, speak_reply=True, from_typed_notch=False)
+        else:
+            self._on_ptt_pressed()
+
+    def _on_keep_listening_timeout(self) -> None:
+        if self._active_voice_mode == "ptt":
+            self._on_ptt_released()
+
     def _on_escape_pressed(self) -> None:
         self._active_voice_mode = "idle"
         self._agent_worker_generation += 1
+        self._keep_listening_timer.stop()
+        self._last_turn_ended_with_question = False
         self._pending_admin_request = None
+        self._pending_approval_command = None
+        self._pending_approval_key = ""
+        self._walkthrough_queue.clear()
         self._pending_direct_agent_commands = []
         self._cancel_scroll_explain_sequence()
+        self.wake_word_service.set_paused(False)
+        self.cursor_ask_bar.hide()
+        self.risky_approval_bar.hide()
+        self.overlay_window.cancel_walkthrough_wait()
         self.overlay_window.cancel_interactive_lasso_mode()
         self.tts_service.stop_speaking()
         self.sound_player.stop_drawing_sound()
@@ -617,8 +752,32 @@ class JarvisApplicationController(QObject):
         self._current_spoken_sentence_text = ""
 
         self._executed_agent_command_in_turn = False
+        self._executed_agent_kinds_in_turn = []
+        self._last_turn_ended_with_question = False
+        self._keep_listening_timer.stop()
+        self._walkthrough_queue.clear()
+        self.overlay_window.cancel_walkthrough_wait()
         agent_actions_enabled = bool(self.settings_store.get("agent_actions_enabled", True))
         self._pending_direct_agent_commands = []
+
+        if not preserve_scroll_session and self._last_due_commitment_id:
+            snooze_mins = jarvis_roamies_core.parse_voice_snooze_request(prompt_text)
+            if snooze_mins is not None:
+                snoozed_ok = self.commitments_service.snooze_commitment(
+                    self._last_due_commitment_id,
+                    minutes=float(snooze_mins),
+                )
+                if snoozed_ok:
+                    self._last_due_commitment_id = ""
+                    reply_msg = f"Got it, snoozed that reminder for {int(snooze_mins)} minutes."
+                    self.main_window.append_chat_message("user", prompt_text)
+                    self.main_window.append_chat_message("assistant", reply_msg)
+                    self.overlay_window.set_bubble_message(reply_msg, word_by_word=False, hold_seconds=3.2)
+                    if speak_reply:
+                        gen_id = self.tts_service.begin_turn()
+                        self.tts_service.enqueue_sentence(reply_msg, turn_generation=gen_id)
+                        self.tts_service.mark_turn_complete(turn_generation=gen_id)
+                    return
 
         if not preserve_scroll_session:
             if jarvis_response_parser.is_scroll_and_explain_request(prompt_text):
@@ -781,6 +940,7 @@ class JarvisApplicationController(QObject):
                         daemon=True,
                     ).start()
                     return
+                self._prepare_roamies_prompt_context(speak_reply)
                 self.brain_service.start_vision_turn(
                     user_prompt=prompt_text,
                     include_screenshot=True,
@@ -824,6 +984,7 @@ class JarvisApplicationController(QObject):
                 ).start()
                 return
 
+        self._prepare_roamies_prompt_context(speak_reply)
         self.brain_service.start_vision_turn(
             user_prompt=prompt_text,
             include_screenshot=True,
@@ -836,6 +997,27 @@ class JarvisApplicationController(QObject):
             max_scroll_steps=self._max_scroll_steps if self._scroll_explain_active else 0,
             memory_context=self.memory_service.build_memory_context_for_prompt(),
             live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
+        )
+
+    def _prepare_roamies_prompt_context(self, speak_reply: bool) -> None:
+        briefing_res = jarvis_roamies_core.build_morning_briefing_note(
+            on=bool(self.settings_store.get("morning_briefing_enabled", False)),
+            last_day=str(self.settings_store.get("last_briefing_day", "") or ""),
+            by_voice=speak_reply,
+            todoist=bool(self.settings_store.get("morning_briefing_todoist", False)),
+            user_name=str(self.settings_store.get("user_display_name", "you") or "you"),
+        )
+        briefing_note = ""
+        if briefing_res is not None:
+            briefing_note, day_key = briefing_res
+            self.settings_store.set("last_briefing_day", day_key)
+        self.brain_service.set_roamies_prompt_context(
+            mcp_live_text=self.mcp_manager.live_state_text(),
+            subagent_crew_text=self.subagent_manager.crew_prompt_text(
+                subagent_models=self.settings_store.get("subagent_models"),
+                delegate_mode=str(self.settings_store.get("subagent_delegate_mode", "ask") or "ask"),
+            ),
+            morning_briefing_note=briefing_note,
         )
 
     def _request_admin_confirmation(self, admin_req: jarvis_services.AdminPermissionRequest) -> None:
@@ -1304,6 +1486,20 @@ class JarvisApplicationController(QObject):
         status_msg: str,
         succeeded: bool,
     ) -> None:
+        if (not succeeded) and (status_msg or "").startswith("NEEDS_ALLOW:"):
+            raw_spec = status_msg[len("NEEDS_ALLOW:") :]
+            if "|" in raw_spec:
+                action_key, reason_text = raw_spec.split("|", 1)
+            else:
+                action_key, reason_text = raw_spec, "Confirm potentially risky desktop action?"
+            self._pending_approval_key = action_key.strip()
+            self._pending_approval_command = self._last_queued_agent_command
+            self.sound_player.play_earcon("jarvis-error", volume=0.40)
+            self.risky_approval_bar.prompt_action(
+                reason_text.strip(),
+                QRectF(self.overlay_window.geometry()),
+            )
+            return
         self.memory_service.record_action(
             action_kind=action_kind,
             target_summary=target_summary,
@@ -1314,8 +1510,231 @@ class JarvisApplicationController(QObject):
         if status_msg:
             self.overlay_window.set_bubble_message(status_msg, word_by_word=False, hold_seconds=2.8)
 
+    def _on_risky_approval_decision(self, allowed: bool) -> None:
+        pending_cmd = self._pending_approval_command
+        pending_key = self._pending_approval_key
+        self._pending_approval_command = None
+        self._pending_approval_key = ""
+        if allowed and pending_cmd is not None:
+            jarvis_services.DesktopAgentService.approve_risky_action_once(pending_key)
+            self._brain_agent_queue.put((self._agent_worker_generation, pending_cmd))
+            self.overlay_window.set_bubble_message("Approved — running action.", word_by_word=False, hold_seconds=2.2)
+        else:
+            self.overlay_window.set_bubble_message("Action declined for safety.", word_by_word=False, hold_seconds=2.4)
+
+    def _on_subagent_artifact_ready(self, agent_label: str, brief_text: str, files: list) -> None:
+        self.sound_player.play_earcon("jarvis-text-send", volume=0.42)
+        self.artifact_toast.show_artifact(
+            agent_label,
+            brief_text,
+            [str(file_item) for file_item in (files or [])],
+            QRectF(self.overlay_window.geometry()),
+        )
+
+    def _run_subagent_runner(self, specialist_name: str, brief_text: str) -> str:
+        """Runs one delegated subagent turn synchronously inside SubagentCrewManager worker thread."""
+        endpoints = jarvis_services.VisionBrainService.resolve_all_vision_endpoints(
+            self.settings_store,
+            user_prompt=brief_text,
+            has_images=False,
+        )
+        if not endpoints:
+            return f"[{specialist_name}] No model endpoint available to run subagent brief."
+        selected_cfg = endpoints[0]
+        try:
+            import requests as http_requests
+
+            if selected_cfg["wire_protocol"] == "openai":
+                headers = {"Content-Type": "application/json"}
+                if selected_cfg["api_key"]:
+                    headers["Authorization"] = f"Bearer {selected_cfg['api_key']}"
+                payload = {
+                    "model": selected_cfg["model_id"],
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": f"You are Jarvis's {specialist_name} specialist subagent. Return a concise, factual report.",
+                        },
+                        {"role": "user", "content": brief_text},
+                    ],
+                    "max_tokens": 600,
+                    "stream": False,
+                }
+                resp = http_requests.post(selected_cfg["endpoint_url"], headers=headers, json=payload, timeout=30)
+                if resp.ok:
+                    choices = resp.json().get("choices") or []
+                    if choices:
+                        return str(choices[0].get("message", {}).get("content") or "Done.").strip()
+            elif selected_cfg["wire_protocol"] == "google" and selected_cfg["api_key"]:
+                req_url = selected_cfg["endpoint_url"].format(model_id=selected_cfg["model_id"]).replace("?alt=sse", "").replace(":streamGenerateContent", ":generateContent")
+                payload = {
+                    "contents": [{"role": "user", "parts": [{"text": f"Act as {specialist_name}: {brief_text}"}]}],
+                    "generationConfig": {"maxOutputTokens": 600},
+                }
+                resp = http_requests.post(req_url, headers={"x-goog-api-key": selected_cfg["api_key"], "Content-Type": "application/json"}, json=payload, timeout=30)
+                if resp.ok:
+                    cands = resp.json().get("candidates") or []
+                    if cands:
+                        parts = cands[0].get("content", {}).get("parts") or []
+                        return "".join(str(part_item.get("text") or "") for part_item in parts).strip()
+        except Exception as exc:
+            return f"Subagent {specialist_name} error: {exc}"
+        return f"Subagent {specialist_name} finished brief."
+
+    def _on_card_saved_as_image(self, saved_path: str) -> None:
+        self.sound_player.play_earcon("jarvis-text-send", volume=0.40)
+        file_name = os.path.basename(saved_path) if saved_path else "card.png"
+        self.overlay_window.set_bubble_message(f"Saved card image: {file_name}", word_by_word=False, hold_seconds=3.0)
+
+    def _on_overlay_checklist_toggled(self, item_text: str) -> None:
+        self.sound_player.play_earcon("jarvis-text-open", volume=0.25)
+        self.commitments_service.toggle_item_by_text(item_text)
+
+    def _on_overlay_action_pill_triggered(self, command_text: str) -> None:
+        cleaned = (command_text or "").strip()
+        if not cleaned:
+            return
+        parsed_cmd = jarvis_response_parser.parse_command_line(cleaned)
+        if parsed_cmd is not None:
+            self._on_brain_drawing_command(parsed_cmd)
+        else:
+            speak = bool(self.settings_store.get("typed_turns_respond_with_voice", False))
+            self._start_turn(prompt_text=cleaned, speak_reply=speak, from_typed_notch=False)
+
+    def _on_overlay_quiz_answered(self, option_text: str, is_correct: bool) -> None:
+        self.sound_player.play_earcon("jarvis-text-send" if is_correct else "jarvis-error", volume=0.42)
+        feedback = f"Correct: {option_text[:42]}" if is_correct else f"Not quite — try another ({option_text[:30]})"
+        self.overlay_window.set_bubble_message(feedback, word_by_word=False, hold_seconds=2.8)
+
+    def _on_walkthrough_step_completed(self) -> None:
+        self.sound_player.play_earcon("jarvis-text-open", volume=0.35)
+        if self._walkthrough_queue:
+            self._walkthrough_queue.pop(0)
+        if self._walkthrough_queue:
+            next_cmd = self._walkthrough_queue[0]
+            self.overlay_window.add_drawing_command(next_cmd)
+            target_rect = QRectF(
+                max(0.0, float(next_cmd.x) - 60.0),
+                max(0.0, float(next_cmd.y) - 28.0),
+                max(100.0, float(next_cmd.width or 120.0)),
+                max(48.0, float(next_cmd.height or 48.0)),
+            )
+            self.overlay_window.start_walkthrough_wait(target_rect, wait_mode=(next_cmd.header or "click"))
+        else:
+            self.overlay_window.set_bubble_message("Walkthrough completed!", word_by_word=False, hold_seconds=2.8)
+
     def _on_brain_drawing_command(self, command: jarvis_response_parser.DrawingCommand) -> None:
         if command.kind == "scroll":
+            return
+        if command.kind == "emote":
+            self.overlay_window.set_emotion_feel(command.label or command.body or "happy", hold_seconds=4.5)
+            return
+        if command.kind == "sfx":
+            sfx_name = (command.label or command.body or "jarvis-text-open").strip().lower()
+            self.sound_player.play_earcon(sfx_name, volume=0.45)
+            return
+        if command.kind == "about_jarvis":
+            look_val = str(self.settings_store.get("companion_look", "jarvis"))
+            tts_val = str(self.settings_store.get("tts_engine", "assemblyai"))
+            info_card = jarvis_response_parser.DrawingCommand(
+                kind="paper",
+                x=40.0,
+                y=96.0,
+                width=360.0,
+                height=260.0,
+                label=f"Jarvis {jarvis_theme.APP_DISPLAY_VERSION}",
+                header=f"Jarvis {jarvis_theme.APP_DISPLAY_VERSION}",
+                body=f"Look: {look_val} | Voice Engine: {tts_val} | Lite Mode: {bool(self.settings_store.get('lite_mode_enabled', False))} | 3D/Molecule/Map/MCP/Subagents active",
+                tone="blue",
+            )
+            self.overlay_window.add_drawing_command(info_card)
+            return
+        if command.kind == "walkthrough_step":
+            self._walkthrough_queue.append(command)
+            if len(self._walkthrough_queue) == 1:
+                self.overlay_window.add_drawing_command(command)
+                target_rect = QRectF(
+                    max(0.0, float(command.x) - 60.0),
+                    max(0.0, float(command.y) - 28.0),
+                    max(100.0, float(command.width or 120.0)),
+                    max(48.0, float(command.height or 48.0)),
+                )
+                self.overlay_window.start_walkthrough_wait(target_rect, wait_mode=(command.header or "click"))
+            return
+        if command.kind == "add_connection":
+            srv_name = (command.label or command.header or "").strip()
+            srv_target = (command.body or "").strip()
+            if srv_target.startswith(("http://", "https://")):
+                decision, reason = jarvis_roamies_core.JarvisSafetyEngine.check_mcp_server(srv_name, url=srv_target)
+                add_ok, add_msg = (
+                    (False, reason)
+                    if decision == jarvis_roamies_core.JarvisSafetyEngine.BLOCK
+                    else self.mcp_manager.add_connection(srv_name, url=srv_target)
+                )
+            else:
+                parts = srv_target.split()
+                cmd_bin = parts[0] if parts else ""
+                cmd_args = parts[1:] if len(parts) > 1 else []
+                decision, reason = jarvis_roamies_core.JarvisSafetyEngine.check_mcp_server(srv_name, command=cmd_bin, args=cmd_args)
+                add_ok, add_msg = (
+                    (False, reason)
+                    if decision == jarvis_roamies_core.JarvisSafetyEngine.BLOCK
+                    else self.mcp_manager.add_connection(srv_name, command=cmd_bin, args=cmd_args)
+                )
+            self.overlay_window.set_bubble_message(add_msg, word_by_word=False, hold_seconds=3.2)
+            self.sound_player.play_earcon("jarvis-text-send" if add_ok else "jarvis-error", volume=0.4)
+            return
+        if command.kind == "remove_connection":
+            rem_ok, rem_msg = self.mcp_manager.remove_connection(command.label or command.body)
+            self.overlay_window.set_bubble_message(rem_msg, word_by_word=False, hold_seconds=2.8)
+            self.sound_player.play_earcon("jarvis-text-send" if rem_ok else "jarvis-error", volume=0.4)
+            return
+        if command.kind == "connection_tools":
+            srv_name = (command.label or command.body or "").strip()
+            list_ok, tools_list, err_msg = self.mcp_manager.connection_tools(srv_name, query=command.header or "")
+            summary = f"{srv_name}: {', '.join(str(tool_item.get('name')) for tool_item in tools_list[:5])}" if list_ok else err_msg
+            self.overlay_window.set_bubble_message(summary or "No tools listed.", word_by_word=False, hold_seconds=3.4)
+            return
+        if command.kind == "use_connection":
+            srv_name = (command.label or "").strip()
+            tool_name = (command.header or "").strip()
+            raw_args = (command.body or "{}").strip()
+            try:
+                import json as json_mod
+                parsed_args = json_mod.loads(raw_args) if raw_args.startswith("{") else {"input": raw_args}
+            except Exception:
+                parsed_args = {"input": raw_args}
+            call_ok, call_out = self.mcp_manager.call_tool(srv_name, tool_name, parsed_args)
+            self.overlay_window.set_bubble_message(call_out[:120], word_by_word=False, hold_seconds=3.5)
+            self.sound_player.play_earcon("jarvis-text-send" if call_ok else "jarvis-error", volume=0.4)
+            return
+        if command.kind == "send_agent":
+            spec_name = (command.label or command.header or "").strip()
+            brief_text = (command.body or "").strip()
+            sent_ok, agent_entry, sent_msg = self.subagent_manager.send_agent(
+                brief=brief_text,
+                subagent=spec_name,
+                runner_fn=self._run_subagent_runner,
+                on_done_callback=lambda entry: self._subagentArtifactReady.emit(
+                    str(entry.get("specialist") or entry.get("id") or "Agent"),
+                    str(entry.get("brief") or ""),
+                    list(entry.get("files") or []),
+                ),
+            )
+            self.overlay_window.set_bubble_message(sent_msg, word_by_word=False, hold_seconds=3.0)
+            self.sound_player.play_earcon("jarvis-text-send" if sent_ok else "jarvis-error", volume=0.4)
+            return
+        if command.kind in ("tell_agent", "answer_agent"):
+            _ok, tell_msg = self.subagent_manager.tell_agent(command.label or command.header, command.body)
+            self.overlay_window.set_bubble_message(tell_msg, word_by_word=False, hold_seconds=2.8)
+            return
+        if command.kind == "stop_agent":
+            _ok, stop_msg = self.subagent_manager.stop_agent(command.label or command.body)
+            self.overlay_window.set_bubble_message(stop_msg, word_by_word=False, hold_seconds=2.8)
+            return
+        if command.kind == "agent_report":
+            rep_ok, rep_msg = self.subagent_manager.get_agent_report(command.label or command.body)
+            self.overlay_window.set_bubble_message(rep_msg[:120] if rep_ok else rep_msg, word_by_word=False, hold_seconds=3.6)
             return
         if command.kind == "plan_steps":
             steps_list = [step_part.strip() for step_part in (command.body or "").split("|") if step_part.strip()]
@@ -1398,6 +1817,8 @@ class JarvisApplicationController(QObject):
                 return
             if bool(self.settings_store.get("agent_actions_enabled", True)):
                 self._executed_agent_command_in_turn = True
+                self._executed_agent_kinds_in_turn.append(command.kind)
+                self._last_queued_agent_command = command
                 self._pending_direct_agent_commands = []
                 self._brain_agent_queue.put((self._agent_worker_generation, command))
             return
@@ -1444,8 +1865,15 @@ class JarvisApplicationController(QObject):
     def _on_companion_periodic_tick(self) -> None:
         if self._quitting:
             return
+        companion_hidden = self._companion_hidden_override or (
+            not bool(self.settings_store.get("show_cursor_always", True))
+            and not self.overlay_window.isVisible()
+        )
+        suppress_nudge_voice = companion_hidden and bool(self.settings_store.get("quiet_when_hidden", True))
+
         due_items = self.commitments_service.pop_due_commitments()
         if due_items:
+            self._last_due_commitment_id = str(due_items[0].get("id") or "")
             due_lines = " ; ".join(f"[ ] {item['text'][:38]}" for item in due_items[:4])
             reminder_card = jarvis_response_parser.DrawingCommand(
                 kind="paper",
@@ -1462,7 +1890,7 @@ class JarvisApplicationController(QObject):
             self.sound_player.play_earcon("jarvis-text-send", volume=0.45)
             spoken_nudge = f"Quick reminder: {due_items[0]['text']}."
             self.overlay_window.set_bubble_message(spoken_nudge, word_by_word=False, hold_seconds=4.0)
-            if not self.brain_service.is_running and not self.tts_service.is_speaking:
+            if (not suppress_nudge_voice) and (not self.brain_service.is_running) and (not self.tts_service.is_speaking):
                 gen_id = self.tts_service.begin_turn()
                 self.tts_service.enqueue_sentence(spoken_nudge, turn_generation=gen_id)
                 self.tts_service.mark_turn_complete(turn_generation=gen_id)
@@ -1472,7 +1900,7 @@ class JarvisApplicationController(QObject):
         if focus_nudge:
             self.overlay_window.set_bubble_message(focus_nudge, word_by_word=False, hold_seconds=4.0)
             self.sound_player.play_earcon("jarvis-error", volume=0.35)
-            if not self.brain_service.is_running and not self.tts_service.is_speaking:
+            if (not suppress_nudge_voice) and (not self.brain_service.is_running) and (not self.tts_service.is_speaking):
                 gen_id = self.tts_service.begin_turn()
                 self.tts_service.enqueue_sentence(focus_nudge, turn_generation=gen_id)
                 self.tts_service.mark_turn_complete(turn_generation=gen_id)
@@ -1490,7 +1918,69 @@ class JarvisApplicationController(QObject):
                     daemon=True,
                 ).start()
 
+        sync_folder = str(self.settings_store.get("sync_folder_path", "") or "").strip()
+        if (
+            bool(self.settings_store.get("sync_enabled", False))
+            and sync_folder
+            and (time.time() - self._last_sync_ts) >= 60.0
+        ):
+            self._last_sync_ts = time.time()
+            dev_id = str(self.settings_store.get("sync_device_id", "") or "win-primary")
+            threading.Thread(
+                target=jarvis_roamies_core.EncryptedSyncService.run_sync_pass,
+                args=(sync_folder, dev_id, self.commitments_service, self.facts_service, self.dpapi_store),
+                name="JarvisEncryptedSyncWorker",
+                daemon=True,
+            ).start()
+
     def _on_main_window_agent_command(self, action_kind: str, argument_text: str) -> None:
+        if action_kind == "run_sync_now":
+            sync_folder = str(self.settings_store.get("sync_folder_path", "") or "").strip()
+            dev_id = str(self.settings_store.get("sync_device_id", "") or "win-primary")
+            sync_ok, sync_msg = jarvis_roamies_core.EncryptedSyncService.run_sync_pass(
+                sync_folder,
+                dev_id,
+                self.commitments_service,
+                self.facts_service,
+                dpapi_store=self.dpapi_store,
+            )
+            self.overlay_window.set_bubble_message(sync_msg, word_by_word=False, hold_seconds=3.2)
+            self.sound_player.play_earcon("jarvis-text-send" if sync_ok else "jarvis-error", volume=0.45)
+            return
+        if action_kind == "save_diagnostics":
+            diag_path = jarvis_roamies_core.DiagnosticsExporter.save_and_reveal_diagnostics(
+                self.settings_store,
+                log_paths=[os.path.join(jarvis_config.WINDOWS_DIRECTORY, "jarvis.log")],
+            )
+            self.overlay_window.set_bubble_message(
+                f"Diagnostics saved: {os.path.basename(diag_path)}",
+                word_by_word=False,
+                hold_seconds=3.4,
+            )
+            self.sound_player.play_earcon("jarvis-text-send", volume=0.45)
+            return
+        if action_kind == "import_mcp_source":
+            imported_total = 0
+            for source_name in ("claude", "gg"):
+                imported_total += int(self.mcp_manager.import_from_source(source_name))
+            self.overlay_window.set_bubble_message(
+                f"Imported {imported_total} MCP server(s) ({self.mcp_manager.live_state_text()[:48]})",
+                word_by_word=False,
+                hold_seconds=3.5,
+            )
+            self.sound_player.play_earcon("jarvis-text-send" if imported_total > 0 else "jarvis-text-open", volume=0.42)
+            return
+        if action_kind == "send_subagent":
+            self._on_brain_drawing_command(
+                jarvis_response_parser.DrawingCommand(kind="send_agent", label="", body=argument_text or "Inspect workspace status")
+            )
+            return
+        if action_kind == "toggle_show_hide":
+            self._on_show_hide_companion_toggled()
+            return
+        if action_kind == "open_ask_bar":
+            self._on_ask_bar_tapped()
+            return
         if action_kind == "show_list":
             self._on_brain_drawing_command(jarvis_response_parser.DrawingCommand(kind="show_list", body="show"))
             self.sound_player.play_earcon("jarvis-text-send", volume=0.45)
@@ -1544,6 +2034,15 @@ class JarvisApplicationController(QObject):
         self._pending_direct_agent_commands = []
 
         final_text = parsed_response.spoken_text or "Done."
+        if getattr(parsed_response, "last_emotion_feel", None):
+            self.overlay_window.set_emotion_feel(parsed_response.last_emotion_feel, hold_seconds=5.0)
+        self._last_turn_ended_with_question = jarvis_roamies_core.ends_with_question(final_text)
+        if bool(self.settings_store.get("auto_learn_skills_enabled", True)) and len(self._executed_agent_kinds_in_turn) >= 2:
+            self.skills_service.auto_learn_from_agent_trace(
+                self._current_turn_prompt_text,
+                list(self._executed_agent_kinds_in_turn),
+                final_text,
+            )
         visual_summary = ", ".join(cmd_item.kind for cmd_item in parsed_response.commands[:6])
         self.memory_service.record_assistant_response(final_text, visual_summary)
         self.main_window.finish_streaming_assistant_message(final_text)
@@ -1654,6 +2153,7 @@ class JarvisApplicationController(QObject):
 
     def _on_tts_finished(self) -> None:
         self._flush_pending_voice_synced_commands(max_sentence_index=None)
+        self.wake_word_service.set_paused(False)
         self.overlay_window.set_cursor_visual_state(False, False, False)
         if not self._force_captions_for_turn:
             self.overlay_window.clear_caption()
@@ -1674,6 +2174,19 @@ class JarvisApplicationController(QObject):
 
         if self.notch_window.current_mode() == jarvis_notch_window.NotchVisualMode.SPEAKING:
             self.notch_window.collapse_to_idle()
+
+        if (
+            self._last_turn_ended_with_question
+            and bool(self.settings_store.get("keep_listening_enabled", False))
+            and (not self._quitting)
+            and (not self._scroll_explain_active)
+            and (self._active_voice_mode == "idle")
+            and (not self._companion_hidden_override)
+        ):
+            self._last_turn_ended_with_question = False
+            listen_seconds = max(3, min(20, int(self.settings_store.get("keep_listening_seconds", 8) or 8)))
+            self._on_ptt_pressed()
+            self._keep_listening_timer.start(listen_seconds * 1000)
 
     def _execute_scroll_and_schedule_next(
         self,

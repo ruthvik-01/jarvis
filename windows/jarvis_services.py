@@ -60,6 +60,7 @@ import websockets
 
 import jarvis_config
 import jarvis_response_parser
+import jarvis_roamies_core
 import jarvis_theme
 
 AUDIO_SAMPLE_RATE = 16000
@@ -915,12 +916,18 @@ class CommitmentsReminderService:
                 if last_reminded > 0.0 and (check_ts - last_reminded) < 120.0:
                     continue
                 item["reminded_at"] = check_ts
-                repeat_rule = str(item.get("repeat") or "").lower()
-                if "daily" in repeat_rule:
-                    item["due_ts"] = float(due_ts) + 86400.0
-                    item["reminded_at"] = 0.0
-                elif "week" in repeat_rule and "weekday" not in repeat_rule:
-                    item["due_ts"] = float(due_ts) + 7.0 * 86400.0
+                repeat_rule = str(item.get("repeat") or "").strip().lower()
+                if repeat_rule:
+                    repeat_spec = jarvis_roamies_core.parse_repeat_schedule(repeat_rule)
+                    if repeat_spec is not None:
+                        item["due_ts"] = float(
+                            jarvis_roamies_core.compute_next_repeat_timestamp(
+                                repeat_spec,
+                                from_ts=float(due_ts),
+                            )
+                        )
+                    else:
+                        item["due_ts"] = float(due_ts) + 86400.0
                     item["reminded_at"] = 0.0
                 due_now.append(dict(item))
                 changed = True
@@ -940,6 +947,31 @@ class CommitmentsReminderService:
         if not sections:
             return "section:Today | list:[✓] All caught up!"
         return " | ".join(sections)
+
+    def toggle_item_by_text(self, target_text: str) -> Optional[bool]:
+        """Toggles a commitment item matching `target_text` (e.g. from overlay checklist click)."""
+        needle = re.sub(r"^\s*\[[xX\u2713 ]?\]\s*", "", (target_text or "")).strip().lower()
+        if not needle:
+            return None
+        with self._lock:
+            for item in self._items:
+                item_text_lower = str(item.get("text") or "").strip().lower()
+                if item_text_lower == needle or (len(needle) >= 6 and (needle in item_text_lower or item_text_lower in needle)):
+                    new_done = not bool(item.get("done", False))
+                    item["done"] = new_done
+                    item["updated_at"] = float(time.time() * 1000.0)
+                    self._save()
+                    return new_done
+        return None
+
+    def export_sync_items(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._items]
+
+    def apply_sync_items(self, synced_items: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self._items = [dict(item) for item in synced_items if isinstance(item, dict) and not item.get("deleted")]
+            self._save()
 
 
 class FocusGuardianService:
@@ -1149,6 +1181,41 @@ class SkillsManagerService:
                 continue
         return False, f"Could not fetch SKILL.md from {cleaned_source}"
 
+    def auto_learn_from_agent_trace(
+        self,
+        user_goal: str,
+        command_kinds: List[str],
+        outcome_summary: str,
+    ) -> Optional[str]:
+        """Automatically drafts a compact procedural SKILL.md after multi-step successes."""
+        cleaned_goal = re.sub(r"\s+", " ", (user_goal or "").strip())
+        if len(cleaned_goal) < 8 or len(command_kinds) < 2:
+            return None
+        slug_base = re.sub(r"[^a-z0-9]+", "-", cleaned_goal.lower()).strip("-")[:36]
+        if not slug_base:
+            return None
+        skill_name = f"auto-{slug_base}"
+        existing = self.list_skills()
+        for existing_skill in existing:
+            if existing_skill.get("name", "").lower() == skill_name.lower():
+                return None
+        step_lines = "\n".join(
+            f"{step_idx + 1}. Run `{cmd_kind}` toward: {cleaned_goal}"
+            for step_idx, cmd_kind in enumerate(command_kinds[:8])
+        )
+        skill_body = (
+            f"# {cleaned_goal[:60]}\n\n"
+            f"Learned automatically after completing this workflow.\n\n"
+            f"## Procedure\n{step_lines}\n\n"
+            f"## Outcome\n{(outcome_summary or 'Completed cleanly.').strip()[:260]}\n"
+        )
+        saved_path = self.save_skill(
+            name=skill_name,
+            description=f"Auto-learned procedure for: {cleaned_goal[:110]}",
+            body_markdown=skill_body,
+        )
+        return saved_path
+
 
 class ScheduledJobsService:
     """One-shot or repeating autonomous background routines cloned from Roamies."""
@@ -1219,12 +1286,19 @@ class ScheduledJobsService:
                 due_ts = item.get("due_ts")
                 if due_ts is None or float(due_ts) > check_ts:
                     continue
-                repeat_rule = str(item.get("repeat") or "").lower()
+                repeat_rule = str(item.get("repeat") or "").strip().lower()
                 item["last_run_at"] = check_ts
-                if "daily" in repeat_rule:
-                    item["due_ts"] = float(due_ts) + 86400.0
-                elif "hour" in repeat_rule:
-                    item["due_ts"] = float(due_ts) + 3600.0
+                if repeat_rule:
+                    repeat_spec = jarvis_roamies_core.parse_repeat_schedule(repeat_rule)
+                    if repeat_spec is not None:
+                        item["due_ts"] = float(
+                            jarvis_roamies_core.compute_next_repeat_timestamp(
+                                repeat_spec,
+                                from_ts=float(due_ts),
+                            )
+                        )
+                    else:
+                        item["due_ts"] = float(due_ts) + 86400.0
                 else:
                     item["due_ts"] = None
                 due_jobs.append(dict(item))
@@ -1241,6 +1315,33 @@ class ScheduledJobsService:
                     item["last_error"] = "" if succeeded else outcome_text[:180]
                     self._save()
                     break
+
+    def set_job_paused(self, job_id: str, paused: bool) -> bool:
+        with self._lock:
+            for item in self._jobs:
+                if item.get("id") == job_id:
+                    item["paused"] = bool(paused)
+                    self._save()
+                    return True
+        return False
+
+    def delete_job(self, job_id: str) -> bool:
+        with self._lock:
+            before_count = len(self._jobs)
+            self._jobs = [item for item in self._jobs if item.get("id") != job_id]
+            if len(self._jobs) != before_count:
+                self._save()
+                return True
+        return False
+
+    def export_sync_items(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._jobs]
+
+    def apply_sync_items(self, synced_items: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self._jobs = [dict(item) for item in synced_items if isinstance(item, dict) and not item.get("deleted")]
+            self._save()
 
 
 class LearnedFactsService:
@@ -1327,6 +1428,15 @@ class LearnedFactsService:
             if matched and not re.search(r"\b(?:remind|minutes?|hours?|tomorrow|at\s+\d)\b", cleaned, flags=re.IGNORECASE):
                 return matched.group(1).strip()
         return None
+
+    def export_sync_items(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._facts]
+
+    def apply_sync_items(self, synced_items: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self._facts = [dict(item) for item in synced_items if isinstance(item, dict) and not item.get("deleted")]
+            self._save()
 
 
 # ---------------------------------------------------------------------------
@@ -2512,6 +2622,358 @@ class MicrophoneStreamService(QObject):
         return assemble_transcript()
 
 
+def is_fullscreen_game_active() -> bool:
+    """Returns True when a fullscreen non-shell non-Jarvis application covers the monitor."""
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = int(user32.GetForegroundWindow() or 0)
+        if not hwnd:
+            return False
+        title_buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, title_buf, 256)
+        title_lower = title_buf.value.strip().lower()
+        if (not title_lower) or title_lower in ("program manager", "taskbar", "jarvis", "heyclicky"):
+            return False
+        win_rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(win_rect)):
+            return False
+        monitor = user32.MonitorFromWindow(hwnd, 2)
+        if not monitor:
+            return False
+
+        class _MonitorInfo(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        mon_info = _MonitorInfo()
+        mon_info.cbSize = ctypes.sizeof(_MonitorInfo)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(mon_info)):
+            return False
+        mon_rect = mon_info.rcMonitor
+        covers_monitor = (
+            win_rect.left <= mon_rect.left + 2
+            and win_rect.top <= mon_rect.top + 2
+            and win_rect.right >= mon_rect.right - 2
+            and win_rect.bottom >= mon_rect.bottom - 2
+        )
+        if not covers_monitor:
+            return False
+        # Avoid falsely treating a maximized browser, explorer, or IDE as a fullscreen game
+        style_bits = int(user32.GetWindowLongW(hwnd, -16))
+        ws_caption = 0x00C00000
+        has_title_caption = bool((style_bits & ws_caption) == ws_caption)
+        non_game_apps = ("chrome", "edge", "firefox", "code", "explorer", "notepad", "powershell", "terminal")
+        if has_title_caption and any(app_tok in title_lower for app_tok in non_game_apps):
+            return False
+        game_title_hints = ("directx", "vulkan", "opengl", "unreal", "unity", "counter-strike", "valorant", "minecraft", "elden", "fortnite", "apex")
+        return (not has_title_caption) or any(game_tok in title_lower for game_tok in game_title_hints)
+    except Exception:
+        return False
+
+
+class WakeWordService(QObject):
+    """Lightweight wake-phrase watcher cloned from Roamies' wake word pass."""
+
+    wakeWordHeard = Signal(str)
+
+    def __init__(self, settings_store: jarvis_config.SettingsStore) -> None:
+        super().__init__()
+        self._settings_store = settings_store
+        self._running = False
+        self._paused = False
+        self._watch_thread: Optional[threading.Thread] = None
+
+    @staticmethod
+    def matches_wake_phrase(transcript_text: str, wake_name: str = "Jarvis") -> Tuple[bool, str]:
+        """Checks whether `transcript_text` opens with 'hey <wake_name>' or '<wake_name>' and returns the stripped remainder."""
+        cleaned_text = (transcript_text or "").strip()
+        if not cleaned_text:
+            return False, ""
+        valid_ok, clean_name, _ = jarvis_roamies_core.clean_wake_name(wake_name or "Jarvis")
+        target_name = clean_name if valid_ok else "Jarvis"
+        pattern = re.compile(
+            rf"^(?:(?:hey|hi|ok|okay|yo)\s+)?{re.escape(target_name.lower())}\b[\s,:\.\!\?]*(.*)$",
+            re.IGNORECASE,
+        )
+        matched = pattern.match(cleaned_text.lower())
+        if not matched:
+            return False, cleaned_text
+        remainder_start = matched.start(1)
+        remainder = cleaned_text[remainder_start:].strip()
+        return True, remainder
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._paused = False
+        self._watch_thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self._watch_thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        thread_ref = self._watch_thread
+        if thread_ref is not None and thread_ref.is_alive():
+            thread_ref.join(timeout=0.7)
+
+    def set_paused(self, paused: bool) -> None:
+        self._paused = bool(paused)
+
+    def _watch_loop(self) -> None:
+        audio_interface: Optional[pyaudio.PyAudio] = None
+        stream: Optional[pyaudio.Stream] = None
+        try:
+            while self._running:
+                if (
+                    not bool(self._settings_store.get("wake_word_enabled", False))
+                    or self._paused
+                ):
+                    if stream is not None:
+                        try:
+                            stream.stop_stream()
+                            stream.close()
+                        except Exception:
+                            pass
+                        stream = None
+                    time.sleep(0.35)
+                    continue
+                if audio_interface is None:
+                    audio_interface = pyaudio.PyAudio()
+                if stream is None:
+                    try:
+                        stream = audio_interface.open(
+                            format=pyaudio.paInt16,
+                            channels=1,
+                            rate=AUDIO_SAMPLE_RATE,
+                            input=True,
+                            frames_per_buffer=AUDIO_FRAMES_PER_BUFFER,
+                        )
+                    except Exception:
+                        time.sleep(0.6)
+                        continue
+                pcm_chunk = stream.read(AUDIO_FRAMES_PER_BUFFER, exception_on_overflow=False)
+                samples = np.frombuffer(pcm_chunk, dtype=np.int16).astype(np.float32)
+                rms_level = float(np.sqrt(np.mean(samples * samples))) / 32768.0 if samples.size > 0 else 0.0
+                if rms_level > 0.055:
+                    # Capture 1.3s burst when loud onset occurs to check against AssemblyAI short turn
+                    captured_frames = [pcm_chunk]
+                    for _ in range(12):
+                        if not self._running or self._paused:
+                            break
+                        captured_frames.append(stream.read(AUDIO_FRAMES_PER_BUFFER, exception_on_overflow=False))
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except Exception:
+                        pass
+                    stream = None
+                    heard_text = self._transcribe_short_burst(b"".join(captured_frames))
+                    wake_name = str(self._settings_store.get("wake_word_name", "Jarvis") or "Jarvis")
+                    matched, remainder = self.matches_wake_phrase(heard_text, wake_name)
+                    if matched:
+                        self.wakeWordHeard.emit(remainder)
+                        time.sleep(1.0)
+                time.sleep(0.05)
+        except Exception:
+            pass
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+            if audio_interface is not None:
+                try:
+                    audio_interface.terminate()
+                except Exception:
+                    pass
+
+    def _transcribe_short_burst(self, pcm_bytes: bytes) -> str:
+        api_key = self._settings_store.get_secret(jarvis_config.SECRET_ASSEMBLYAI_API_KEY)
+        if not api_key or not pcm_bytes:
+            return ""
+        try:
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as wav_writer:
+                wav_writer.setnchannels(1)
+                wav_writer.setsampwidth(2)
+                wav_writer.setframerate(AUDIO_SAMPLE_RATE)
+                wav_writer.writeframes(pcm_bytes)
+            upload_resp = requests.post(
+                "https://api.assemblyai.com/v2/upload",
+                headers={"authorization": api_key, "content-type": "application/octet-stream"},
+                data=wav_buffer.getvalue(),
+                timeout=4.0,
+            )
+            if not upload_resp.ok:
+                return ""
+            upload_url = upload_resp.json().get("upload_url", "")
+            if not upload_url:
+                return ""
+            tx_resp = requests.post(
+                "https://api.assemblyai.com/v2/transcript",
+                headers={"authorization": api_key, "content-type": "application/json"},
+                json={"audio_url": upload_url, "speech_model": "universal"},
+                timeout=4.0,
+            )
+            if not tx_resp.ok:
+                return ""
+            tx_id = tx_resp.json().get("id", "")
+            if not tx_id:
+                return ""
+            for _ in range(12):
+                poll_resp = requests.get(
+                    f"https://api.assemblyai.com/v2/transcript/{tx_id}",
+                    headers={"authorization": api_key},
+                    timeout=3.0,
+                )
+                if poll_resp.ok:
+                    poll_json = poll_resp.json()
+                    status_val = poll_json.get("status", "")
+                    if status_val == "completed":
+                        return str(poll_json.get("text") or "").strip()
+                    if status_val == "error":
+                        return ""
+                time.sleep(0.25)
+        except Exception:
+            return ""
+        return ""
+
+
+def _extract_pcm_from_audio_bytes(raw_audio: bytes) -> Tuple[bytes, int]:
+    """Unwraps WAV RIFF header when present, otherwise treats payload as 24 kHz 16-bit mono PCM."""
+    if raw_audio.startswith(b"RIFF") and len(raw_audio) > 44:
+        try:
+            with wave.open(io.BytesIO(raw_audio), "rb") as wav_reader:
+                sample_rate = int(wav_reader.getframerate() or TTS_SAMPLE_RATE)
+                pcm_frames = wav_reader.readframes(wav_reader.getnframes())
+                return pcm_frames, sample_rate
+        except Exception:
+            return raw_audio[44:], TTS_SAMPLE_RATE
+    return raw_audio, TTS_SAMPLE_RATE
+
+
+def _request_gemini_tts_pcm(
+    text_to_speak: str,
+    model_id: str,
+    voice_name: str,
+    api_key: str,
+    timeout_seconds: int = 18,
+) -> Optional[Tuple[bytes, int]]:
+    if not api_key or not (text_to_speak or "").strip():
+        return None
+    target_model = (model_id or "gemini-2.5-flash-preview-tts").strip()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(target_model)}:generateContent"
+    payload = {
+        "contents": [{"parts": [{"text": text_to_speak}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {
+                        "voiceName": (voice_name or "Kore").strip(),
+                    }
+                }
+            },
+        },
+    }
+    response = requests.post(
+        url,
+        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout_seconds,
+    )
+    if not response.ok:
+        return None
+    resp_json = response.json()
+    for candidate in resp_json.get("candidates", []):
+        parts = candidate.get("content", {}).get("parts", [])
+        for part_item in parts:
+            inline_data = part_item.get("inlineData") or part_item.get("inline_data")
+            if isinstance(inline_data, dict) and inline_data.get("data"):
+                raw_bytes = base64.b64decode(inline_data["data"])
+                return _extract_pcm_from_audio_bytes(raw_bytes)
+    return None
+
+
+def _request_fish_tts_stream(
+    text_to_speak: str,
+    model_id: str,
+    voice_id: str,
+    api_key: str,
+    speech_speed: float = 1.0,
+    timeout_seconds: int = 20,
+) -> Optional[requests.Response]:
+    if not api_key or not (text_to_speak or "").strip():
+        return None
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "model": (model_id or "s2-pro").strip(),
+    }
+    payload: Dict[str, Any] = {
+        "text": text_to_speak,
+        "format": "pcm",
+        "sample_rate": TTS_SAMPLE_RATE,
+        "latency": "balanced",
+        "prosody": {"speed": max(0.7, min(1.3, float(speech_speed)))},
+    }
+    if (voice_id or "").strip():
+        payload["reference_id"] = voice_id.strip()
+    response = requests.post(
+        "https://api.fish.audio/v1/tts",
+        headers=headers,
+        json=payload,
+        stream=True,
+        timeout=timeout_seconds,
+    )
+    if response.ok:
+        return response
+    try:
+        response.close()
+    except Exception:
+        pass
+    return None
+
+
+def _request_voicestudio_tts_pcm(
+    text_to_speak: str,
+    base_url: str,
+    voice_name: str,
+    speech_speed: float = 1.0,
+    timeout_seconds: int = 12,
+) -> Optional[Tuple[bytes, int]]:
+    clean_base = (base_url or "http://localhost:8765").strip().rstrip("/")
+    if not clean_base or not (text_to_speak or "").strip():
+        return None
+    payload = {
+        "text": text_to_speak,
+        "input": text_to_speak,
+        "voice": (voice_name or "default").strip(),
+        "speed": float(speech_speed),
+        "response_format": "pcm",
+    }
+    for route_suffix in ("/tts", "/v1/audio/speech", "/synthesize"):
+        try:
+            response = requests.post(
+                f"{clean_base}{route_suffix}",
+                json=payload,
+                timeout=timeout_seconds,
+            )
+            if response.ok and response.content:
+                return _extract_pcm_from_audio_bytes(response.content)
+        except Exception:
+            continue
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Streaming ElevenLabs PCM TTS (sentence-pipelined) + SAPI fallback
 # ---------------------------------------------------------------------------
@@ -2629,6 +3091,7 @@ class StreamingTTSService(QObject):
     speechStarted = Signal()
     sentenceStarted = Signal(int, str)
     speechWordProgress = Signal(str, int, int)
+    sentenceEmotionDetected = Signal(str)
     audioLevelChanged = Signal(float)
     speechFinished = Signal()
 
@@ -2727,6 +3190,71 @@ class StreamingTTSService(QObject):
                     self.audioLevelChanged.emit(0.0)
                     self.speechFinished.emit()
 
+    @staticmethod
+    def probe_voicestudio_status(base_url: str) -> Tuple[bool, str]:
+        clean_base = (base_url or "http://localhost:8765").strip().rstrip("/")
+        for suffix in ("/status", "/health", "/v1/models", "/"):
+            try:
+                resp = requests.get(f"{clean_base}{suffix}", timeout=1.6)
+                if resp.ok:
+                    return True, f"Connected ({clean_base})"
+            except Exception:
+                continue
+        return False, "VoiceStudio not reachable"
+
+    @staticmethod
+    def list_voicestudio_voices(base_url: str) -> List[str]:
+        clean_base = (base_url or "http://localhost:8765").strip().rstrip("/")
+        for suffix in ("/voices", "/v1/voices", "/api/voices"):
+            try:
+                resp = requests.get(f"{clean_base}{suffix}", timeout=1.8)
+                if resp.ok:
+                    parsed = resp.json()
+                    raw_list = parsed.get("voices") if isinstance(parsed, dict) else parsed
+                    if isinstance(raw_list, list):
+                        names = []
+                        for item in raw_list:
+                            if isinstance(item, str) and item.strip():
+                                names.append(item.strip())
+                            elif isinstance(item, dict) and (item.get("name") or item.get("id")):
+                                names.append(str(item.get("name") or item.get("id")).strip())
+                        if names:
+                            return names
+            except Exception:
+                continue
+        return []
+
+    def _play_pcm_with_karaoke(
+        self,
+        chunk_iterator: Any,
+        sample_rate: int,
+        display_sentence: str,
+        speech_speed: float,
+        generation_id: int,
+        sentence_index: int,
+    ) -> None:
+        words = display_sentence.split()
+        total_words = max(1, len(words))
+        estimated_seconds = max(0.8, len(display_sentence) / (15.5 * max(0.5, speech_speed)))
+        expected_bytes = max(4096, int(estimated_seconds * sample_rate * 2))
+
+        def on_progress(bytes_played: int) -> None:
+            fraction = min(1.0, float(bytes_played) / float(expected_bytes))
+            word_idx = min(total_words, max(1, int(math.ceil(fraction * total_words))))
+            self.speechWordProgress.emit(display_sentence, word_idx, total_words)
+
+        if self._generation_id == generation_id:
+            self.sentenceStarted.emit(sentence_index, display_sentence)
+        self.speechWordProgress.emit(display_sentence, 1, total_words)
+        _play_pcm_stream_blocking(
+            chunk_iterator=chunk_iterator,
+            sample_rate=sample_rate,
+            on_level=self.audioLevelChanged.emit,
+            on_bytes_played=on_progress,
+            should_abort=lambda: self._generation_id != generation_id,
+        )
+        self.speechWordProgress.emit(display_sentence, total_words, total_words)
+
     def _speak_one_sentence(
         self,
         sentence_text: str,
@@ -2734,42 +3262,132 @@ class StreamingTTSService(QObject):
         sentence_index: int = 0,
     ) -> str:
         voice_id = str(self._settings_store.get("voice_id", jarvis_config.DEFAULT_SETTINGS["voice_id"]))
+        active_engine = str(self._settings_store.get("tts_engine", "assemblyai") or "assemblyai").strip().lower()
+        if voice_id == "windows-sapi":
+            active_engine = "sapi"
         speech_speed = float(self._settings_store.get("speech_speed", 1.0))
         speech_speed = max(0.7, min(1.2, speech_speed))
-        api_key = self._settings_store.get_secret(jarvis_config.SECRET_ASSEMBLYAI_API_KEY)
-        words = sentence_text.split()
-        total_words = max(1, len(words))
+        cues_enabled = bool(self._settings_store.get("voice_cues_enabled", True))
+        math_words_enabled = bool(self._settings_store.get("math_speech_normalization", True))
 
-        if voice_id != "windows-sapi" and api_key:
+        feel_name = jarvis_roamies_core.cue_feel(sentence_text)
+        if feel_name and self._generation_id == generation_id:
+            self.sentenceEmotionDetected.emit(feel_name)
+
+        display_sentence = jarvis_roamies_core.strip_voice_cues_for_display(sentence_text)
+        if not display_sentence:
+            display_sentence = sentence_text.strip()
+        spoken_plain = jarvis_roamies_core.speakable_text(
+            sentence_text,
+            keep_cues=False,
+            math_words_enabled=math_words_enabled,
+        )
+        if cues_enabled:
+            norm_for_gemini = jarvis_roamies_core.normalize_math_for_speech(sentence_text) if math_words_enabled else sentence_text
+            spoken_gemini, _gemini_style_hint = jarvis_roamies_core.convert_cues_for_gemini(norm_for_gemini)
+        else:
+            spoken_gemini = spoken_plain
+        spoken_fish = jarvis_roamies_core.speakable_text(
+            sentence_text,
+            keep_cues=cues_enabled,
+            math_words_enabled=math_words_enabled,
+        )
+        total_words = max(1, len(display_sentence.split()))
+
+        if active_engine == "gemini":
+            google_key = self._settings_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
+            if google_key:
+                try:
+                    companion_look = str(self._settings_store.get("companion_look", "jarvis") or "jarvis")
+                    gemini_voice = str(self._settings_store.get("gemini_tts_voice", "") or "").strip()
+                    if not gemini_voice:
+                        gemini_voice = jarvis_config.GEMINI_LOOK_VOICES.get(companion_look, "Kore")
+                    gemini_model = str(self._settings_store.get("gemini_tts_model", "gemini-2.5-flash-preview-tts") or "")
+                    pcm_pair = _request_gemini_tts_pcm(
+                        text_to_speak=spoken_gemini or display_sentence,
+                        model_id=gemini_model,
+                        voice_name=gemini_voice,
+                        api_key=google_key,
+                    )
+                    if pcm_pair is not None and pcm_pair[0]:
+                        pcm_bytes, sample_rate = pcm_pair
+                        chunk_size = 4096
+                        chunks = [pcm_bytes[offset : offset + chunk_size] for offset in range(0, len(pcm_bytes), chunk_size)]
+                        self._play_pcm_with_karaoke(chunks, sample_rate, display_sentence, speech_speed, generation_id, sentence_index)
+                        self._last_engine_used = "gemini"
+                        return "gemini"
+                except Exception:
+                    pass
+
+        if active_engine == "fish":
+            fish_key = self._settings_store.get_secret(jarvis_config.SECRET_FISH_API_KEY)
+            if fish_key:
+                try:
+                    fish_model = str(self._settings_store.get("fish_tts_model", "s2-pro") or "s2-pro")
+                    fish_voice = str(self._settings_store.get("fish_tts_voice", "") or "")
+                    fish_resp = _request_fish_tts_stream(
+                        text_to_speak=spoken_fish or display_sentence,
+                        model_id=fish_model,
+                        voice_id=fish_voice,
+                        api_key=fish_key,
+                        speech_speed=speech_speed,
+                    )
+                    if fish_resp is not None:
+                        self._play_pcm_with_karaoke(
+                            fish_resp.iter_content(chunk_size=4096),
+                            TTS_SAMPLE_RATE,
+                            display_sentence,
+                            speech_speed,
+                            generation_id,
+                            sentence_index,
+                        )
+                        try:
+                            fish_resp.close()
+                        except Exception:
+                            pass
+                        self._last_engine_used = "fish"
+                        return "fish"
+                except Exception:
+                    pass
+
+        if active_engine == "voicestudio":
+            try:
+                vs_url = str(self._settings_store.get("voicestudio_url", "http://localhost:8765") or "http://localhost:8765")
+                vs_voice = str(self._settings_store.get("voicestudio_voice", "") or "")
+                pcm_pair = _request_voicestudio_tts_pcm(
+                    text_to_speak=spoken_plain or display_sentence,
+                    base_url=vs_url,
+                    voice_name=vs_voice,
+                    speech_speed=speech_speed,
+                )
+                if pcm_pair is not None and pcm_pair[0]:
+                    pcm_bytes, sample_rate = pcm_pair
+                    chunks = [pcm_bytes[offset : offset + 4096] for offset in range(0, len(pcm_bytes), 4096)]
+                    self._play_pcm_with_karaoke(chunks, sample_rate, display_sentence, speech_speed, generation_id, sentence_index)
+                    self._last_engine_used = "voicestudio"
+                    return "voicestudio"
+            except Exception:
+                pass
+
+        api_key = self._settings_store.get_secret(jarvis_config.SECRET_ASSEMBLYAI_API_KEY)
+        if voice_id != "windows-sapi" and active_engine != "sapi" and api_key:
             try:
                 response = _request_assemblyai_tts_stream(
-                    text_to_speak=sentence_text,
+                    text_to_speak=spoken_plain or display_sentence,
                     voice_id=voice_id,
                     api_key=api_key,
                     speech_speed=speech_speed,
                     timeout_seconds=20,
                 )
                 if response is not None:
-                    # Estimate spoken duration conservatively so karaoke highlight tracks audio closely
-                    estimated_seconds = max(0.8, len(sentence_text) / (15.5 * speech_speed))
-                    expected_bytes = max(4096, int(estimated_seconds * TTS_SAMPLE_RATE * 2))
-
-                    def on_progress(bytes_played: int) -> None:
-                        fraction = min(1.0, float(bytes_played) / float(expected_bytes))
-                        word_idx = min(total_words, max(1, int(math.ceil(fraction * total_words))))
-                        self.speechWordProgress.emit(sentence_text, word_idx, total_words)
-
-                    if self._generation_id == generation_id:
-                        self.sentenceStarted.emit(sentence_index, sentence_text)
-                    self.speechWordProgress.emit(sentence_text, 1, total_words)
-                    _play_pcm_stream_blocking(
-                        chunk_iterator=_iter_assemblyai_pcm_chunks(response),
-                        sample_rate=TTS_SAMPLE_RATE,
-                        on_level=self.audioLevelChanged.emit,
-                        on_bytes_played=on_progress,
-                        should_abort=lambda: self._generation_id != generation_id,
+                    self._play_pcm_with_karaoke(
+                        _iter_assemblyai_pcm_chunks(response),
+                        TTS_SAMPLE_RATE,
+                        display_sentence,
+                        speech_speed,
+                        generation_id,
+                        sentence_index,
                     )
-                    self.speechWordProgress.emit(sentence_text, total_words, total_words)
                     self._last_engine_used = "assemblyai"
                     return "assemblyai"
             except Exception:
@@ -2777,10 +3395,10 @@ class StreamingTTSService(QObject):
 
         # Fallback to Windows built-in SAPI if offline or configured to Windows voice
         if self._generation_id == generation_id:
-            self.sentenceStarted.emit(sentence_index, sentence_text)
-        self.speechWordProgress.emit(sentence_text, total_words, total_words)
+            self.sentenceStarted.emit(sentence_index, display_sentence)
+        self.speechWordProgress.emit(display_sentence, total_words, total_words)
         _speak_with_sapi_blocking(
-            sentence_text,
+            spoken_plain or display_sentence,
             speed=speech_speed,
             on_level=self.audioLevelChanged.emit,
             should_abort=lambda: self._generation_id != generation_id,
@@ -2806,6 +3424,21 @@ class VisionBrainService(QObject):
     drawingCommandReady = Signal(object)
     turnCompleted = Signal(object)
     turnFailed = Signal(str)
+
+    _mcp_live_text: str = ""
+    _subagent_crew_text: str = ""
+    _morning_briefing_note: str = ""
+
+    def set_roamies_prompt_context(
+        self,
+        mcp_live_text: str = "",
+        subagent_crew_text: str = "",
+        morning_briefing_note: str = "",
+    ) -> None:
+        self._mcp_live_text = mcp_live_text or ""
+        self._subagent_crew_text = subagent_crew_text or ""
+        if morning_briefing_note:
+            self._morning_briefing_note = morning_briefing_note
 
     RIVER_CHAT_URL = "https://api.river.ai/v1/chat/completions"
     GOOGLE_GEMINI_STREAM_URL_TEMPLATE = (
@@ -2883,134 +3516,218 @@ class VisionBrainService(QObject):
     def resolve_all_vision_endpoints(
         cls,
         settings_store: jarvis_config.SettingsStore,
+        user_prompt: str = "",
+        has_images: bool = True,
+        max_scroll_steps: int = 0,
     ) -> List[Dict[str, str]]:
-        """Builds an ordered list of primary and fallback vision endpoints from UI settings and .env."""
+        """Builds an ordered list of primary, hybrid-routed, local, and backup vision endpoints."""
         selected_model = str(
             settings_store.get("chat_model", jarvis_config.DEFAULT_SETTINGS["chat_model"]) or ""
         ).strip()
         if not selected_model:
             selected_model = str(jarvis_config.DEFAULT_SETTINGS["chat_model"])
 
+        route_slot = "default"
+        if user_prompt:
+            selected_model, route_slot = jarvis_roamies_core.HybridModelRouter.select_model_for_turn(
+                user_prompt,
+                settings_store,
+            )
+
+        backup_chain = jarvis_roamies_core.HybridModelRouter.get_backup_chain(settings_store)
+        all_models_to_resolve = [selected_model] + [
+            backup_item for backup_item in backup_chain if backup_item != selected_model
+        ]
+
         custom_endpoint_raw = settings_store.get_effective_endpoint_url()
         custom_key, custom_key_alias = settings_store.get_custom_secret_with_name()
         google_key = settings_store.get_secret(jarvis_config.SECRET_GOOGLE_API_KEY)
         river_key = settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
-
-        custom_url_entry: Optional[Dict[str, str]] = None
-        if custom_endpoint_raw:
-            url_lower = custom_endpoint_raw.lower()
-            is_local_host = ("localhost" in url_lower) or ("127.0.0.1" in url_lower) or ("0.0.0.0" in url_lower)
-            hint_alias = custom_key_alias
-            chosen_key = custom_key
-            if not chosen_key:
-                if ("generativelanguage.googleapis.com" in url_lower) and google_key:
-                    chosen_key = google_key
-                    hint_alias = "GOOGLE_API_KEY"
-                elif ("api.river.ai" in url_lower) and river_key:
-                    chosen_key = river_key
-                    hint_alias = "RIVER_AI_API"
-                elif (not is_local_host) and google_key and jarvis_config.detect_wire_protocol(custom_endpoint_raw, selected_model, "") == "google":
-                    chosen_key = google_key
-                    hint_alias = "GOOGLE_API_KEY"
-
-            custom_wire = jarvis_config.detect_wire_protocol(custom_endpoint_raw, selected_model, hint_alias)
-            custom_label = jarvis_config.infer_provider_name(custom_endpoint_raw, selected_model, hint_alias)
-            custom_model = cls._adapt_model_for_provider(selected_model, custom_wire, custom_label, fallback_alias=hint_alias)
-            custom_url_final = (
-                custom_endpoint_raw
-                if (custom_wire == "google" and "{model_id}" in custom_endpoint_raw)
-                else jarvis_config.normalize_endpoint_url(custom_endpoint_raw, custom_wire, custom_model)
-            )
-            custom_url_entry = {
-                "provider_label": custom_label,
-                "wire_protocol": custom_wire,
-                "endpoint_url": custom_url_final,
-                "model_id": custom_model,
-                "api_key": chosen_key,
-            }
-
-        custom_key_entry: Optional[Dict[str, str]] = None
-        if custom_key:
-            inferred_url, inferred_label = cls._infer_universal_key_endpoint(
-                custom_key,
-                custom_key_alias,
-                selected_model,
-            )
-            inferred_wire = jarvis_config.detect_wire_protocol(inferred_url, selected_model, custom_key_alias)
-            inferred_model = cls._adapt_model_for_provider(
-                selected_model,
-                inferred_wire,
-                inferred_label,
-                fallback_alias=custom_key_alias,
-            )
-            if custom_key_alias and custom_key_alias in jarvis_config.DEFAULT_MODEL_FOR_KEY_ALIAS and selected_model.startswith("deepseek-ai/"):
-                inferred_model = jarvis_config.DEFAULT_MODEL_FOR_KEY_ALIAS[custom_key_alias]
-            normalized_key_url = (
-                inferred_url
-                if (inferred_wire == "google" and "{model_id}" in inferred_url)
-                else jarvis_config.normalize_endpoint_url(inferred_url, inferred_wire, inferred_model)
-            )
-            custom_key_entry = {
-                "provider_label": inferred_label,
-                "wire_protocol": inferred_wire,
-                "endpoint_url": normalized_key_url,
-                "model_id": inferred_model,
-                "api_key": custom_key,
-            }
-
-        google_entry: Optional[Dict[str, str]] = None
-        if google_key:
-            google_model = (
-                selected_model
-                if jarvis_config.is_google_gemini_model(selected_model)
-                else jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL
-            )
-            google_entry = {
-                "provider_label": "Google Gemini",
-                "wire_protocol": "google",
-                "endpoint_url": cls.GOOGLE_GEMINI_STREAM_URL_TEMPLATE,
-                "model_id": google_model,
-                "api_key": google_key,
-            }
-
-        river_entry: Optional[Dict[str, str]] = None
-        if river_key:
-            river_model = cls._adapt_model_for_provider(selected_model, "openai", "River AI")
-            river_entry = {
-                "provider_label": "River AI",
-                "wire_protocol": "openai",
-                "endpoint_url": cls.RIVER_CHAT_URL,
-                "model_id": river_model,
-                "api_key": river_key,
-            }
-
-        ordered_candidates: List[Dict[str, str]] = []
-        if custom_url_entry is not None:
-            ordered_candidates.append(custom_url_entry)
-
-        if jarvis_config.is_google_gemini_model(selected_model):
-            priority_list = [google_entry, custom_key_entry, river_entry]
-        elif selected_model.startswith("deepseek-ai/"):
-            priority_list = [river_entry, custom_key_entry, google_entry]
-        else:
-            priority_list = [custom_key_entry, google_entry, river_entry]
-
-        for entry in priority_list:
-            if entry is not None:
-                ordered_candidates.append(entry)
+        local_servers_cfg = settings_store.get("local_servers", []) or []
 
         deduped_endpoints: List[Dict[str, str]] = []
         seen_signatures = set()
-        for candidate_entry in ordered_candidates:
-            signature = (
-                candidate_entry["wire_protocol"],
-                candidate_entry["endpoint_url"],
-                candidate_entry["model_id"],
-                candidate_entry["api_key"],
+
+        for candidate_target_model in all_models_to_resolve:
+            effort_val = (
+                jarvis_roamies_core.HybridModelRouter.resolve_reasoning_effort(
+                    route_slot,
+                    settings_store,
+                )
+                or ""
             )
-            if signature not in seen_signatures:
-                seen_signatures.add(signature)
-                deduped_endpoints.append(candidate_entry)
+            local_entries: List[Dict[str, str]] = []
+            model_lower = candidate_target_model.lower()
+            if model_lower.startswith(("ollama:", "local:")):
+                raw_local_model = candidate_target_model.split(":", 1)[1].strip()
+                base_local_url = ""
+                if "::" in raw_local_model:
+                    base_local_url, raw_local_model = raw_local_model.split("::", 1)
+                if not base_local_url and isinstance(local_servers_cfg, list) and local_servers_cfg:
+                    first_srv = local_servers_cfg[0]
+                    if isinstance(first_srv, dict):
+                        base_local_url = str(first_srv.get("url") or "http://localhost:11434")
+                local_base = jarvis_roamies_core.LocalModelDiscoveryService.normalize_local_server_url(
+                    base_local_url or "http://localhost:11434"
+                ) or "http://localhost:11434/v1"
+                local_chat_url = (
+                    f"{local_base}/chat/completions"
+                    if local_base.endswith("/v1")
+                    else f"{local_base}/v1/chat/completions"
+                )
+                local_entries.append(
+                    {
+                        "provider_label": f"Local ({local_base})",
+                        "wire_protocol": "openai",
+                        "endpoint_url": local_chat_url,
+                        "model_id": raw_local_model,
+                        "api_key": "",
+                        "reasoning_effort": effort_val,
+                    }
+                )
+            elif isinstance(local_servers_cfg, list):
+                for srv_item in local_servers_cfg:
+                    if not isinstance(srv_item, dict):
+                        continue
+                    srv_models = [str(mdl) for mdl in (srv_item.get("models") or [])]
+                    if candidate_target_model in srv_models:
+                        srv_url = jarvis_roamies_core.LocalModelDiscoveryService.normalize_local_server_url(
+                            str(srv_item.get("url") or "")
+                        )
+                        if srv_url:
+                            srv_chat_url = (
+                                f"{srv_url}/chat/completions"
+                                if srv_url.endswith("/v1")
+                                else f"{srv_url}/v1/chat/completions"
+                            )
+                            local_entries.append(
+                                {
+                                    "provider_label": str(srv_item.get("name") or "Local LLM"),
+                                    "wire_protocol": "openai",
+                                    "endpoint_url": srv_chat_url,
+                                    "model_id": candidate_target_model,
+                                    "api_key": str(srv_item.get("api_key") or ""),
+                                    "reasoning_effort": effort_val,
+                                }
+                            )
+
+            custom_url_entry: Optional[Dict[str, str]] = None
+            if custom_endpoint_raw:
+                url_lower = custom_endpoint_raw.lower()
+                is_local_host = ("localhost" in url_lower) or ("127.0.0.1" in url_lower) or ("0.0.0.0" in url_lower)
+                hint_alias = custom_key_alias
+                chosen_key = custom_key
+                if not chosen_key:
+                    if ("generativelanguage.googleapis.com" in url_lower) and google_key:
+                        chosen_key = google_key
+                        hint_alias = "GOOGLE_API_KEY"
+                    elif ("api.river.ai" in url_lower) and river_key:
+                        chosen_key = river_key
+                        hint_alias = "RIVER_AI_API"
+                    elif (not is_local_host) and google_key and jarvis_config.detect_wire_protocol(custom_endpoint_raw, candidate_target_model, "") == "google":
+                        chosen_key = google_key
+                        hint_alias = "GOOGLE_API_KEY"
+
+                custom_wire = jarvis_config.detect_wire_protocol(custom_endpoint_raw, candidate_target_model, hint_alias)
+                custom_label = jarvis_config.infer_provider_name(custom_endpoint_raw, candidate_target_model, hint_alias)
+                custom_model = cls._adapt_model_for_provider(candidate_target_model, custom_wire, custom_label, fallback_alias=hint_alias)
+                custom_url_final = (
+                    custom_endpoint_raw
+                    if (custom_wire == "google" and "{model_id}" in custom_endpoint_raw)
+                    else jarvis_config.normalize_endpoint_url(custom_endpoint_raw, custom_wire, custom_model)
+                )
+                custom_url_entry = {
+                    "provider_label": custom_label,
+                    "wire_protocol": custom_wire,
+                    "endpoint_url": custom_url_final,
+                    "model_id": custom_model,
+                    "api_key": chosen_key,
+                    "reasoning_effort": effort_val,
+                }
+
+            custom_key_entry: Optional[Dict[str, str]] = None
+            if custom_key:
+                inferred_url, inferred_label = cls._infer_universal_key_endpoint(
+                    custom_key,
+                    custom_key_alias,
+                    candidate_target_model,
+                )
+                inferred_wire = jarvis_config.detect_wire_protocol(inferred_url, candidate_target_model, custom_key_alias)
+                inferred_model = cls._adapt_model_for_provider(
+                    candidate_target_model,
+                    inferred_wire,
+                    inferred_label,
+                    fallback_alias=custom_key_alias,
+                )
+                if custom_key_alias and custom_key_alias in jarvis_config.DEFAULT_MODEL_FOR_KEY_ALIAS and candidate_target_model.startswith("deepseek-ai/"):
+                    inferred_model = jarvis_config.DEFAULT_MODEL_FOR_KEY_ALIAS[custom_key_alias]
+                normalized_key_url = (
+                    inferred_url
+                    if (inferred_wire == "google" and "{model_id}" in inferred_url)
+                    else jarvis_config.normalize_endpoint_url(inferred_url, inferred_wire, inferred_model)
+                )
+                custom_key_entry = {
+                    "provider_label": inferred_label,
+                    "wire_protocol": inferred_wire,
+                    "endpoint_url": normalized_key_url,
+                    "model_id": inferred_model,
+                    "api_key": custom_key,
+                    "reasoning_effort": effort_val,
+                }
+
+            google_entry: Optional[Dict[str, str]] = None
+            if google_key:
+                google_model = (
+                    candidate_target_model
+                    if jarvis_config.is_google_gemini_model(candidate_target_model)
+                    else jarvis_config.DEFAULT_GOOGLE_CHAT_MODEL
+                )
+                google_entry = {
+                    "provider_label": "Google Gemini",
+                    "wire_protocol": "google",
+                    "endpoint_url": cls.GOOGLE_GEMINI_STREAM_URL_TEMPLATE,
+                    "model_id": google_model,
+                    "api_key": google_key,
+                    "reasoning_effort": effort_val,
+                }
+
+            river_entry: Optional[Dict[str, str]] = None
+            if river_key:
+                river_model = cls._adapt_model_for_provider(candidate_target_model, "openai", "River AI")
+                river_entry = {
+                    "provider_label": "River AI",
+                    "wire_protocol": "openai",
+                    "endpoint_url": cls.RIVER_CHAT_URL,
+                    "model_id": river_model,
+                    "api_key": river_key,
+                    "reasoning_effort": effort_val,
+                }
+
+            ordered_candidates: List[Dict[str, str]] = list(local_entries)
+            if custom_url_entry is not None:
+                ordered_candidates.append(custom_url_entry)
+
+            if jarvis_config.is_google_gemini_model(candidate_target_model):
+                priority_list = [google_entry, custom_key_entry, river_entry]
+            elif candidate_target_model.startswith("deepseek-ai/"):
+                priority_list = [river_entry, custom_key_entry, google_entry]
+            else:
+                priority_list = [custom_key_entry, google_entry, river_entry]
+
+            for entry in priority_list:
+                if entry is not None:
+                    ordered_candidates.append(entry)
+
+            for candidate_entry in ordered_candidates:
+                signature = (
+                    candidate_entry["wire_protocol"],
+                    candidate_entry["endpoint_url"],
+                    candidate_entry["model_id"],
+                    candidate_entry["api_key"],
+                )
+                if signature not in seen_signatures:
+                    seen_signatures.add(signature)
+                    deduped_endpoints.append(candidate_entry)
         return deduped_endpoints
 
     @classmethod
@@ -3275,6 +3992,7 @@ class VisionBrainService(QObject):
         allow_visual_notes: bool,
         endpoint_url: str = "",
         wire_protocol: str = "",
+        reasoning_effort: str = "",
     ) -> Tuple[bool, bool, str]:
         """Streams one vision turn against any OpenAI-compatible, Google Gemini, or Anthropic endpoint.
 
@@ -3338,6 +4056,12 @@ class VisionBrainService(QObject):
                         lasso_crop_b64=step_lasso,
                         max_output_tokens=turn_max_tokens,
                     )
+                    budget_map = {"none": 0, "low": 1024, "medium": 4096, "high": 8192}
+                    effort_lower = (reasoning_effort or "").strip().lower()
+                    if effort_lower in budget_map and any(ver_tag in candidate_model.lower() for ver_tag in ("2.5", "3.", "3-", "hydrogen")):
+                        request_json.setdefault("generationConfig", {})["thinkingConfig"] = {
+                            "thinkingBudget": budget_map[effort_lower]
+                        }
                 elif active_protocol == "anthropic":
                     request_url = endpoint_url or "https://api.anthropic.com/v1/messages"
                     request_headers = {
@@ -3390,8 +4114,13 @@ class VisionBrainService(QObject):
                         "max_tokens": turn_max_tokens,
                         "stream": True,
                     }
+                    effort_clean = (reasoning_effort or "").strip().lower()
                     if "api.river.ai" in url_lower:
-                        request_json["reasoning_effort"] = "none"
+                        request_json["reasoning_effort"] = effort_clean if effort_clean in ("none", "low", "medium", "high") else "none"
+                    elif effort_clean in ("low", "medium", "high") and any(
+                        reason_tok in candidate_model.lower() for reason_tok in ("o1", "o3", "o4", "gpt-5", "qwen3", "deepseek-r1")
+                    ):
+                        request_json["reasoning_effort"] = effort_clean
 
                 try:
                     with requests.post(
@@ -3404,6 +4133,11 @@ class VisionBrainService(QObject):
                         if not response.ok:
                             error_text = response.text[:240]
                             last_error_message = f"{provider_label} error {response.status_code}: {error_text}"
+                            if any(host_tok in request_url.lower() for host_tok in ("localhost", "127.0.0.1", "0.0.0.0")):
+                                last_error_message = jarvis_roamies_core.LocalModelDiscoveryService.format_local_error(
+                                    provider_label,
+                                    last_error_message,
+                                )
                             if (not emitted_any_chunk) and include_images and response.status_code in (400, 422):
                                 # Text-only models (e.g. DeepSeek direct, some Groq/Ollama models) reject image_url; retry text-only once
                                 continue
@@ -3584,8 +4318,13 @@ class VisionBrainService(QObject):
         live_screen_context: str = "",
         suppress_visual_notes: bool = False,
     ) -> None:
-        vision_endpoints = self.resolve_all_vision_endpoints(self._settings_store)
-        if not vision_endpoints:
+        pre_endpoints = self.resolve_all_vision_endpoints(
+            self._settings_store,
+            user_prompt=user_prompt,
+            has_images=include_screenshot,
+            max_scroll_steps=max_scroll_steps,
+        )
+        if not pre_endpoints:
             self._is_running = False
             if self._generation_id == turn_generation:
                 self.turnFailed.emit(
@@ -3611,6 +4350,13 @@ class VisionBrainService(QObject):
                 jpeg_b64 = ""
                 lasso_crop_b64 = ""
 
+        vision_endpoints = self.resolve_all_vision_endpoints(
+            self._settings_store,
+            user_prompt=user_prompt,
+            has_images=bool(jpeg_b64 or lasso_crop_b64),
+            max_scroll_steps=max_scroll_steps,
+        ) or pre_endpoints
+
         allow_visual_notes = (not suppress_visual_notes) and (
             bool(lasso_crop_b64)
             or (max_scroll_steps > 0)
@@ -3626,6 +4372,10 @@ class VisionBrainService(QObject):
             system_telemetry_snapshot = SystemTelemetryService.get_full_system_snapshot()
         except Exception:
             system_telemetry_snapshot = ""
+
+        briefing_note = str(getattr(self, "_morning_briefing_note", "") or "")
+        if briefing_note:
+            self._morning_briefing_note = ""
 
         system_prompt = jarvis_response_parser.build_vision_system_prompt(
             screen_width=img_w,
@@ -3646,6 +4396,12 @@ class VisionBrainService(QObject):
             live_screen_context="",
             suppress_visual_notes=(not allow_visual_notes),
             system_telemetry_summary=system_telemetry_snapshot,
+            companion_look=str(self._settings_store.get("companion_look", "jarvis") or "jarvis"),
+            lite_mode=bool(self._settings_store.get("lite_mode_enabled", False)),
+            mcp_live_text=str(getattr(self, "_mcp_live_text", "") or ""),
+            subagent_crew_text=str(getattr(self, "_subagent_crew_text", "") or ""),
+            morning_briefing_note=briefing_note,
+            voice_cues_enabled=bool(self._settings_store.get("voice_cues_enabled", True)),
         )
 
         # Keep system message completely static across turns; place compact sanitized desktop/session
@@ -3691,9 +4447,15 @@ class VisionBrainService(QObject):
             for endpoint_index, endpoint_cfg in enumerate(vision_endpoints):
                 if self._generation_id != turn_generation:
                     return
-                if endpoint_index > 0:
+                if jarvis_roamies_core.HybridModelRouter.is_qwen_1000_grid_model(endpoint_cfg["model_id"]):
+                    active_scale_x = (float(img_w) * float(scale_x)) / 1000.0
+                    active_scale_y = (float(img_h) * float(scale_y)) / 1000.0
+                else:
+                    active_scale_x = float(scale_x)
+                    active_scale_y = float(scale_y)
+                if endpoint_index > 0 or active_scale_x != scale_x or active_scale_y != scale_y:
                     extractor = jarvis_response_parser.StreamingSentenceExtractor(
-                        scale_x=scale_x, scale_y=scale_y
+                        scale_x=active_scale_x, scale_y=active_scale_y
                     )
                 stream_ok, emitted_any_chunk, stream_error_message = self._stream_vision_provider_once(
                     provider_name=endpoint_cfg["provider_label"],
@@ -3709,6 +4471,7 @@ class VisionBrainService(QObject):
                     allow_visual_notes=allow_visual_notes,
                     endpoint_url=endpoint_cfg["endpoint_url"],
                     wire_protocol=endpoint_cfg["wire_protocol"],
+                    reasoning_effort=str(endpoint_cfg.get("reasoning_effort") or ""),
                 )
                 if stream_ok or emitted_any_chunk or self._generation_id != turn_generation:
                     break
@@ -4311,6 +5074,13 @@ class GlobalHotkeyService(QObject):
     escapePressed = Signal()
     leftArrowPressed = Signal()
     rightArrowPressed = Signal()
+    askBarTapped = Signal()
+    askAreaPressed = Signal()
+    showHidePressed = Signal()
+
+    _shift_down: bool = False
+    _ctrl_shift_press_time: float = 0.0
+    _other_key_pressed_during_ctrl_shift: bool = False
 
     def __init__(self) -> None:
         super().__init__()
@@ -4355,6 +5125,10 @@ class GlobalHotkeyService(QObject):
     def _is_win(key: Any) -> bool:
         return key in (keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r)
 
+    @staticmethod
+    def _is_shift(key: Any) -> bool:
+        return key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r)
+
     def _handle_press(self, key: Any) -> None:
         now = time.perf_counter()
 
@@ -4376,18 +5150,38 @@ class GlobalHotkeyService(QObject):
                 self._ctrl_down = True
                 self._ctrl_press_time = now
                 self._other_key_pressed_during_ctrl = False
+                self._other_key_pressed_during_ctrl_shift = False
+                if self._shift_down:
+                    self._ctrl_shift_press_time = now
+        elif self._is_shift(key):
+            if not self._shift_down:
+                self._shift_down = True
+                self._other_key_pressed_during_ctrl = True
+                if self._ctrl_down:
+                    self._ctrl_shift_press_time = now
+                    self._other_key_pressed_during_ctrl_shift = False
         elif self._is_alt(key):
             self._alt_down = True
             self._other_key_pressed_during_ctrl = True
+            self._other_key_pressed_during_ctrl_shift = True
         elif self._is_win(key):
             self._win_down = True
             self._other_key_pressed_during_ctrl = True
+            self._other_key_pressed_during_ctrl_shift = True
             if self._ctrl_down:
                 if (now - self._last_win_tap_time) < 0.45:
                     self._hands_free_dictation = not self._hands_free_dictation
                 self._last_win_tap_time = now
         else:
             self._other_key_pressed_during_ctrl = True
+            if self._ctrl_down and self._shift_down:
+                self._other_key_pressed_during_ctrl_shift = True
+                key_vk = getattr(key, "vk", None)
+                key_char = getattr(key, "char", None)
+                if key_vk == 0x41 or key_char in ("a", "A", "\x01"):
+                    self.askAreaPressed.emit()
+                elif key_vk == 0x53 or key_char in ("s", "S", "\x13"):
+                    self.showHidePressed.emit()
 
         if self._ctrl_down and self._alt_down and not self._ptt_active:
             self._ptt_active = True
@@ -4401,12 +5195,24 @@ class GlobalHotkeyService(QObject):
         now = time.perf_counter()
 
         if self._is_ctrl(key):
+            was_ctrl_shift_clean = (
+                self._shift_down
+                and (not self._other_key_pressed_during_ctrl_shift)
+                and (not self._alt_down)
+                and (not self._win_down)
+                and self._ctrl_shift_press_time > 0.0
+                and (now - self._ctrl_shift_press_time) < 0.45
+            )
             self._ctrl_down = False
+            if was_ctrl_shift_clean:
+                self._other_key_pressed_during_ctrl_shift = True
+                self.askBarTapped.emit()
             hold_duration = now - self._ctrl_press_time
             if (
                 not self._other_key_pressed_during_ctrl
                 and not self._alt_down
                 and not self._win_down
+                and not self._shift_down
                 and hold_duration < 0.40
             ):
                 if (now - self._last_ctrl_tap_release_time) < 0.48:
@@ -4414,6 +5220,19 @@ class GlobalHotkeyService(QObject):
                     self.doubleCtrlTapped.emit()
                 else:
                     self._last_ctrl_tap_release_time = now
+        elif self._is_shift(key):
+            was_ctrl_shift_clean = (
+                self._ctrl_down
+                and (not self._other_key_pressed_during_ctrl_shift)
+                and (not self._alt_down)
+                and (not self._win_down)
+                and self._ctrl_shift_press_time > 0.0
+                and (now - self._ctrl_shift_press_time) < 0.45
+            )
+            self._shift_down = False
+            if was_ctrl_shift_clean:
+                self._other_key_pressed_during_ctrl_shift = True
+                self.askBarTapped.emit()
         elif self._is_alt(key):
             self._alt_down = False
         elif self._is_win(key):
@@ -4940,6 +5759,35 @@ class RoamiesHandsService:
             if isinstance(bounds, list) and len(bounds) == 4:
                 return (int(bounds[0]), int(bounds[1]), int(bounds[2]), int(bounds[3]))
         return None
+
+    @classmethod
+    def find_all_text_matches(
+        cls,
+        query_text: str,
+        spec: str = "front",
+        hands_exe: str = "",
+    ) -> List[Tuple[int, int, int, int]]:
+        """Returns all matching text bounding boxes for multi-match highlight/hover."""
+        needle = (query_text or "").strip()
+        if not needle:
+            return []
+        target_spec = "front" if (not spec or spec.lower() in ("front", "screen")) else (
+            spec if spec.startswith(("app:", "window:")) else f"app:{spec}"
+        )
+        res = cls.run_hands_json("find-text", target_spec, needle, timeout_sec=4.5, hands_exe=hands_exe)
+        matches = res.get("matches") if isinstance(res, dict) else None
+        if not isinstance(matches, list) or not matches:
+            ocr_res = cls.run_hands_json("ocr-find", target_spec, needle, timeout_sec=5.0, hands_exe=hands_exe)
+            matches = ocr_res.get("matches") if isinstance(ocr_res, dict) else None
+        results: List[Tuple[int, int, int, int]] = []
+        if isinstance(matches, list):
+            for match_item in matches:
+                if not isinstance(match_item, dict):
+                    continue
+                bounds = match_item.get("bounds") or match_item.get("rect")
+                if isinstance(bounds, list) and len(bounds) == 4:
+                    results.append((int(bounds[0]), int(bounds[1]), int(bounds[2]), int(bounds[3])))
+        return results
 
     @classmethod
     def refine_boxes(cls, rects_list: List[List[int]], window_spec: str = "", hands_exe: str = "") -> List[Tuple[int, int, int, int]]:
@@ -6481,6 +7329,63 @@ class DesktopAgentService:
         """Executes a parsed desktop/browser command safely and returns (ok, status_message)."""
         return cls._execute_agent_command_internal(command, block_for_typing=False)
 
+    _safety_allow_file_edits: bool = True
+    _safety_allow_shell: bool = True
+    _safety_allow_app_control: bool = True
+    _safety_skip_allow: bool = False
+    _confirmed_action_keys: set = set()
+
+    @classmethod
+    def configure_safety_settings(cls, settings_store: Any) -> None:
+        if settings_store is None:
+            return
+        cls._safety_allow_file_edits = bool(settings_store.get("allow_file_edits", True))
+        cls._safety_allow_shell = bool(settings_store.get("allow_shell_commands", True))
+        cls._safety_allow_app_control = bool(settings_store.get("allow_app_control", True))
+        cls._safety_skip_allow = bool(settings_store.get("skip_allow_prompts", False))
+
+    @classmethod
+    def approve_risky_action_once(cls, action_key: str) -> None:
+        cleaned_key = (action_key or "").strip()
+        if cleaned_key:
+            cls._confirmed_action_keys.add(cleaned_key)
+
+    @classmethod
+    def _evaluate_command_safety(
+        cls,
+        command: jarvis_response_parser.DrawingCommand,
+    ) -> Tuple[str, str]:
+        command_kind = command.kind
+        arg_text = (command.body or command.label or command.header or "").strip()
+        action_key = f"{command_kind}:{arg_text[:120]}"
+        ask_sentinel = jarvis_roamies_core.JarvisSafetyEngine.ASK
+        if command_kind in ("write_file", "write_project_file"):
+            if not cls._safety_allow_file_edits:
+                return jarvis_roamies_core.JarvisSafetyEngine.BLOCK, "File editing is disabled in Abilities settings."
+            decision, reason = jarvis_roamies_core.JarvisSafetyEngine.check_write(arg_text)
+        elif command_kind in ("run_project_command", "run_shell_read"):
+            if not cls._safety_allow_shell:
+                return jarvis_roamies_core.JarvisSafetyEngine.BLOCK, "Shell commands are disabled in Abilities settings."
+            decision, reason = jarvis_roamies_core.JarvisSafetyEngine.check_shell_command(arg_text)
+        elif command_kind in ("open_app", "click_ui", "act_in_app", "type_text", "press_keys"):
+            if not cls._safety_allow_app_control:
+                return jarvis_roamies_core.JarvisSafetyEngine.BLOCK, "App control is disabled in Abilities settings."
+            if command_kind in ("click_ui", "act_in_app"):
+                decision, reason = jarvis_roamies_core.JarvisSafetyEngine.check_click(
+                    arg_text,
+                    target_process=command.header or "",
+                )
+            else:
+                return jarvis_roamies_core.JarvisSafetyEngine.SAFE, ""
+        elif command_kind in ("open_url", "open_browser"):
+            decision, reason = jarvis_roamies_core.JarvisSafetyEngine.check_url(arg_text)
+        else:
+            return jarvis_roamies_core.JarvisSafetyEngine.SAFE, ""
+
+        if decision == ask_sentinel and (cls._safety_skip_allow or action_key in cls._confirmed_action_keys):
+            return jarvis_roamies_core.JarvisSafetyEngine.SAFE, reason
+        return decision, reason
+
     @classmethod
     def _execute_agent_command_internal(
         cls,
@@ -6489,6 +7394,11 @@ class DesktopAgentService:
     ) -> Tuple[bool, str]:
         command_kind = command.kind
         argument_text = (command.body or command.label or command.header or "").strip()
+        safety_decision, safety_reason = cls._evaluate_command_safety(command)
+        if safety_decision == jarvis_roamies_core.JarvisSafetyEngine.BLOCK:
+            return False, f"Blocked by safety: {safety_reason}"
+        if safety_decision == jarvis_roamies_core.JarvisSafetyEngine.ASK:
+            return False, f"NEEDS_ALLOW:{command_kind}:{argument_text[:120]}|{safety_reason}"
 
         if command_kind in ("open_browser", "open_url"):
             resolved_url = cls.normalize_target_url(argument_text)

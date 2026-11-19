@@ -76,6 +76,7 @@ from PySide6.QtWidgets import (
 )
 
 import jarvis_config
+import jarvis_roamies_core
 import jarvis_theme
 
 DARK_PALETTE: Dict[str, str] = jarvis_theme.WINDOW_PALETTE_DARK
@@ -142,6 +143,18 @@ SECRET_FIELD_DEFINITIONS: List[Dict[str, str]] = [
         "display_title": "AssemblyAI Key",
         "subtitle": "Streaming speech-to-text & neural voice TTS (ASSEMBLYAI_API_KEY)",
         "placeholder": "Enter AssemblyAI key...",
+    },
+    {
+        "secret_name": jarvis_config.SECRET_FISH_API_KEY,
+        "display_title": "Fish Audio Key",
+        "subtitle": "Optional expressive Fish TTS synthesis (FISH_API_KEY)",
+        "placeholder": "Enter Fish Audio key...",
+    },
+    {
+        "secret_name": jarvis_config.SECRET_OPENCODE_API_KEY,
+        "display_title": "OpenCode Zen Key",
+        "subtitle": "OpenCode Zen multi-model endpoint (OPENCODE_API_KEY)",
+        "placeholder": "Enter OpenCode key...",
     },
 ]
 
@@ -996,6 +1009,7 @@ class ChatMessageBubble(QWidget):
         self._body_label.setObjectName("ChatBodyLabel")
         self._body_label.setWordWrap(True)
         self._body_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._apply_rtl_direction(text)
         bubble_layout.addWidget(self._body_label)
         self._update_bubble_width()
 
@@ -1005,6 +1019,13 @@ class ChatMessageBubble(QWidget):
         else:
             outer_layout.addWidget(self._bubble_frame)
             outer_layout.addStretch(1)
+
+    def _apply_rtl_direction(self, text: str) -> None:
+        is_rtl = jarvis_roamies_core.is_rtl_text(text or "")
+        direction = Qt.LayoutDirection.RightToLeft if is_rtl else Qt.LayoutDirection.LeftToRight
+        align = Qt.AlignmentFlag.AlignRight if is_rtl else Qt.AlignmentFlag.AlignLeft
+        self._body_label.setLayoutDirection(direction)
+        self._body_label.setAlignment(align | Qt.AlignmentFlag.AlignVCenter)
 
     def _update_bubble_width(self) -> None:
         metrics = QFontMetrics(jarvis_theme.ui_font(10.0))
@@ -1019,6 +1040,7 @@ class ChatMessageBubble(QWidget):
         self._is_generating = is_generating
         if text:
             self._body_label.setText(text)
+            self._apply_rtl_direction(text)
             self._update_bubble_width()
         if self._generating_badge is not None:
             self._generating_badge.setVisible(is_generating)
@@ -1700,6 +1722,107 @@ class JarvisMainWindow(QMainWindow):
 
         page_layout.addWidget(custom_endpoint_card)
 
+        page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("LOCAL SERVERS, LITE MODE & HYBRID ROUTING"))
+        hybrid_card = _build_card_frame()
+        hybrid_layout = QVBoxLayout(hybrid_card)
+        hybrid_layout.setContentsMargins(14, 10, 14, 12)
+        hybrid_layout.setSpacing(8)
+
+        self._lite_mode_toggle = ToggleSwitch()
+        self._lite_mode_toggle.toggled.connect(lambda checked: self._set_setting_from_ui("lite_mode_enabled", checked))
+        hybrid_layout.addWidget(
+            _build_setting_row(
+                "Lite Mode (Local 4B–9B models)",
+                "Compact prompt & lightweight tool set tuned for small local Ollama / LM Studio models.",
+                self._lite_mode_toggle,
+            )
+        )
+        hybrid_layout.addWidget(_build_hairline_divider())
+
+        self._reasoning_effort_combo = ChevronComboBox()
+        self._reasoning_effort_combo.setObjectName("SettingsComboBox")
+        self._reasoning_effort_combo.setMinimumWidth(220)
+        self._reasoning_effort_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for effort_entry in jarvis_config.REASONING_EFFORT_CHOICES:
+            self._reasoning_effort_combo.addItem(effort_entry["name"], effort_entry["effort_id"])
+        self._reasoning_effort_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("reasoning_effort", self._reasoning_effort_combo.itemData(idx))
+        )
+        hybrid_layout.addWidget(
+            _build_setting_row(
+                "Reasoning effort",
+                "Control extended thinking budget for Gemini 2.5/3/4, o-series, and R1 models.",
+                self._reasoning_effort_combo,
+            )
+        )
+        hybrid_layout.addWidget(_build_hairline_divider())
+
+        backup_row = QHBoxLayout()
+        backup_row.setSpacing(8)
+        self._backup_model1_input = QLineEdit()
+        self._backup_model1_input.setObjectName("SettingsLineEdit")
+        self._backup_model1_input.setPlaceholderText("Backup model 1 (e.g. gpt-4o-mini)")
+        self._backup_model1_input.editingFinished.connect(
+            lambda: self._set_setting_from_ui("backup_model_1", self._backup_model1_input.text().strip())
+        )
+        self._backup_model2_input = QLineEdit()
+        self._backup_model2_input.setObjectName("SettingsLineEdit")
+        self._backup_model2_input.setPlaceholderText("Backup model 2 (e.g. gemini-3.8-flash)")
+        self._backup_model2_input.editingFinished.connect(
+            lambda: self._set_setting_from_ui("backup_model_2", self._backup_model2_input.text().strip())
+        )
+        backup_row.addWidget(self._backup_model1_input, 1)
+        backup_row.addWidget(self._backup_model2_input, 1)
+        hybrid_layout.addWidget(QLabel("Failover Backup Chain"))
+        hybrid_layout.addLayout(backup_row)
+
+        hybrid_slots_row = QHBoxLayout()
+        hybrid_slots_row.setSpacing(6)
+        self._hybrid_vision_input = QLineEdit()
+        self._hybrid_vision_input.setObjectName("SettingsLineEdit")
+        self._hybrid_vision_input.setPlaceholderText("Vision slot model...")
+        self._hybrid_coding_input = QLineEdit()
+        self._hybrid_coding_input.setObjectName("SettingsLineEdit")
+        self._hybrid_coding_input.setPlaceholderText("Coding slot model...")
+        self._hybrid_writing_input = QLineEdit()
+        self._hybrid_writing_input.setObjectName("SettingsLineEdit")
+        self._hybrid_writing_input.setPlaceholderText("Writing slot model...")
+        save_hybrid_btn = QPushButton("Save Hybrid")
+        save_hybrid_btn.setObjectName("SecondaryActionButton")
+        save_hybrid_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_hybrid_btn.clicked.connect(self._save_hybrid_models_from_ui)
+        hybrid_slots_row.addWidget(self._hybrid_vision_input, 1)
+        hybrid_slots_row.addWidget(self._hybrid_coding_input, 1)
+        hybrid_slots_row.addWidget(self._hybrid_writing_input, 1)
+        hybrid_slots_row.addWidget(save_hybrid_btn)
+        hybrid_layout.addLayout(hybrid_slots_row)
+        hybrid_layout.addWidget(_build_hairline_divider())
+
+        local_row = QHBoxLayout()
+        local_row.setSpacing(8)
+        self._local_server_url_input = QLineEdit()
+        self._local_server_url_input.setObjectName("SettingsLineEdit")
+        self._local_server_url_input.setPlaceholderText("Local server URL (e.g. http://localhost:11434 or :1234)")
+        probe_ollama_btn = QPushButton("Probe Ollama")
+        probe_ollama_btn.setObjectName("SecondaryActionButton")
+        probe_ollama_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        probe_ollama_btn.clicked.connect(lambda: self._probe_local_server_ui("http://localhost:11434"))
+        probe_custom_btn = QPushButton("Probe URL")
+        probe_custom_btn.setObjectName("SecondaryActionButton")
+        probe_custom_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        probe_custom_btn.clicked.connect(lambda: self._probe_local_server_ui(self._local_server_url_input.text()))
+        local_row.addWidget(self._local_server_url_input, 1)
+        local_row.addWidget(probe_ollama_btn)
+        local_row.addWidget(probe_custom_btn)
+        hybrid_layout.addLayout(local_row)
+
+        self._local_servers_status_label = QLabel("Local servers: none probed yet.")
+        self._local_servers_status_label.setObjectName("RowSubtitleLabel")
+        self._local_servers_status_label.setWordWrap(True)
+        hybrid_layout.addWidget(self._local_servers_status_label)
+        page_layout.addWidget(hybrid_card)
+
         # ACCOUNT card matching bottom card in 2.15.41 AM.jpeg
         page_layout.addSpacing(4)
         page_layout.addWidget(_build_section_label("ACCOUNT"))
@@ -1901,6 +2024,42 @@ class JarvisMainWindow(QMainWindow):
         style_layout.addLayout(add_rule_row)
 
         page_layout.addWidget(style_card)
+
+        page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("DIAGNOSTICS & WHAT'S NEW"))
+        diag_card = _build_card_frame()
+        diag_layout = QVBoxLayout(diag_card)
+        diag_layout.setContentsMargins(16, 12, 16, 14)
+        diag_layout.setSpacing(8)
+
+        diag_row = QHBoxLayout()
+        diag_row.setSpacing(10)
+        diag_btn = QPushButton("Save Redacted Diagnostics")
+        diag_btn.setObjectName("SecondaryActionButton")
+        diag_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        diag_btn.clicked.connect(lambda: self.agentCommandRequested.emit("save_diagnostics", ""))
+        diag_hint = QLabel("Exports redacted logs & settings without secrets or personal usernames.")
+        diag_hint.setObjectName("CardMutedLabel")
+        diag_hint.setWordWrap(True)
+        diag_row.addWidget(diag_btn)
+        diag_row.addWidget(diag_hint, 1)
+        diag_layout.addLayout(diag_row)
+
+        diag_layout.addWidget(_build_hairline_divider())
+        releases_title = QLabel("Recent Release Parity Highlights")
+        releases_title.setObjectName("RowTitleLabel")
+        diag_layout.addWidget(releases_title)
+        for rel_entry in jarvis_roamies_core.WHATS_NEW_RELEASES[:6]:
+            if isinstance(rel_entry, dict):
+                rel_ver = str(rel_entry.get("version") or rel_entry.get("tag") or "")
+                rel_notes = str(rel_entry.get("summary") or rel_entry.get("title") or "")
+                rel_line = QLabel(f"• {rel_ver}: {rel_notes[:120]}")
+            else:
+                rel_line = QLabel(f"• {str(rel_entry)[:130]}")
+            rel_line.setObjectName("RowSubtitleLabel")
+            rel_line.setWordWrap(True)
+            diag_layout.addWidget(rel_line)
+        page_layout.addWidget(diag_card)
         page_layout.addStretch(1)
         return page_widget
 
@@ -1954,6 +2113,130 @@ class JarvisMainWindow(QMainWindow):
             )
         )
         page_layout.addWidget(playback_card)
+
+        page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("VOICE ENGINE & EXPRESSIVENESS"))
+        engine_card = _build_card_frame()
+        engine_layout = QVBoxLayout(engine_card)
+        engine_layout.setContentsMargins(16, 12, 16, 12)
+        engine_layout.setSpacing(8)
+
+        self._tts_engine_combo = ChevronComboBox()
+        self._tts_engine_combo.setObjectName("SettingsComboBox")
+        self._tts_engine_combo.setMinimumWidth(250)
+        self._tts_engine_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for engine_entry in jarvis_config.TTS_ENGINE_CHOICES:
+            self._tts_engine_combo.addItem(engine_entry["name"], engine_entry["engine_id"])
+        self._tts_engine_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("tts_engine", self._tts_engine_combo.itemData(idx))
+        )
+        engine_layout.addWidget(
+            _build_setting_row(
+                "Voice synthesis engine",
+                "Switch between AssemblyAI Neural, Google Gemini TTS (30 voices), Fish Audio, Local VoiceStudio, or Windows SAPI.",
+                self._tts_engine_combo,
+            )
+        )
+        engine_layout.addWidget(_build_hairline_divider())
+
+        self._gemini_tts_model_combo = ChevronComboBox()
+        self._gemini_tts_model_combo.setObjectName("SettingsComboBox")
+        self._gemini_tts_model_combo.setMinimumWidth(250)
+        for gem_model in jarvis_config.GEMINI_TTS_MODELS:
+            self._gemini_tts_model_combo.addItem(gem_model["name"], gem_model["model_id"])
+        self._gemini_tts_model_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("gemini_tts_model", self._gemini_tts_model_combo.itemData(idx))
+        )
+        engine_layout.addWidget(
+            _build_setting_row("Gemini TTS model", "Model used when Gemini TTS engine is active.", self._gemini_tts_model_combo)
+        )
+
+        self._gemini_tts_voice_combo = ChevronComboBox()
+        self._gemini_tts_voice_combo.setObjectName("SettingsComboBox")
+        self._gemini_tts_voice_combo.setMinimumWidth(250)
+        self._gemini_tts_voice_combo.addItem("Auto (match Companion Look)", "")
+        for gem_voice in jarvis_config.GEMINI_TTS_VOICES:
+            self._gemini_tts_voice_combo.addItem(f"{gem_voice['voice_id']} · {gem_voice['style']}", gem_voice["voice_id"])
+        self._gemini_tts_voice_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("gemini_tts_voice", self._gemini_tts_voice_combo.itemData(idx))
+        )
+        engine_layout.addWidget(
+            _build_setting_row("Gemini TTS voice", "Pick any of the 30 prebuilt Gemini voices.", self._gemini_tts_voice_combo)
+        )
+        engine_layout.addWidget(_build_hairline_divider())
+
+        fish_controls = QHBoxLayout()
+        fish_controls.setSpacing(6)
+        self._fish_tts_model_combo = ChevronComboBox()
+        self._fish_tts_model_combo.setObjectName("SettingsComboBox")
+        for fish_model in jarvis_config.FISH_TTS_MODELS:
+            self._fish_tts_model_combo.addItem(fish_model["name"], fish_model["model_id"])
+        self._fish_tts_model_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("fish_tts_model", self._fish_tts_model_combo.itemData(idx))
+        )
+        self._fish_tts_voice_input = QLineEdit()
+        self._fish_tts_voice_input.setObjectName("SettingsLineEdit")
+        self._fish_tts_voice_input.setPlaceholderText("Fish voice reference ID (optional)")
+        self._fish_tts_voice_input.editingFinished.connect(
+            lambda: self._set_setting_from_ui("fish_tts_voice", self._fish_tts_voice_input.text().strip())
+        )
+        fish_controls.addWidget(self._fish_tts_model_combo, 1)
+        fish_controls.addWidget(self._fish_tts_voice_input, 1)
+        engine_layout.addWidget(QLabel("Fish Audio TTS Model & Voice Reference"))
+        engine_layout.addLayout(fish_controls)
+        engine_layout.addWidget(_build_hairline_divider())
+
+        vs_row = QHBoxLayout()
+        vs_row.setSpacing(6)
+        self._voicestudio_url_input = QLineEdit()
+        self._voicestudio_url_input.setObjectName("SettingsLineEdit")
+        self._voicestudio_url_input.setPlaceholderText("http://localhost:8765")
+        self._voicestudio_url_input.editingFinished.connect(
+            lambda: self._set_setting_from_ui("voicestudio_url", self._voicestudio_url_input.text().strip())
+        )
+        self._voicestudio_voice_combo = ChevronComboBox()
+        self._voicestudio_voice_combo.setObjectName("SettingsComboBox")
+        self._voicestudio_voice_combo.addItem("default", "default")
+        self._voicestudio_voice_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("voicestudio_voice", self._voicestudio_voice_combo.itemData(idx))
+        )
+        vs_probe_btn = QPushButton("Test / Voices")
+        vs_probe_btn.setObjectName("SecondaryActionButton")
+        vs_probe_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        vs_probe_btn.clicked.connect(self._probe_voicestudio_from_ui)
+        vs_row.addWidget(self._voicestudio_url_input, 1)
+        vs_row.addWidget(self._voicestudio_voice_combo, 1)
+        vs_row.addWidget(vs_probe_btn)
+        engine_layout.addWidget(QLabel("Local VoiceStudio Server"))
+        engine_layout.addLayout(vs_row)
+        self._voicestudio_status_label = QLabel("VoiceStudio: click Test to probe localhost server.")
+        self._voicestudio_status_label.setObjectName("RowSubtitleLabel")
+        engine_layout.addWidget(self._voicestudio_status_label)
+        engine_layout.addWidget(_build_hairline_divider())
+
+        self._voice_cues_toggle = ToggleSwitch()
+        self._voice_cues_toggle.toggled.connect(lambda checked: self._set_setting_from_ui("voice_cues_enabled", checked))
+        engine_layout.addWidget(
+            _build_setting_row(
+                "Expressive voice cues",
+                "Extract (laugh), (sigh), (excited) cues for avatar expressions and Gemini/Fish emotion styling.",
+                self._voice_cues_toggle,
+            )
+        )
+        engine_layout.addWidget(_build_hairline_divider())
+
+        self._math_speech_toggle = ToggleSwitch()
+        self._math_speech_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("math_speech_normalization", checked)
+        )
+        engine_layout.addWidget(
+            _build_setting_row(
+                "Read math expressions aloud",
+                "Convert fractions, exponents, and LaTeX notation into clean spoken words before synthesis.",
+                self._math_speech_toggle,
+            )
+        )
+        page_layout.addWidget(engine_card)
 
         page_layout.addSpacing(4)
         page_layout.addWidget(_build_section_label("VOICES"))
@@ -2032,6 +2315,77 @@ class JarvisMainWindow(QMainWindow):
 
         mic_layout.addLayout(meter_section)
         page_layout.addWidget(mic_card)
+
+        page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("WAKE WORD & CONVERSATION FLOW"))
+        wake_card = _build_card_frame()
+        wake_layout = QVBoxLayout(wake_card)
+        wake_layout.setContentsMargins(16, 12, 16, 12)
+        wake_layout.setSpacing(8)
+
+        self._wake_word_toggle = ToggleSwitch()
+        self._wake_word_toggle.toggled.connect(lambda checked: self._set_setting_from_ui("wake_word_enabled", checked))
+        wake_layout.addWidget(
+            _build_setting_row(
+                "Hands-free Wake Word",
+                "Listen passively for your wake phrase without holding Ctrl+Alt.",
+                self._wake_word_toggle,
+            )
+        )
+        wake_layout.addWidget(_build_hairline_divider())
+
+        self._wake_word_name_input = QLineEdit()
+        self._wake_word_name_input.setObjectName("SettingsLineEdit")
+        self._wake_word_name_input.setFixedWidth(180)
+        self._wake_word_name_input.setPlaceholderText("Jarvis")
+        self._wake_word_name_input.editingFinished.connect(self._save_wake_word_name_from_ui)
+        self._wake_word_status_label = QLabel("Active name: Jarvis")
+        self._wake_word_status_label.setObjectName("RowSubtitleLabel")
+        wake_layout.addWidget(
+            _build_setting_row("Custom wake name", "Say 'Hey <name>' to trigger Jarvis.", self._wake_word_name_input)
+        )
+        wake_layout.addWidget(self._wake_word_status_label)
+        wake_layout.addWidget(_build_hairline_divider())
+
+        self._keep_listening_toggle = ToggleSwitch()
+        self._keep_listening_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("keep_listening_enabled", checked)
+        )
+        wake_layout.addWidget(
+            _build_setting_row(
+                "Keep listening after questions",
+                "Open the mic briefly when Jarvis finishes a reply with a follow-up question.",
+                self._keep_listening_toggle,
+            )
+        )
+
+        self._keep_listening_seconds_combo = ChevronComboBox()
+        self._keep_listening_seconds_combo.setObjectName("SettingsComboBox")
+        for secs in (5, 8, 12, 15):
+            self._keep_listening_seconds_combo.addItem(f"{secs} seconds", secs)
+        self._keep_listening_seconds_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui(
+                "keep_listening_seconds",
+                int(self._keep_listening_seconds_combo.itemData(idx) or 8),
+            )
+        )
+        wake_layout.addWidget(
+            _build_setting_row("Follow-up listen timeout", "Window before mic auto-closes.", self._keep_listening_seconds_combo)
+        )
+        wake_layout.addWidget(_build_hairline_divider())
+
+        self._speak_language_combo = ChevronComboBox()
+        self._speak_language_combo.setObjectName("SettingsComboBox")
+        self._speak_language_combo.setMinimumWidth(220)
+        for lang_item in jarvis_config.DICTATION_LANGUAGE_CHOICES:
+            self._speak_language_combo.addItem(lang_item["name"], lang_item["code"])
+        self._speak_language_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("speak_language", self._speak_language_combo.itemData(idx))
+        )
+        wake_layout.addWidget(
+            _build_setting_row("Speak & response language", "Primary spoken recognition & reply language.", self._speak_language_combo)
+        )
+        page_layout.addWidget(wake_card)
         page_layout.addStretch(1)
         return page_widget
 
@@ -2158,6 +2512,49 @@ class JarvisMainWindow(QMainWindow):
             shortcuts_layout.addWidget(row_widget)
 
         page_layout.addWidget(shortcuts_card)
+
+        page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("QUICK CURSOR SHORTCUTS (CTRL+SHIFT)"))
+        quick_bar_card = _build_card_frame()
+        quick_bar_layout = QVBoxLayout(quick_bar_card)
+        quick_bar_layout.setContentsMargins(16, 12, 16, 12)
+        quick_bar_layout.setSpacing(8)
+
+        self._ask_bar_tap_toggle = ToggleSwitch()
+        self._ask_bar_tap_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("ask_bar_tap_enabled", checked)
+        )
+        test_ask_btn = QPushButton("Open Ask Bar")
+        test_ask_btn.setObjectName("SecondaryActionButton")
+        test_ask_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        test_ask_btn.clicked.connect(lambda: self.agentCommandRequested.emit("open_ask_bar", ""))
+        ask_bar_controls = QHBoxLayout()
+        ask_bar_controls.setSpacing(8)
+        ask_bar_controls.addWidget(test_ask_btn)
+        ask_bar_controls.addWidget(self._ask_bar_tap_toggle)
+        ask_host = QWidget()
+        ask_host.setLayout(ask_bar_controls)
+        quick_bar_layout.addWidget(
+            _build_setting_row(
+                "Ctrl + Shift tap -> Ask Bar at cursor",
+                "Tap Ctrl+Shift cleanly to open an inline type-to-ask bar right beside your mouse cursor.",
+                ask_host,
+            )
+        )
+        quick_bar_layout.addWidget(_build_hairline_divider())
+
+        toggle_vis_btn = QPushButton("Show / Hide")
+        toggle_vis_btn.setObjectName("SecondaryActionButton")
+        toggle_vis_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        toggle_vis_btn.clicked.connect(lambda: self.agentCommandRequested.emit("toggle_show_hide", ""))
+        quick_bar_layout.addWidget(
+            _build_setting_row(
+                "Ctrl + Shift + A (Ask Area) · Ctrl + Shift + S (Show / Hide)",
+                "Press Ctrl+Shift+A to drag a quick capture lasso anywhere, or Ctrl+Shift+S to hide/show Jarvis.",
+                toggle_vis_btn,
+            )
+        )
+        page_layout.addWidget(quick_bar_card)
         page_layout.addStretch(1)
         return page_widget
 
@@ -2209,6 +2606,80 @@ class JarvisMainWindow(QMainWindow):
         self._cursor_preview_widget = CursorPreviewWidget()
         color_layout.addWidget(self._cursor_preview_widget, 0, Qt.AlignmentFlag.AlignVCenter)
         page_layout.addWidget(color_card)
+
+        page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("COMPANION LOOK, SIZE & PRESENCE"))
+        look_card = _build_card_frame()
+        look_layout = QVBoxLayout(look_card)
+        look_layout.setContentsMargins(16, 12, 16, 12)
+        look_layout.setSpacing(8)
+
+        self._companion_look_combo = ChevronComboBox()
+        self._companion_look_combo.setObjectName("SettingsComboBox")
+        self._companion_look_combo.setMinimumWidth(250)
+        self._companion_look_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for look_entry in jarvis_config.COMPANION_LOOK_CHOICES:
+            self._companion_look_combo.addItem(look_entry["name"], look_entry["look_id"])
+        self._companion_look_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("companion_look", self._companion_look_combo.itemData(idx))
+        )
+        look_layout.addWidget(
+            _build_setting_row("Companion look", "Choose JARVIS 3D LED sphere, Triangle, Classic, GLayOS, Ultren, Anime, or Pixel Crew.", self._companion_look_combo)
+        )
+        look_layout.addWidget(_build_hairline_divider())
+
+        self._companion_size_combo = ChevronComboBox()
+        self._companion_size_combo.setObjectName("SettingsComboBox")
+        self._companion_size_combo.setMinimumWidth(220)
+        for size_entry in jarvis_config.COMPANION_SIZE_CHOICES:
+            self._companion_size_combo.addItem(size_entry["name"], size_entry["size_id"])
+        self._companion_size_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("companion_size", self._companion_size_combo.itemData(idx))
+        )
+        look_layout.addWidget(
+            _build_setting_row("Companion size", "Scale the floating avatar size.", self._companion_size_combo)
+        )
+        look_layout.addWidget(_build_hairline_divider())
+
+        self._where_appear_combo = ChevronComboBox()
+        self._where_appear_combo.setObjectName("SettingsComboBox")
+        self._where_appear_combo.setMinimumWidth(220)
+        for place_entry in jarvis_config.WHERE_I_APPEAR_CHOICES:
+            self._where_appear_combo.addItem(place_entry["name"], place_entry["place_id"])
+        self._where_appear_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("where_i_appear", self._where_appear_combo.itemData(idx))
+        )
+        look_layout.addWidget(
+            _build_setting_row("Where Jarvis appears", "Follow your mouse cursor or park neatly as a top capsule.", self._where_appear_combo)
+        )
+        look_layout.addWidget(_build_hairline_divider())
+
+        self._quiet_when_hidden_toggle = ToggleSwitch()
+        self._quiet_when_hidden_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("quiet_when_hidden", checked)
+        )
+        look_layout.addWidget(
+            _build_setting_row("Quiet when hidden", "Mute unsolicited reminder/focus voice nudges while the companion is hidden.", self._quiet_when_hidden_toggle)
+        )
+        look_layout.addWidget(_build_hairline_divider())
+
+        self._auto_clear_switch_toggle = ToggleSwitch()
+        self._auto_clear_switch_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("auto_clear_drawings_on_app_switch", checked)
+        )
+        look_layout.addWidget(
+            _build_setting_row("Clear unpinned ink on app switch", "Keep pinned paper cards while clearing transient highlights when you switch apps.", self._auto_clear_switch_toggle)
+        )
+        look_layout.addWidget(_build_hairline_divider())
+
+        self._circle_talk_toggle = ToggleSwitch()
+        self._circle_talk_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("circle_while_talking_enabled", checked)
+        )
+        look_layout.addWidget(
+            _build_setting_row("Circle-While-Talking crop", "Automatically trace & crop the area circled around your voice pointer.", self._circle_talk_toggle)
+        )
+        page_layout.addWidget(look_card)
 
         page_layout.addSpacing(4)
         page_layout.addWidget(_build_section_label("BEHAVIOR"))
@@ -2423,6 +2894,102 @@ class JarvisMainWindow(QMainWindow):
         page_layout.addWidget(companion_card)
 
         page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("SAFETY GATES & AUTO-LEARN SKILLS"))
+        safety_card = _build_card_frame()
+        safety_layout = QVBoxLayout(safety_card)
+        safety_layout.setContentsMargins(16, 12, 16, 12)
+        safety_layout.setSpacing(8)
+
+        self._allow_file_edits_toggle = ToggleSwitch()
+        self._allow_file_edits_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("allow_file_edits", checked)
+        )
+        safety_layout.addWidget(
+            _build_setting_row("Allow file edits", "Allow Jarvis to create or modify project files under D:\\Projects.", self._allow_file_edits_toggle)
+        )
+        safety_layout.addWidget(_build_hairline_divider())
+
+        self._allow_shell_toggle = ToggleSwitch()
+        self._allow_shell_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("allow_shell_commands", checked)
+        )
+        safety_layout.addWidget(
+            _build_setting_row("Allow shell commands", "Permit running local build/test commands inside project workspaces.", self._allow_shell_toggle)
+        )
+        safety_layout.addWidget(_build_hairline_divider())
+
+        self._allow_app_ctrl_toggle = ToggleSwitch()
+        self._allow_app_ctrl_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("allow_app_control", checked)
+        )
+        safety_layout.addWidget(
+            _build_setting_row("Allow UI & app control", "Allow clicking controls, typing into apps, and window orchestration.", self._allow_app_ctrl_toggle)
+        )
+        safety_layout.addWidget(_build_hairline_divider())
+
+        self._skip_allow_toggle = ToggleSwitch()
+        self._skip_allow_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("skip_allow_prompts", checked)
+        )
+        safety_layout.addWidget(
+            _build_setting_row("Auto-approve 'Ask' actions", "Skip confirmation toast prompts for mid-risk URLs/clicks (destructive blocks remain active).", self._skip_allow_toggle)
+        )
+        safety_layout.addWidget(_build_hairline_divider())
+
+        self._auto_learn_skills_toggle = ToggleSwitch()
+        self._auto_learn_skills_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("auto_learn_skills_enabled", checked)
+        )
+        safety_layout.addWidget(
+            _build_setting_row("Auto-learn procedural skills", "Automatically draft reusable SKILL.md recipes after multi-step workflows.", self._auto_learn_skills_toggle)
+        )
+        page_layout.addWidget(safety_card)
+
+        page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("MCP CONNECTIONS & 5-SPECIALIST CREW"))
+        crew_card = _build_card_frame()
+        crew_layout = QVBoxLayout(crew_card)
+        crew_layout.setContentsMargins(16, 12, 16, 14)
+        crew_layout.setSpacing(8)
+
+        self._subagent_delegate_combo = ChevronComboBox()
+        self._subagent_delegate_combo.setObjectName("SettingsComboBox")
+        self._subagent_delegate_combo.setMinimumWidth(220)
+        for mode_label, mode_id in [
+            ("Ask / Balanced Delegation", "ask"),
+            ("Automatic Crew Delegation", "auto"),
+            ("Disabled", "off"),
+        ]:
+            self._subagent_delegate_combo.addItem(mode_label, mode_id)
+        self._subagent_delegate_combo.currentIndexChanged.connect(
+            lambda idx: self._set_setting_from_ui("subagent_delegate_mode", self._subagent_delegate_combo.itemData(idx))
+        )
+        crew_layout.addWidget(
+            _build_setting_row("Subagent crew mode", "Specialists: scout, builder, writer, reviewer, tidier (up to 3 concurrent).", self._subagent_delegate_combo)
+        )
+        crew_layout.addWidget(_build_hairline_divider())
+
+        mcp_row = QHBoxLayout()
+        mcp_row.setSpacing(8)
+        import_mcp_btn = QPushButton("Import Claude / GG MCP")
+        import_mcp_btn.setObjectName("SecondaryActionButton")
+        import_mcp_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        import_mcp_btn.clicked.connect(lambda: self.agentCommandRequested.emit("import_mcp_source", "all"))
+        test_subagent_btn = QPushButton("Run Scout Subagent")
+        test_subagent_btn.setObjectName("SecondaryActionButton")
+        test_subagent_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        test_subagent_btn.clicked.connect(lambda: self.agentCommandRequested.emit("send_subagent", "Check system health"))
+        self._mcp_status_label = QLabel("MCP Servers: loading...")
+        self._mcp_status_label.setObjectName("RowSubtitleLabel")
+        self._mcp_status_label.setWordWrap(True)
+        mcp_row.addWidget(import_mcp_btn)
+        mcp_row.addWidget(test_subagent_btn)
+        mcp_row.addStretch(1)
+        crew_layout.addLayout(mcp_row)
+        crew_layout.addWidget(self._mcp_status_label)
+        page_layout.addWidget(crew_card)
+
+        page_layout.addSpacing(4)
         page_layout.addWidget(_build_section_label("LOCAL ASSISTANT EXECUTION"))
         info_card = _build_card_frame()
         info_layout = QVBoxLayout(info_card)
@@ -2502,6 +3069,61 @@ class JarvisMainWindow(QMainWindow):
         page_layout.addWidget(routines_card)
 
         page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("MORNING BRIEFING & ENCRYPTED SYNC"))
+        sync_card = _build_card_frame()
+        sync_layout = QVBoxLayout(sync_card)
+        sync_layout.setContentsMargins(16, 12, 16, 14)
+        sync_layout.setSpacing(8)
+
+        self._morning_briefing_toggle = ToggleSwitch()
+        self._morning_briefing_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("morning_briefing_enabled", checked)
+        )
+        sync_layout.addWidget(
+            _build_setting_row("Daily morning briefing", "Summarize due reminders and today's plan on your first morning turn.", self._morning_briefing_toggle)
+        )
+        sync_layout.addWidget(_build_hairline_divider())
+
+        self._morning_todoist_toggle = ToggleSwitch()
+        self._morning_todoist_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("morning_briefing_todoist", checked)
+        )
+        sync_layout.addWidget(
+            _build_setting_row("Include Todoist tasks in briefing", "Pull open Todoist items into the morning briefing note when connected.", self._morning_todoist_toggle)
+        )
+        sync_layout.addWidget(_build_hairline_divider())
+
+        sync_inputs_row = QHBoxLayout()
+        sync_inputs_row.setSpacing(6)
+        self._sync_folder_input = QLineEdit()
+        self._sync_folder_input.setObjectName("SettingsLineEdit")
+        self._sync_folder_input.setPlaceholderText("Shared sync folder path (e.g. D:\\Dropbox\\JarvisSync)")
+        self._sync_passphrase_input = QLineEdit()
+        self._sync_passphrase_input.setObjectName("SettingsLineEdit")
+        self._sync_passphrase_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._sync_passphrase_input.setPlaceholderText("Sync passphrase (scrypt + AES-GCM)")
+        unlock_sync_btn = QPushButton("Unlock && Enable")
+        unlock_sync_btn.setObjectName("SecondaryActionButton")
+        unlock_sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        unlock_sync_btn.clicked.connect(self._unlock_encrypted_sync_from_ui)
+        sync_now_btn = QPushButton("Sync Now")
+        sync_now_btn.setObjectName("PrimaryActionButton")
+        sync_now_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        sync_now_btn.clicked.connect(lambda: self.agentCommandRequested.emit("run_sync_now", ""))
+        sync_inputs_row.addWidget(self._sync_folder_input, 2)
+        sync_inputs_row.addWidget(self._sync_passphrase_input, 1)
+        sync_inputs_row.addWidget(unlock_sync_btn)
+        sync_inputs_row.addWidget(sync_now_btn)
+        sync_layout.addWidget(QLabel("End-to-End Encrypted Sync (Commitments & Facts)"))
+        sync_layout.addLayout(sync_inputs_row)
+
+        self._sync_status_label = QLabel("Encrypted sync: disabled.")
+        self._sync_status_label.setObjectName("RowSubtitleLabel")
+        self._sync_status_label.setWordWrap(True)
+        sync_layout.addWidget(self._sync_status_label)
+        page_layout.addWidget(sync_card)
+
+        page_layout.addSpacing(4)
         page_layout.addWidget(_build_section_label("LOCAL ROUTINES"))
         info_card = _build_card_frame()
         info_layout = QVBoxLayout(info_card)
@@ -2548,6 +3170,9 @@ class JarvisMainWindow(QMainWindow):
             )
             self._agents_summary_label.setText(summary_line)
 
+            mcp_mgr = jarvis_roamies_core.MCPConnectionManager()
+            self._mcp_status_label.setText(f"MCP Servers: {mcp_mgr.live_state_text()}")
+
             today_preview = ", ".join(item["text"][:32] for item in (today_items + later_items)[:4]) or "None"
             self._routines_commitments_label.setText(f"Commitments ({open_total}): {today_preview}")
             skills_preview = ", ".join(item["name"][:28] for item in skills_list[:5]) or "None yet"
@@ -2556,6 +3181,105 @@ class JarvisMainWindow(QMainWindow):
             self._routines_jobs_label.setText(f"Scheduled Jobs ({len(jobs_list)}): {jobs_preview}")
         except Exception:
             pass
+
+    @staticmethod
+    def _set_combo_by_data(combo_box: QComboBox, target_value: Any) -> None:
+        idx = combo_box.findData(target_value)
+        if idx >= 0:
+            combo_box.setCurrentIndex(idx)
+
+    def _save_hybrid_models_from_ui(self) -> None:
+        if self._updating_from_store:
+            return
+        hybrid_map: Dict[str, str] = {}
+        if self._hybrid_vision_input.text().strip():
+            hybrid_map["vision"] = self._hybrid_vision_input.text().strip()
+        if self._hybrid_coding_input.text().strip():
+            hybrid_map["coding"] = self._hybrid_coding_input.text().strip()
+        if self._hybrid_writing_input.text().strip():
+            hybrid_map["writing"] = self._hybrid_writing_input.text().strip()
+        self._settings_store.set("hybrid_models", hybrid_map)
+        self._local_servers_status_label.setText(f"Saved hybrid routing ({len(hybrid_map)} custom slot(s)).")
+
+    def _probe_local_server_ui(self, raw_url: str) -> None:
+        normalized_url = jarvis_roamies_core.LocalModelDiscoveryService.normalize_local_server_url(
+            raw_url or "http://localhost:11434"
+        )
+        if not normalized_url:
+            self._local_servers_status_label.setText("Invalid local URL format.")
+            return
+        if ":11434" in normalized_url:
+            probe_res = jarvis_roamies_core.LocalModelDiscoveryService.probe_ollama()
+        else:
+            probe_res = jarvis_roamies_core.LocalModelDiscoveryService.probe_openai_server(
+                server_id="custom-local",
+                label="Local OpenAI",
+                base_url=normalized_url,
+            )
+        discovered_models = list(probe_res.get("models") or [])
+        if probe_res.get("ok") and discovered_models:
+            existing_srvs = list(self._settings_store.get("local_servers", []) or [])
+            updated_srvs = [
+                srv for srv in existing_srvs if isinstance(srv, dict) and srv.get("url") != normalized_url
+            ]
+            updated_srvs.append(
+                {
+                    "id": str(probe_res.get("id") or "local"),
+                    "name": str(probe_res.get("label") or "Local Server"),
+                    "url": normalized_url,
+                    "models": [str(mdl.get("id") or mdl) if isinstance(mdl, dict) else str(mdl) for mdl in discovered_models],
+                }
+            )
+            self._settings_store.set("local_servers", updated_srvs)
+            self._local_servers_status_label.setText(
+                f"Connected {normalized_url}: {len(discovered_models)} model(s) ready."
+            )
+        else:
+            err_hint = str(probe_res.get("error") or "Server not responding")
+            self._local_servers_status_label.setText(
+                jarvis_roamies_core.LocalModelDiscoveryService.format_local_error(normalized_url, err_hint)
+            )
+
+    def _probe_voicestudio_from_ui(self) -> None:
+        import jarvis_services
+
+        vs_url = self._voicestudio_url_input.text().strip() or "http://localhost:8765"
+        self._set_setting_from_ui("voicestudio_url", vs_url)
+        conn_ok, status_msg = jarvis_services.StreamingTTSService.probe_voicestudio_status(vs_url)
+        self._voicestudio_status_label.setText(status_msg)
+        if conn_ok:
+            voices = jarvis_services.StreamingTTSService.list_voicestudio_voices(vs_url)
+            if voices:
+                current_choice = self._voicestudio_voice_combo.currentData()
+                self._voicestudio_voice_combo.clear()
+                for voice_name in voices:
+                    self._voicestudio_voice_combo.addItem(voice_name, voice_name)
+                if current_choice:
+                    self._set_combo_by_data(self._voicestudio_voice_combo, current_choice)
+
+    def _save_wake_word_name_from_ui(self) -> None:
+        raw_name = self._wake_word_name_input.text()
+        valid_ok, clean_name, err_text = jarvis_roamies_core.clean_wake_name(raw_name)
+        if valid_ok:
+            self._wake_word_status_label.setText(f"Active wake name: {clean_name}")
+            self._set_setting_from_ui("wake_word_name", clean_name)
+        else:
+            self._wake_word_status_label.setText(f"Invalid: {err_text}")
+
+    def _unlock_encrypted_sync_from_ui(self) -> None:
+        folder_path = self._sync_folder_input.text().strip()
+        passphrase = self._sync_passphrase_input.text()
+        prep_ok, _key_bytes, msg = jarvis_roamies_core.EncryptedSyncService.prepare_sync_folder(
+            folder_path,
+            passphrase,
+        )
+        if prep_ok:
+            self._settings_store.set("sync_folder_path", folder_path)
+            self._settings_store.set("sync_enabled", True)
+            self._sync_status_label.setText(f"Sync active -> {folder_path} ({msg})")
+            self._sync_passphrase_input.clear()
+        else:
+            self._sync_status_label.setText(f"Sync setup error: {msg}")
 
     def _build_byok_info_page(
         self,
@@ -3374,6 +4098,58 @@ class JarvisMainWindow(QMainWindow):
                 bool(self._settings_store.get("voice_beats_enabled", True))
             )
 
+            # Roamies full-parity UI controls sync
+            self._lite_mode_toggle.setCheckedInstant(bool(self._settings_store.get("lite_mode_enabled", False)))
+            self._set_combo_by_data(self._reasoning_effort_combo, str(self._settings_store.get("reasoning_effort", "auto")))
+            self._backup_model1_input.setText(str(self._settings_store.get("backup_model_1", "") or ""))
+            self._backup_model2_input.setText(str(self._settings_store.get("backup_model_2", "") or ""))
+            hybrid_dict = dict(self._settings_store.get("hybrid_models", {}) or {})
+            self._hybrid_vision_input.setText(str(hybrid_dict.get("vision", "") or ""))
+            self._hybrid_coding_input.setText(str(hybrid_dict.get("coding", "") or ""))
+            self._hybrid_writing_input.setText(str(hybrid_dict.get("writing", "") or ""))
+
+            self._set_combo_by_data(self._tts_engine_combo, str(self._settings_store.get("tts_engine", "assemblyai")))
+            self._set_combo_by_data(self._gemini_tts_model_combo, str(self._settings_store.get("gemini_tts_model", "gemini-2.5-flash-preview-tts")))
+            self._set_combo_by_data(self._gemini_tts_voice_combo, str(self._settings_store.get("gemini_tts_voice", "")))
+            self._set_combo_by_data(self._fish_tts_model_combo, str(self._settings_store.get("fish_tts_model", "s2-pro")))
+            self._fish_tts_voice_input.setText(str(self._settings_store.get("fish_tts_voice", "") or ""))
+            self._voicestudio_url_input.setText(str(self._settings_store.get("voicestudio_url", "http://localhost:8765") or ""))
+            self._voice_cues_toggle.setCheckedInstant(bool(self._settings_store.get("voice_cues_enabled", True)))
+            self._math_speech_toggle.setCheckedInstant(bool(self._settings_store.get("math_speech_normalization", True)))
+
+            self._wake_word_toggle.setCheckedInstant(bool(self._settings_store.get("wake_word_enabled", False)))
+            wake_name_val = str(self._settings_store.get("wake_word_name", "Jarvis") or "Jarvis")
+            self._wake_word_name_input.setText(wake_name_val)
+            self._wake_word_status_label.setText(f"Active wake name: {wake_name_val}")
+            self._keep_listening_toggle.setCheckedInstant(bool(self._settings_store.get("keep_listening_enabled", False)))
+            self._set_combo_by_data(self._keep_listening_seconds_combo, int(self._settings_store.get("keep_listening_seconds", 8) or 8))
+            self._set_combo_by_data(self._speak_language_combo, str(self._settings_store.get("speak_language", "en")))
+
+            self._ask_bar_tap_toggle.setCheckedInstant(bool(self._settings_store.get("ask_bar_tap_enabled", True)))
+            self._set_combo_by_data(self._companion_look_combo, str(self._settings_store.get("companion_look", "jarvis")))
+            self._set_combo_by_data(self._companion_size_combo, str(self._settings_store.get("companion_size", "default")))
+            self._set_combo_by_data(self._where_appear_combo, str(self._settings_store.get("where_i_appear", "cursor")))
+            self._quiet_when_hidden_toggle.setCheckedInstant(bool(self._settings_store.get("quiet_when_hidden", True)))
+            self._auto_clear_switch_toggle.setCheckedInstant(bool(self._settings_store.get("auto_clear_drawings_on_app_switch", False)))
+            self._circle_talk_toggle.setCheckedInstant(bool(self._settings_store.get("circle_while_talking_enabled", True)))
+
+            self._allow_file_edits_toggle.setCheckedInstant(bool(self._settings_store.get("allow_file_edits", True)))
+            self._allow_shell_toggle.setCheckedInstant(bool(self._settings_store.get("allow_shell_commands", True)))
+            self._allow_app_ctrl_toggle.setCheckedInstant(bool(self._settings_store.get("allow_app_control", True)))
+            self._skip_allow_toggle.setCheckedInstant(bool(self._settings_store.get("skip_allow_prompts", False)))
+            self._auto_learn_skills_toggle.setCheckedInstant(bool(self._settings_store.get("auto_learn_skills_enabled", True)))
+            self._set_combo_by_data(self._subagent_delegate_combo, str(self._settings_store.get("subagent_delegate_mode", "ask")))
+
+            self._morning_briefing_toggle.setCheckedInstant(bool(self._settings_store.get("morning_briefing_enabled", False)))
+            self._morning_todoist_toggle.setCheckedInstant(bool(self._settings_store.get("morning_briefing_todoist", False)))
+            sync_path_val = str(self._settings_store.get("sync_folder_path", "") or "")
+            self._sync_folder_input.setText(sync_path_val)
+            self._sync_status_label.setText(
+                f"Encrypted sync enabled -> {sync_path_val}"
+                if bool(self._settings_store.get("sync_enabled", False)) and sync_path_val
+                else "Encrypted sync: disabled."
+            )
+
             for field_def in SECRET_FIELD_DEFINITIONS:
                 secret_name = field_def["secret_name"]
                 self._secret_inputs[secret_name].setText(self._settings_store.get_secret(secret_name))
@@ -3448,6 +4224,29 @@ class JarvisMainWindow(QMainWindow):
                 self._screen_recordings_toggle.setCheckedInstant(bool(new_value))
                 if self.testAttribute(Qt.WidgetAttribute.WA_WState_Created):
                     jarvis_theme.set_window_excluded_from_capture(int(self.winId()), not bool(new_value))
+            elif key_name == "companion_look":
+                self._set_combo_by_data(self._companion_look_combo, str(new_value))
+            elif key_name == "companion_size":
+                self._set_combo_by_data(self._companion_size_combo, str(new_value))
+            elif key_name == "where_i_appear":
+                self._set_combo_by_data(self._where_appear_combo, str(new_value))
+            elif key_name == "tts_engine":
+                self._set_combo_by_data(self._tts_engine_combo, str(new_value))
+            elif key_name == "lite_mode_enabled":
+                self._lite_mode_toggle.setCheckedInstant(bool(new_value))
+            elif key_name == "wake_word_enabled":
+                self._wake_word_toggle.setCheckedInstant(bool(new_value))
+            elif key_name == "keep_listening_enabled":
+                self._keep_listening_toggle.setCheckedInstant(bool(new_value))
+            elif key_name == "ask_bar_tap_enabled":
+                self._ask_bar_tap_toggle.setCheckedInstant(bool(new_value))
+            elif key_name == "morning_briefing_enabled":
+                self._morning_briefing_toggle.setCheckedInstant(bool(new_value))
+            elif key_name == "sync_enabled":
+                sync_dir_text = str(self._settings_store.get("sync_folder_path", "") or "")
+                self._sync_status_label.setText(
+                    f"Encrypted sync enabled -> {sync_dir_text}" if bool(new_value) and sync_dir_text else "Encrypted sync: disabled."
+                )
         finally:
             self._updating_from_store = False
 

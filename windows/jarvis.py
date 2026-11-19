@@ -392,6 +392,8 @@ def run_strict_selftest() -> int:
                 "jarvis_main_window.py",
                 "jarvis_notch_window.py",
                 "jarvis_overlay_windows.py",
+                "jarvis_roamies_core.py",
+                "jarvis_roamies_visuals.py",
                 "jarvis_response_parser.py",
                 "jarvis_services.py",
                 "jarvis_theme.py",
@@ -1150,6 +1152,268 @@ def run_strict_selftest() -> int:
             and forgot_ok
         )
 
+        import jarvis_roamies_core
+        import jarvis_roamies_visuals
+        from PySide6.QtCore import QRectF as _SelftestRectF
+        from PySide6.QtGui import QColor as _SelftestColor, QImage as _SelftestImage, QPainter as _SelftestPainter
+
+        # 14-point full KenKaiii/Roamies GitHub parity verification (offline & deterministic)
+        avatar_img = _SelftestImage(96, 96, _SelftestImage.Format.Format_ARGB32_Premultiplied)
+        avatar_img.fill(0)
+        avatar_painter = _SelftestPainter(avatar_img)
+        for sample_look in ("jarvis", "anime", "glayos"):
+            jarvis_roamies_visuals.paint_companion_avatar(
+                avatar_painter,
+                48.0,
+                48.0,
+                sample_look,
+                "default",
+                0.8,
+                0.4,
+                "speaking",
+                "happy",
+                _SelftestColor(jarvis_theme.JARVIS_BLUE_HEX),
+            )
+        avatar_painter.end()
+        looks_ok = (len(jarvis_roamies_core.LOOK_PERSONAS) == 9) and (not avatar_img.isNull())
+
+        cube_parts = jarvis_roamies_visuals.resolve_3d_preset_or_parts("cube")
+        model_renderer = jarvis_roamies_visuals.Jarvis3DModelRenderer(cube_parts)
+        render3d_img = _SelftestImage(140, 140, _SelftestImage.Format.Format_ARGB32_Premultiplied)
+        render3d_img.fill(0)
+        render3d_painter = _SelftestPainter(render3d_img)
+        model_renderer.paint_into_rect(render3d_painter, _SelftestRectF(10.0, 10.0, 120.0, 120.0), 0.4)
+        render3d_painter.end()
+        card3d_pm = jarvis_overlay_windows._render_paper_card_to_pixmap(
+            jarvis_response_parser.DrawingCommand(
+                kind="paper",
+                x=40.0,
+                y=40.0,
+                width=360.0,
+                height=320.0,
+                label="3D Test",
+                header="Cube & Visuals",
+                body=(
+                    "model3d:preset=cube|caption=Cube | "
+                    "molecule:smiles=CCO|caption=Ethanol | "
+                    "graph:expr=x**2|caption=Parabola | "
+                    "map:region=Europe|highlight=France | "
+                    "geometry:shapes=triangle 0,0 100,0 50,80 | "
+                    "sources:NASA|https://nasa.gov | "
+                    "clip:https://youtu.be/demo|10|25|Clip | "
+                    "legend:Blue=Core;Amber=Warn | "
+                    "ticket:JR-42|In Progress|High | "
+                    "medal:Gold|Top Score"
+                ),
+            ),
+            seed_value=23,
+        )
+        visual_cards_ok = (
+            bool(cube_parts)
+            and (not render3d_img.isNull())
+            and (not card3d_pm.isNull())
+        )
+
+        norm_math = jarvis_roamies_core.normalize_math_for_speech("Calculate 3/2 + x^2")
+        cue_val = jarvis_roamies_core.cue_feel("[happy] Great work!")
+        gem_text, _gem_style = jarvis_roamies_core.convert_cues_for_gemini("[sighing] Great work 3/2!")
+        clean_disp = jarvis_roamies_core.strip_voice_cues_for_display("[warm] Great work!")
+        spoken_ok = (
+            ("joy" == cue_val)
+            and ("[warm]" not in clean_disp)
+            and ("<sigh>" in gem_text.lower())
+            and (norm_math != "Calculate 3/2 + x^2")
+            and jarvis_roamies_core.is_rtl_text("שלום עולם")
+            and jarvis_roamies_core.is_rtl_text("مرحبا بكم")
+        )
+
+        write_blk, _ = jarvis_roamies_core.JarvisSafetyEngine.check_write("~/.ssh/authorized_keys")
+        click_ask, _ = jarvis_roamies_core.JarvisSafetyEngine.check_click("Delete forever")
+        url_ask, _ = jarvis_roamies_core.JarvisSafetyEngine.check_url("http://192.168.1.50")
+        url_ok, _ = jarvis_roamies_core.JarvisSafetyEngine.check_url("https://docs.python.org")
+        safety_ok = (
+            write_blk == jarvis_roamies_core.JarvisSafetyEngine.BLOCK
+            and click_ask == jarvis_roamies_core.JarvisSafetyEngine.ASK
+            and url_ask == jarvis_roamies_core.JarvisSafetyEngine.ASK
+            and url_ok == jarvis_roamies_core.JarvisSafetyEngine.SAFE
+        )
+
+        with tempfile.TemporaryDirectory() as roamies_full_tmp:
+            iso_dpapi = jarvis_roamies_core.WindowsDPAPISecretStore(
+                store_file_path=os.path.join(roamies_full_tmp, "dpapi.json")
+            )
+            mcp_mgr = jarvis_roamies_core.MCPConnectionManager(
+                config_file_path=os.path.join(roamies_full_tmp, "mcp.json"),
+                dpapi_store=iso_dpapi,
+            )
+            mcp_add_ok, _ = mcp_mgr.add_connection("demo-mcp", command="echo", args=["ok"])
+            mcp_rem_ok, _ = mcp_mgr.remove_connection("demo-mcp")
+
+            crew_mgr = jarvis_roamies_core.SubagentCrewManager(
+                agents_root_dir=os.path.join(roamies_full_tmp, "agents")
+            )
+            picked_spec = crew_mgr.specialist_for_request("Review this PR carefully", delegate_mode="auto")
+            sent_ok, sent_entry, _ = crew_mgr.send_agent(
+                brief="Summarize readme",
+                subagent="reviewer",
+                runner_fn=lambda spec_name, brief_val: f"{spec_name}: reviewed {brief_val}",
+            )
+            rep_ok = False
+            rep_text = ""
+            for _poll_idx in range(40):
+                rep_ok, rep_text = crew_mgr.get_agent_report(str(sent_entry.get("id") or ""))
+                if rep_ok and ("reviewed" in rep_text.lower()):
+                    break
+                time.sleep(0.025)
+
+            prev_sync_state_path = jarvis_roamies_core.DEFAULT_SYNC_STATE_PATH
+            jarvis_roamies_core.DEFAULT_SYNC_STATE_PATH = os.path.join(roamies_full_tmp, "sync_state.json")
+            try:
+                sync_c = jarvis_services.CommitmentsReminderService(storage_path=os.path.join(roamies_full_tmp, "sc.json"))
+                sync_c.add_commitment("Sync parity item", due_str="tomorrow", repeat_str="every 2 hours")
+                sync_f = jarvis_services.LearnedFactsService(storage_path=os.path.join(roamies_full_tmp, "sf.json"))
+                sync_f.learn_fact("Testing encrypted sync")
+                prep_ok, sync_key_bytes, _ = jarvis_roamies_core.EncryptedSyncService.prepare_sync_folder(
+                    roamies_full_tmp,
+                    "sync-passphrase-1",
+                    dpapi_store=iso_dpapi,
+                )
+                sealed_box = jarvis_roamies_core.EncryptedSyncService.seal_json(
+                    sync_key_bytes or b"0" * 32,
+                    {"hello": "jarvis"},
+                    "dev-a",
+                )
+                unsealed_box = jarvis_roamies_core.EncryptedSyncService.unseal_json(
+                    sync_key_bytes or b"0" * 32,
+                    sealed_box,
+                    "dev-a",
+                )
+                pass_ok, _ = jarvis_roamies_core.EncryptedSyncService.run_sync_pass(
+                    roamies_full_tmp,
+                    "dev-a",
+                    sync_c,
+                    sync_f,
+                    dpapi_store=iso_dpapi,
+                )
+            finally:
+                jarvis_roamies_core.DEFAULT_SYNC_STATE_PATH = prev_sync_state_path
+
+        local_ok = (
+            jarvis_roamies_core.LocalModelDiscoveryService.normalize_local_server_url("http://127.0.0.1:11434")
+            == "http://127.0.0.1:11434/v1"
+            and jarvis_roamies_core.LocalModelDiscoveryService.normalize_local_server_url("ftp://bad") is None
+            and bool(jarvis_roamies_core.LocalModelDiscoveryService.format_local_error("Ollama", "connection refused"))
+            and bool(jarvis_roamies_core.LocalModelDiscoveryService.context_warning_note(4096, "Ollama"))
+        )
+
+        inline_ovr = jarvis_roamies_core.HybridModelRouter.detect_inline_model_override("use sonnet to debug")
+        qwen_x, qwen_y = jarvis_roamies_core.HybridModelRouter.convert_qwen_1000_coords(500.0, 250.0, 1920.0, 1080.0)
+        hybrid_ok = (
+            "code" in jarvis_roamies_core.HybridModelRouter.classify_job_kinds("fix python unit test")
+            and bool(inline_ovr)
+            and jarvis_roamies_core.HybridModelRouter.is_qwen_1000_grid_model("qwen3-vl-32b")
+            and abs(qwen_x - 960.0) < 1.0
+            and abs(qwen_y - 270.0) < 1.0
+        )
+
+        redacted_diag = jarvis_roamies_core.DiagnosticsExporter.redact_secrets_and_pii(
+            "key=sk-proj-1234567890abcdef123456 user@example.com"
+        )
+        diag_ok = (
+            ("sk-proj-123456" not in redacted_diag)
+            and ("example.com" not in redacted_diag)
+            and bool(jarvis_roamies_core.DiagnosticsExporter.build_diagnostics_report(settings_store))
+        )
+
+        rep_spec = jarvis_roamies_core.parse_repeat_schedule("every 2 hours")
+        wake_valid, wake_cleaned, _ = jarvis_roamies_core.clean_wake_name("Jarvis")
+        wake_bad_valid, _bad_clean, _bad_err = jarvis_roamies_core.clean_wake_name("Hey Jarvis!")
+        wake_heard, wake_rem = jarvis_services.WakeWordService.matches_wake_phrase("Hey Jarvis check my screen", "Jarvis")
+        brief_res = jarvis_roamies_core.build_morning_briefing_note(
+            on=True,
+            last_day="",
+            by_voice=True,
+            todoist=True,
+            user_name="Ruthvik",
+        )
+        schedule_wake_ok = (
+            rep_spec is not None
+            and jarvis_roamies_core.compute_next_repeat_timestamp(rep_spec, from_ts=1000.0) == 8200.0
+            and jarvis_roamies_core.parse_voice_snooze_request("snooze for 15 minutes") == 15
+            and wake_valid
+            and (not wake_bad_valid)
+            and wake_cleaned == "Jarvis"
+            and wake_heard
+            and ("check my screen" in wake_rem.lower())
+            and (brief_res is not None)
+        )
+
+        ask_bar_w = jarvis_roamies_visuals.CursorAskBarWindow()
+        approval_w = jarvis_roamies_visuals.RiskyActionApprovalBar()
+        toast_w = jarvis_roamies_visuals.AgentArtifactToastWindow()
+        widgets_ok = (
+            not ask_bar_w.grab().isNull()
+            and not approval_w.grab().isNull()
+            and not toast_w.grab().isNull()
+        )
+        ask_bar_w.close()
+        approval_w.close()
+        toast_w.close()
+        ask_bar_w.deleteLater()
+        approval_w.deleteLater()
+        toast_w.deleteLater()
+        roamies_overlay.deleteLater()
+        qt_application.processEvents()
+
+        full_cmds_turn = jarvis_response_parser.parse_model_response(
+            '[happy] Drawing every full mark now.\n'
+            'hover(400, 300, "Submit")\n'
+            'trace(100, 100, 220, 140)\n'
+            'line(10, 20, 110, 120)\n'
+            'curve(10, 20, 60, 80, 120, 20)\n'
+            'arrow(20, 20, 140, 80)\n'
+            'circle(200, 200, 45)\n'
+            'rect(300, 100, 120, 60)\n'
+            'write(320, 120, "Note")\n'
+            'label(320, 160, "Step 1")\n'
+            'emote("happy")\n'
+            'sfx("jarvis-text-open")\n'
+            'button(120, 420, "Run", "ask|test")\n'
+            'walkthrough_step(500, 300, 32, "Click Save", "click")\n'
+            'add_connection("docs", "npx -y @demo/docs")\n'
+            'send_agent("scout", "Scan project")\n'
+            'about_jarvis("show")\n'
+        )
+        parsed_full_kinds = {cmd_item.kind for cmd_item in full_cmds_turn.commands}
+        expected_full_kinds = {
+            "hover", "trace", "line", "curve", "arrow", "circle", "rect",
+            "write", "label", "emote", "sfx", "button", "walkthrough_step",
+            "add_connection", "send_agent", "about_jarvis",
+        }
+        full_parser_ok = expected_full_kinds.issubset(parsed_full_kinds)
+
+        roamies_github_full_ok = (
+            looks_ok
+            and visual_cards_ok
+            and spoken_ok
+            and safety_ok
+            and mcp_add_ok
+            and mcp_rem_ok
+            and (picked_spec is not None)
+            and sent_ok
+            and rep_ok
+            and ("reviewed" in rep_text.lower())
+            and prep_ok
+            and (unsealed_box == {"hello": "jarvis"})
+            and pass_ok
+            and local_ok
+            and hybrid_ok
+            and diag_ok
+            and schedule_wake_ok
+            and widgets_ok
+            and full_parser_ok
+        )
+
         regression_safety_ok = (
             len(twitter_cmds) == 1
             and twitter_cmds[0].kind == "open_url"
@@ -1178,6 +1442,7 @@ def run_strict_selftest() -> int:
             and universal_api_ok
             and jarvis_agent_upgrade_ok
             and roamies_clone_ok
+            and roamies_github_full_ok
         )
 
         parser_ok = (
@@ -1223,7 +1488,7 @@ def run_strict_selftest() -> int:
                 f"intent_ok={intent_router_ok}, precise_ok={precise_norm_ok}, "
                 f"pdf_margin_ok={pdf_margin_snap_ok}, pt_norm_ok={labeled_point_norm_ok}, "
                 f"univ_agent_ok={universal_agent_ok}, regr_safety_ok={regression_safety_ok}, "
-                f"single_char={single_char_violations[:8]}"
+                f"roamies_full={roamies_github_full_ok}, single_char={single_char_violations[:8]}"
             ),
         )
     except Exception as exc:
@@ -1428,6 +1693,8 @@ def run_strict_selftest() -> int:
         qt_application.processEvents()
         controller.quit_application()
         qt_application.processEvents()
+        controller.deleteLater()
+        qt_application.processEvents()
 
         suite6_ok = vision_ok and tts_ok
         record_result(
@@ -1443,9 +1710,11 @@ def run_strict_selftest() -> int:
 
     if failures:
         print(f"SELFTEST FAILED ({len(failures)} failure(s))")
+        qt_application.processEvents()
         return 1
 
     print("ALL 6 SELFTEST SUITES PASSED")
+    qt_application.processEvents()
     return 0
 
 
@@ -1473,6 +1742,33 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run strict 6-suite verification (assets, 60 FPS benchmarks, parser, live STT/Vision/TTS).",
     )
+    parser.add_argument(
+        "--talk",
+        action="store_true",
+        help="Summon push-to-talk listening immediately on launch.",
+    )
+    parser.add_argument(
+        "--ask",
+        type=str,
+        default="",
+        help="Submit a question prompt immediately on launch.",
+    )
+    parser.add_argument(
+        "--summon",
+        action="store_true",
+        help="Show and center the Jarvis cursor overlay immediately on launch.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Display the interactive Today & Later reminders list overlay card on launch.",
+    )
+    parser.add_argument(
+        "--panel",
+        type=str,
+        default="",
+        help="Open a specific MainWindow panel/tab on launch (e.g. chat, settings:agents, settings:routines).",
+    )
     return parser
 
 
@@ -1485,7 +1781,10 @@ def main() -> int:
         return run_snapshot_export(parsed_args.snapshot)
 
     if parsed_args.selftest:
-        return run_strict_selftest()
+        qt_keepalive = _create_qt_application()
+        selftest_code = run_strict_selftest()
+        qt_keepalive.processEvents()
+        return selftest_code
 
     qt_application = _create_qt_application()
     settings_store = jarvis_config.SettingsStore()
@@ -1496,6 +1795,23 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, handle_sigint)
     controller.start(auto_demo=parsed_args.demo)
+
+    def _run_launch_cli_actions() -> None:
+        if parsed_args.panel:
+            controller.open_main_window(parsed_args.panel)
+        if parsed_args.list:
+            controller._on_main_window_agent_command("show_list", "")
+        if parsed_args.summon:
+            controller.overlay_window.show()
+            center_pos = controller.overlay_window.rect().center()
+            controller.overlay_window.fly_cursor_to(float(center_pos.x()), float(center_pos.y()), label="Ready", hold_seconds=4.0)
+        if (parsed_args.ask or "").strip():
+            controller._on_main_window_prompt_submitted(parsed_args.ask.strip())
+        if parsed_args.talk:
+            controller._on_ptt_pressed()
+
+    if any((parsed_args.panel, parsed_args.list, parsed_args.summon, (parsed_args.ask or "").strip(), parsed_args.talk)):
+        QTimer.singleShot(200, _run_launch_cli_actions)
 
     if parsed_args.demo_seconds > 0:
         exit_delay_ms = max(250, int(parsed_args.demo_seconds * 1000))

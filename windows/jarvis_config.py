@@ -37,6 +37,7 @@ CUSTOM_API_KEY_ALIASES = (
     "AZURE_OPENAI_API_KEY",
     "PERPLEXITY_API_KEY",
     "NVIDIA_API_KEY",
+    "OPENCODE_API_KEY",
     "API_KEY",
 )
 ENV_ENDPOINT_URL_ALIASES = (
@@ -64,12 +65,15 @@ SECRET_GOOGLE_API_KEY = "GOOGLE_API_KEY"
 GOOGLE_API_KEY_ALIASES = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_AI_API_KEY")
 SECRET_RIVER_API_KEY = "RIVER_AI_API"
 SECRET_ASSEMBLYAI_API_KEY = "ASSEMBLYAI_API_KEY"
+SECRET_FISH_API_KEY = "FISH_API_KEY"
+SECRET_OPENCODE_API_KEY = "OPENCODE_API_KEY"
 SECRET_ELEVENLABS_API_KEY = "ELEVENLABS_API_KEY"  # Legacy fallback constant kept only for backward compatibility
 ALL_SECRET_NAMES = [
     SECRET_CUSTOM_API_KEY,
     SECRET_GOOGLE_API_KEY,
     SECRET_RIVER_API_KEY,
     SECRET_ASSEMBLYAI_API_KEY,
+    SECRET_FISH_API_KEY,
 ]
 DEFAULT_GOOGLE_CHAT_MODEL = "gemini-3.8-flash"
 
@@ -85,6 +89,7 @@ KNOWN_PROVIDER_ENDPOINTS: Dict[str, str] = {
     "FIREWORKS_API_KEY": "https://api.fireworks.ai/inference/v1/chat/completions",
     "PERPLEXITY_API_KEY": "https://api.perplexity.ai/chat/completions",
     "NVIDIA_API_KEY": "https://integrate.api.nvidia.com/v1/chat/completions",
+    "OPENCODE_API_KEY": "https://opencode.ai/zen/v1/chat/completions",
     "RIVER_AI_API": "https://api.river.ai/v1/chat/completions",
     "GOOGLE_API_KEY": "https://generativelanguage.googleapis.com/v1beta/models/{model_id}:streamGenerateContent?alt=sse",
     "GEMINI_API_KEY": "https://generativelanguage.googleapis.com/v1beta/models/{model_id}:streamGenerateContent?alt=sse",
@@ -337,7 +342,113 @@ def normalize_endpoint_url(
 
 DICTATION_LANGUAGE_CHOICES: List[Dict[str, str]] = [
     {"code": "en", "name": "English"},
+    {"code": "ar", "name": "Arabic (العربية)"},
+    {"code": "he", "name": "Hebrew (עברית)"},
+    {"code": "es", "name": "Spanish"},
+    {"code": "fr", "name": "French"},
+    {"code": "de", "name": "German"},
+    {"code": "hi", "name": "Hindi"},
+    {"code": "ja", "name": "Japanese"},
+    {"code": "ko", "name": "Korean"},
+    {"code": "zh", "name": "Chinese"},
     {"code": "multi", "name": "Auto-detect (multilingual)"},
+]
+
+TTS_ENGINE_CHOICES: List[Dict[str, str]] = [
+    {"engine_id": "assemblyai", "name": "AssemblyAI Neural TTS (default)"},
+    {"engine_id": "gemini", "name": "Google Gemini TTS (30 voices)"},
+    {"engine_id": "fish", "name": "Fish Audio Live TTS (emotion cues)"},
+    {"engine_id": "voicestudio", "name": "VoiceStudio Local TTS"},
+    {"engine_id": "windows-sapi", "name": "Windows Built-in Voice (offline)"},
+]
+
+GEMINI_TTS_MODELS: List[Dict[str, str]] = [
+    {"model_id": "gemini-3.8-flash-lite-tts", "name": "Gemini 3.8 Flash Lite TTS ($0.0015 / 10s)"},
+    {"model_id": "gemini-3.8-flash-tts", "name": "Gemini 3.8 Flash TTS ($0.00225 / 10s)"},
+]
+
+FISH_TTS_MODELS: List[Dict[str, str]] = [
+    {"model_id": "drama-3", "name": "Fish Drama 3 (expressive emotion cues)"},
+    {"model_id": "s2.1-pro", "name": "Fish S2.1 Pro (fast studio quality)"},
+]
+
+GEMINI_TTS_VOICES: List[Dict[str, str]] = [
+    {"voice_id": "Zephyr", "style": "Bright"},
+    {"voice_id": "Puck", "style": "Upbeat"},
+    {"voice_id": "Charon", "style": "Informative"},
+    {"voice_id": "Kore", "style": "Firm"},
+    {"voice_id": "Fenrir", "style": "Excitable"},
+    {"voice_id": "Leda", "style": "Youthful"},
+    {"voice_id": "Orus", "style": "Firm"},
+    {"voice_id": "Aoede", "style": "Breezy"},
+    {"voice_id": "Callirrhoe", "style": "Easy-going"},
+    {"voice_id": "Autonoe", "style": "Bright"},
+    {"voice_id": "Enceladus", "style": "Breathy"},
+    {"voice_id": "Iapetus", "style": "Clear"},
+    {"voice_id": "Umbriel", "style": "Easy-going"},
+    {"voice_id": "Algieba", "style": "Smooth"},
+    {"voice_id": "Despina", "style": "Smooth"},
+    {"voice_id": "Erinome", "style": "Clear"},
+    {"voice_id": "Algenib", "style": "Gravelly"},
+    {"voice_id": "Rasalgethi", "style": "Informative"},
+    {"voice_id": "Laomedeia", "style": "Upbeat"},
+    {"voice_id": "Achernar", "style": "Soft"},
+    {"voice_id": "Alnilam", "style": "Firm"},
+    {"voice_id": "Schedar", "style": "Even"},
+    {"voice_id": "Gacrux", "style": "Mature"},
+    {"voice_id": "Pulcherrima", "style": "Forward"},
+    {"voice_id": "Achird", "style": "Friendly"},
+    {"voice_id": "Zubenelgenubi", "style": "Casual"},
+    {"voice_id": "Vindemiatrix", "style": "Gentle"},
+    {"voice_id": "Sadachbia", "style": "Lively"},
+    {"voice_id": "Sadaltager", "style": "Knowledgeable"},
+    {"voice_id": "Sulafat", "style": "Warm"},
+]
+
+GEMINI_LOOK_VOICES: Dict[str, str] = {
+    "jarvis": "Charon",
+    "triangle": "Charon",
+    "classic": "Puck",
+    "glayos": "Erinome",
+    "ultren": "Algenib",
+    "anime": "Leda",
+    "sarah": "Sulafat",
+    "adrian": "Achird",
+    "rita": "Despina",
+}
+
+COMPANION_LOOK_CHOICES: List[Dict[str, str]] = [
+    {"look_id": "jarvis", "name": "JARVIS Sphere (3D LED globe)"},
+    {"look_id": "triangle", "name": "Classic Blue Cursor (Arrow emblem)"},
+    {"look_id": "classic", "name": "Roamie (Glowing pixel creature)"},
+    {"look_id": "glayos", "name": "GlayOS (One-eyed lab AI)"},
+    {"look_id": "ultren", "name": "Ultren (Chrome twin-optic machine)"},
+    {"look_id": "anime", "name": "Anime Girl (Pixel companion)"},
+    {"look_id": "sarah", "name": "Sarah (Pixel companion)"},
+    {"look_id": "adrian", "name": "Adrian (Pixel companion)"},
+    {"look_id": "rita", "name": "Rita X (Pixel secretary)"},
+]
+
+COMPANION_SIZE_CHOICES: List[Dict[str, str]] = [
+    {"size_id": "default", "name": "Default"},
+    {"size_id": "small", "name": "Small"},
+    {"size_id": "cursor", "name": "Cursor (Compact reticle / pointer)"},
+]
+
+WHERE_I_APPEAR_CHOICES: List[Dict[str, str]] = [
+    {"place_id": "cursor", "name": "Follow Cursor + Notch"},
+    {"place_id": "capsule", "name": "Top Capsule Everywhere"},
+    {"place_id": "notch", "name": "Top Notch Only"},
+]
+
+REASONING_EFFORT_CHOICES: List[Dict[str, str]] = [
+    {"effort_id": "auto", "name": "Automatic"},
+    {"effort_id": "off", "name": "Off"},
+    {"effort_id": "low", "name": "Low"},
+    {"effort_id": "medium", "name": "Medium"},
+    {"effort_id": "high", "name": "High"},
+    {"effort_id": "xhigh", "name": "Extra High"},
+    {"effort_id": "max", "name": "Max"},
 ]
 
 
@@ -351,33 +462,77 @@ def _default_display_name() -> str:
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "user_display_name": _default_display_name(),
-    # Cursor & Screen Drawing
+    # Cursor & Screen Drawing & Appearance
     "cursor_color_hex": "#3380FF",
     "hide_floating_cursor": False,
     "shake_to_detach_enabled": False,
     "screen_highlight_enabled": True,
     "screen_drawing_mode": "lines_and_card",
     "drawing_speed": "slow_smooth",
-    # Voice (AssemblyAI-TTS-1)
+    "companion_look": "jarvis",
+    "companion_size": "default",
+    "where_i_appear": "cursor",
+    "quiet_when_hidden": True,
+    # Voice (Multi-Engine TTS: AssemblyAI / Gemini / Fish / VoiceStudio / Windows SAPI)
+    "tts_engine": "assemblyai",
     "voice_id": "aai-kyla",
+    "gemini_tts_model": "gemini-3.8-flash-lite-tts",
+    "gemini_tts_voice": "Charon",
+    "fish_tts_model": "drama-3",
+    "fish_tts_voice": "e13fa398a7f445a685316a3de6089ce7",
+    "voicestudio_url": "http://127.0.0.1:8765",
+    "voicestudio_voice": "",
     "speech_speed": 1.0,
     "captions_enabled": False,
     "typed_turns_respond_with_voice": False,
+    "voice_cues_enabled": True,
+    "math_speech_normalization": True,
     # Sounds
     "earcons_enabled": True,
     "drawing_sounds_enabled": True,
-    # Microphone (None = Windows default input device)
+    # Microphone & Listening
     "microphone_device_index": None,
+    "wake_word_enabled": False,
+    "wake_word_name": "Jarvis",
+    "keep_listening_enabled": False,
+    "keep_listening_seconds": 8,
+    "speak_language": "en",
     # Dictation
     "dictation_language": "en",
     "dictation_custom_words": ["Jarvis", "Jarvis"],
-    # Brain & Agent
+    # Shortcuts & Interactions
+    "ask_bar_tap_enabled": True,
+    "circle_while_talking_enabled": True,
+    "auto_clear_drawings_on_app_switch": True,
+    # Brain, Local Models, Hybrid & Lite Mode
     "chat_model": "deepseek-ai/DeepSeek-V4.1-Flash",
     "custom_api_base_url": "",
     "remember_style_notes": [],
+    "local_servers": [],
+    "lite_mode_enabled": False,
+    "reasoning_effort": "auto",
+    "hybrid_models": {},
+    "backup_model_1": "",
+    "backup_model_2": "",
+    "effort_per_slot": {},
+    # Agent & Safety Controls
     "agent_actions_enabled": True,
+    "allow_file_edits": True,
+    "allow_shell_commands": True,
+    "allow_app_control": True,
+    "skip_allow_prompts": False,
     "projects_root_dir": r"D:\Projects",
     "autonomous_agent_max_steps": 6,
+    # Subagents, Morning Briefing, Auto-Learn Skills & Encrypted Sync
+    "subagent_models": {},
+    "subagent_delegate_mode": "ask",
+    "morning_briefing_enabled": True,
+    "morning_briefing_todoist": False,
+    "last_briefing_day": "",
+    "auto_learn_skills_enabled": True,
+    "sync_folder_path": "",
+    "sync_device_id": "",
+    "sync_enabled": False,
     # Roamies Companion & Productivity Integrations
     "voice_beats_enabled": True,
     "focus_distraction_sites": [

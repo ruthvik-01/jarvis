@@ -10,7 +10,9 @@ widget (`OverlayCanvasWindow`) paired with a non-activating clickable floating
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass, field
+import json
 import math
 import os
 import random
@@ -19,7 +21,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QEasingCurve, QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QBuffer, QEasingCurve, QIODevice, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -39,6 +41,8 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 import jarvis_config
 import jarvis_response_parser
+import jarvis_roamies_core
+import jarvis_roamies_visuals
 import jarvis_theme
 
 FRAME_INTERVAL_MILLISECONDS = 16
@@ -95,7 +99,7 @@ class _PaperNode:
 class _PaperRow:
     """Parsed structural row from a `paper` command body."""
 
-    kind: str  # "section" | "flow" | "compare" | "tree" | "decision" | "clue" | "bars" | "timeline" | "table" | "math" | "mindmap" | "quiz" | "list" | "photo" | "note"
+    kind: str  # "section" | "flow" | "compare" | "tree" | "decision" | "clue" | "bars" | "timeline" | "table" | "math" | "mindmap" | "quiz" | "list" | "photo" | "model3d" | "molecule" | "graph" | "worldmap" | "geometry" | "sources" | "clip" | "legend" | "ticket" | "medal" | "note"
     text: str = ""
     nodes: List[_PaperNode] = field(default_factory=list)
     extra_items: List[str] = field(default_factory=list)
@@ -118,6 +122,14 @@ class _ActiveDrawingItem:
     cached_paper_size: Tuple[int, int] = (0, 0)
     cached_stroke_pixmap: Optional[QPixmap] = None
     cached_stroke_origin: Tuple[float, float] = (0.0, 0.0)
+    is_pinned: bool = False
+    card_size_mode: str = "normal"
+    checked_items: Dict[int, bool] = field(default_factory=dict)
+    quiz_selected: Dict[int, int] = field(default_factory=dict)
+    expanded_branches: Dict[int, bool] = field(default_factory=dict)
+    model3d_renderer: Optional[Any] = None
+    live_map_spec: Optional[Dict[str, Any]] = None
+    interactive_rects: List[Tuple[QRectF, str, Any]] = field(default_factory=list)
 
 
 class _ShakeToDetachDetector:
@@ -547,7 +559,30 @@ def _parse_paper_body_rows(body_text: str) -> List[_PaperRow]:
     if not body_text:
         return []
     normalized = body_text.replace("\n", "|")
-    raw_segments = [segment.strip() for segment in normalized.split("|") if segment.strip()]
+    split_segments = [segment.strip() for segment in normalized.split("|") if segment.strip()]
+    known_row_prefixes = (
+        "clue:", "memory:", "pattern:", "tip:", "section:", "bars:", "bar:", "chart:",
+        "timeline:", "dates:", "table:", "math:", "formula:", "eq:", "mindmap:", "quiz:",
+        "list:", "checklist:", "todo:", "photo:", "3d:", "model3d:", "model:", "molecule:",
+        "smiles:", "graph:", "plot:", "worldmap:", "map:", "geometry:", "geom:", "sources:",
+        "clip:", "legend:", "ticket:", "medal:", "compare:", "vs:", "tree:", "hierarchy:",
+    )
+    directive_prefixes = (
+        "3d:", "model3d:", "model:", "molecule:", "smiles:", "graph:", "plot:",
+        "worldmap:", "map:", "geometry:", "geom:", "sources:", "clip:", "legend:",
+        "ticket:", "medal:",
+    )
+    raw_segments: List[str] = []
+    for seg_piece in split_segments:
+        lowered_piece = seg_piece.lower()
+        if (
+            raw_segments
+            and raw_segments[-1].lower().startswith(directive_prefixes)
+            and (not lowered_piece.startswith(known_row_prefixes))
+        ):
+            raw_segments[-1] = f"{raw_segments[-1]}|{seg_piece}"
+        else:
+            raw_segments.append(seg_piece)
     parsed_rows: List[_PaperRow] = []
     pending_topic_nodes: List[_PaperNode] = []
 
@@ -621,6 +656,22 @@ def _parse_paper_body_rows(body_text: str) -> List[_PaperRow]:
             parsed_rows.append(_PaperRow(kind="math", text=eq_part.strip(), note_text=eq_note.strip()))
             continue
 
+        if lowered_segment.startswith("worldmap:") or (
+            lowered_segment.startswith("map:")
+            and ("->" not in cleaned_segment)
+            and (
+                lowered_segment.split(":", 1)[1].strip().startswith("{")
+                or "region" in lowered_segment
+                or "pins" in lowered_segment
+                or "shade" in lowered_segment
+                or "highlight" in lowered_segment
+            )
+        ):
+            _flush_pending_topics()
+            wmap_raw = cleaned_segment.split(":", 1)[1].strip()
+            parsed_rows.append(_PaperRow(kind="worldmap", text=wmap_raw))
+            continue
+
         if lowered_segment.startswith(("mindmap:", "map:")):
             _flush_pending_topics()
             map_raw = cleaned_segment.split(":", 1)[1].strip()
@@ -686,6 +737,89 @@ def _parse_paper_body_rows(body_text: str) -> List[_PaperRow]:
                     note_text=photo_caption.strip(),
                 )
             )
+            continue
+
+        if lowered_segment.startswith(("3d:", "model3d:", "model:")):
+            _flush_pending_topics()
+            spec_raw = cleaned_segment.split(":", 1)[1].strip()
+            parsed_rows.append(_PaperRow(kind="model3d", text=spec_raw))
+            continue
+
+        if lowered_segment.startswith(("molecule:", "smiles:")):
+            _flush_pending_topics()
+            mol_raw = cleaned_segment.split(":", 1)[1].strip()
+            if "::" in mol_raw:
+                smiles_part, mol_title = mol_raw.split("::", 1)
+            else:
+                smiles_part, mol_title = mol_raw, mol_raw
+            parsed_rows.append(_PaperRow(kind="molecule", text=smiles_part.strip(), note_text=mol_title.strip()))
+            continue
+
+        if lowered_segment.startswith(("graph:", "plot:")):
+            _flush_pending_topics()
+            graph_raw = cleaned_segment.split(":", 1)[1].strip()
+            parsed_rows.append(_PaperRow(kind="graph", text=graph_raw))
+            continue
+
+        if lowered_segment.startswith(("geometry:", "geom:")):
+            _flush_pending_topics()
+            geom_raw = cleaned_segment.split(":", 1)[1].strip()
+            parsed_rows.append(_PaperRow(kind="geometry", text=geom_raw))
+            continue
+
+        if lowered_segment.startswith("sources:"):
+            _flush_pending_topics()
+            src_raw = cleaned_segment.split(":", 1)[1].strip()
+            parsed_rows.append(_PaperRow(kind="sources", text=src_raw))
+            continue
+
+        if lowered_segment.startswith("clip:"):
+            _flush_pending_topics()
+            clip_raw = cleaned_segment.split(":", 1)[1].strip()
+            if "::" in clip_raw:
+                clip_title, clip_body = clip_raw.split("::", 1)
+            elif "|" in clip_raw:
+                clip_parts = [part.strip() for part in clip_raw.split("|") if part.strip()]
+                clip_url = clip_parts[0] if clip_parts else ""
+                clip_title = clip_parts[-1] if len(clip_parts) >= 4 else "Clip Snippet"
+                clip_range = (
+                    f"{clip_parts[1]}s–{clip_parts[2]}s"
+                    if len(clip_parts) >= 3 and clip_parts[1].isdigit()
+                    else ""
+                )
+                clip_body = f"{clip_url} ({clip_range})" if clip_range else " · ".join(clip_parts)
+            else:
+                clip_title, clip_body = ("Snippet", clip_raw)
+            parsed_rows.append(_PaperRow(kind="clip", text=clip_title.strip(), note_text=clip_body.strip()))
+            continue
+
+        if lowered_segment.startswith("legend:"):
+            _flush_pending_topics()
+            leg_raw = cleaned_segment.split(":", 1)[1].strip()
+            parsed_rows.append(_PaperRow(kind="legend", text=leg_raw))
+            continue
+
+        if lowered_segment.startswith("ticket:"):
+            _flush_pending_topics()
+            tick_raw = cleaned_segment.split(":", 1)[1].strip()
+            if "::" in tick_raw:
+                tick_title, tick_body = tick_raw.split("::", 1)
+            elif "|" in tick_raw:
+                tick_parts = [part.strip() for part in tick_raw.split("|") if part.strip()]
+                tick_title = tick_parts[0] if tick_parts else tick_raw
+                tick_body = " · ".join(tick_parts[1:])
+            else:
+                tick_title, tick_body = (tick_raw, "")
+            parsed_rows.append(_PaperRow(kind="ticket", text=tick_title.strip(), note_text=tick_body.strip()))
+            continue
+
+        if lowered_segment.startswith("medal:"):
+            _flush_pending_topics()
+            medal_raw = cleaned_segment.split(":", 1)[1].strip()
+            if "|" in medal_raw:
+                medal_parts = [part.strip() for part in medal_raw.split("|") if part.strip()]
+                medal_raw = " · ".join(medal_parts)
+            parsed_rows.append(_PaperRow(kind="medal", text=medal_raw))
             continue
 
         normalized_arrow_segment = cleaned_segment.replace("→", "->").replace("=>", "->")
@@ -1024,6 +1158,12 @@ def _render_paper_card_to_pixmap(
                 natural_heights.append(max(54.0, 14.0 + len(row.extra_items) * 22.0))
             elif row.kind == "photo":
                 natural_heights.append(92.0)
+            elif row.kind in ("model3d", "worldmap", "graph", "geometry", "molecule"):
+                natural_heights.append(128.0)
+            elif row.kind in ("clip", "ticket"):
+                natural_heights.append(78.0)
+            elif row.kind in ("sources", "legend", "medal"):
+                natural_heights.append(48.0)
             else:
                 natural_heights.append(34.0)
 
@@ -1192,6 +1332,154 @@ def _render_paper_card_to_pixmap(
                     row_width=inner_width,
                     row_height=row_height,
                     accent_color=accent_color,
+                )
+            elif row.kind == "molecule":
+                smiles_text = row.text.strip()
+                for kv_part in row.text.split("|"):
+                    kv_clean = kv_part.strip()
+                    if kv_clean.lower().startswith("smiles="):
+                        smiles_text = kv_clean.split("=", 1)[1].strip()
+                        break
+                    if ("=" not in kv_clean) and kv_clean:
+                        smiles_text = kv_clean
+                        break
+                jarvis_roamies_visuals.paint_molecule_row(
+                    painter=painter,
+                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(64.0, row_height - 4.0)),
+                    smiles_str=smiles_text,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "graph":
+                try:
+                    graph_spec = json.loads(row.text) if row.text.strip().startswith("{") else {"plots": [{"points": [[0, 1], [1, 3], [2, 2], [3, 5]]}]}
+                except Exception:
+                    graph_spec = {"plots": [{"points": [[0, 1], [1, 3], [2, 2], [3, 5]]}]}
+                jarvis_roamies_visuals.paint_graph_row(
+                    painter=painter,
+                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(64.0, row_height - 4.0)),
+                    graph_spec=graph_spec,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "geometry":
+                try:
+                    geom_spec = json.loads(row.text) if row.text.strip().startswith("{") else {}
+                except Exception:
+                    geom_spec = {}
+                if not geom_spec.get("vertices"):
+                    geom_spec = {
+                        "vertices": [{"id": "A", "x": 0, "y": 0}, {"id": "B", "x": 4, "y": 0}, {"id": "C", "x": 2, "y": 3}],
+                        "lines": [{"from": "A", "to": "B"}, {"from": "B", "to": "C"}, {"from": "C", "to": "A"}],
+                    }
+                jarvis_roamies_visuals.paint_geometry_row(
+                    painter=painter,
+                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(64.0, row_height - 4.0)),
+                    geom_spec=geom_spec,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "worldmap":
+                if row.text.strip().startswith("{"):
+                    try:
+                        map_spec = json.loads(row.text)
+                    except Exception:
+                        map_spec = {"region": "world"}
+                else:
+                    region_val = "world"
+                    shade_list: List[str] = []
+                    for map_part in row.text.split("|"):
+                        clean_part = map_part.strip()
+                        lower_part = clean_part.lower()
+                        if lower_part.startswith("region="):
+                            region_val = clean_part.split("=", 1)[1].strip() or "world"
+                        elif lower_part.startswith(("highlight=", "shade=")):
+                            raw_countries = clean_part.split("=", 1)[1].strip()
+                            shade_list.extend(
+                                {"name": country_tok.strip(), "tone": "accent"}
+                                for country_tok in re.split(r"[;,]", raw_countries)
+                                if country_tok.strip()
+                            )
+                        elif ("=" not in clean_part) and clean_part:
+                            region_val = clean_part
+                    map_spec = {"region": region_val, "shade": shade_list}
+                jarvis_roamies_visuals.paint_map_row(
+                    painter=painter,
+                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(64.0, row_height - 4.0)),
+                    map_spec=map_spec,
+                    accent_color=accent_color,
+                    anim_time=0.0,
+                )
+            elif row.kind == "model3d":
+                model3d_spec = row.text.strip()
+                if not model3d_spec.startswith(("[", "{")):
+                    for model_part in row.text.split("|"):
+                        clean_part = model_part.strip()
+                        if clean_part.lower().startswith("preset="):
+                            model3d_spec = clean_part.split("=", 1)[1].strip()
+                            break
+                jarvis_roamies_visuals.Jarvis3DModelRenderer(model3d_spec).paint_into_rect(
+                    painter=painter,
+                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(64.0, row_height - 4.0)),
+                    anim_time=0.35,
+                )
+            elif row.kind == "sources":
+                if row.text.strip().startswith("["):
+                    try:
+                        src_items = json.loads(row.text)
+                    except Exception:
+                        src_items = [{"name": row.text[:24], "url": ""}]
+                else:
+                    src_items = []
+                    for src_entry in re.split(r"[;,]", row.text):
+                        entry_clean = src_entry.strip()
+                        if not entry_clean:
+                            continue
+                        if "|" in entry_clean:
+                            src_name, src_url = entry_clean.split("|", 1)
+                            src_items.append({"name": src_name.strip(), "url": src_url.strip()})
+                        else:
+                            src_items.append({"name": entry_clean, "url": ""})
+                jarvis_roamies_visuals.paint_sources_row(
+                    painter=painter,
+                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(36.0, row_height - 4.0)),
+                    sources_list=src_items,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "clip":
+                jarvis_roamies_visuals.paint_clip_row(
+                    painter=painter,
+                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(54.0, row_height - 4.0)),
+                    clip_title=row.text,
+                    clip_text=row.note_text,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "legend":
+                keys_parsed = []
+                for chunk in re.split(r"[;,]", row.text):
+                    chunk_s = chunk.strip()
+                    if not chunk_s:
+                        continue
+                    if "=" in chunk_s:
+                        tone_p, lbl_p = chunk_s.split("=", 1)
+                        keys_parsed.append({"tone": tone_p.strip(), "text": lbl_p.strip()})
+                    else:
+                        keys_parsed.append({"tone": "accent", "text": chunk_s})
+                jarvis_roamies_visuals.paint_legend_row(
+                    painter=painter,
+                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(34.0, row_height - 4.0)),
+                    keys_list=keys_parsed,
+                )
+            elif row.kind == "ticket":
+                jarvis_roamies_visuals.paint_ticket_row(
+                    painter=painter,
+                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(54.0, row_height - 4.0)),
+                    title_text=row.text,
+                    task_text=row.note_text,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "medal":
+                jarvis_roamies_visuals.paint_medal_row(
+                    painter=painter,
+                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(38.0, row_height - 4.0)),
+                    medal_text=row.text,
                 )
             else:
                 note_font = jarvis_theme.barlow_font(11.0, semibold=False)
@@ -2108,6 +2396,11 @@ class OverlayCanvasWindow(QWidget):
     interactiveLassoCompleted = Signal(object)
     strokeAnimationStarted = Signal(str, int)
     strokeAnimationFinished = Signal()
+    cardSavedAsImage = Signal(str)
+    checklistItemToggled = Signal(str, bool)
+    actionPillTriggered = Signal(str, str)
+    quizAnswered = Signal(str, bool)
+    walkthroughStepCompleted = Signal()
 
     def __init__(self, settings_store: jarvis_config.SettingsStore) -> None:
         super().__init__(None)
@@ -2223,6 +2516,20 @@ class OverlayCanvasWindow(QWidget):
         self._plan_steps_skipped: Dict[int, str] = {}
         self._plan_steps_expires_at: float = 0.0
 
+        # Roamies companion looks, emotion state, game mode, walkthrough wait, circle-talk, card hit-rects
+        self._companion_look = str(self._settings_store.get("companion_look", "jarvis"))
+        self._companion_size = str(self._settings_store.get("companion_size", "default"))
+        self._emotion_feel: Optional[str] = None
+        self._emotion_feel_until: float = 0.0
+        self._game_mode_parked: bool = False
+        self._walkthrough_wait_rect: Optional[QRectF] = None
+        self._walkthrough_wait_mode: str = ""
+        self._walkthrough_hover_since: float = 0.0
+        self._walkthrough_prev_lbutton: bool = False
+        self._circle_talk_active: bool = False
+        self._circle_talk_points: List[Tuple[float, float]] = []
+        self._hover_interactive_active: bool = False
+
         # Bottom LiveCaption state & sprite cache
         self._caption_text = ""
         self._caption_words: List[str] = []
@@ -2285,10 +2592,120 @@ class OverlayCanvasWindow(QWidget):
         try:
             window_handle = int(self.winId())
             jarvis_theme.set_window_no_activate(window_handle, True)
-            jarvis_theme.set_window_click_through(window_handle, not self._interactive_lasso_active)
+            interactive_now = (self._interactive_lasso_active or self._hover_interactive_active) and (not self._game_mode_parked)
+            jarvis_theme.set_window_click_through(window_handle, not interactive_now)
             jarvis_theme.set_window_excluded_from_capture(window_handle, not self._show_in_screen_recordings)
         except Exception:
             pass
+
+    def set_emotion_feel(self, feel_name: Optional[str], hold_seconds: float = 4.0) -> None:
+        self._emotion_feel = (str(feel_name).strip().lower() if feel_name else None)
+        self._emotion_feel_until = (time.monotonic() + max(0.5, float(hold_seconds))) if self._emotion_feel else 0.0
+        self._ensure_timer_running()
+        self.update()
+
+    def set_game_mode_parked(self, is_parked: bool) -> None:
+        if bool(is_parked) == self._game_mode_parked:
+            return
+        self._game_mode_parked = bool(is_parked)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._hover_interactive_active = False
+        self._apply_win32_styles()
+        if self._game_mode_parked:
+            screen_w = float(max(640, self.width()))
+            self._cursor_x_spring.set_target(screen_w - 28.0)
+            self._cursor_y_spring.set_target(float(max(120, self.height() * 0.48)))
+            self._navigation_mode = "parked"
+            self._parked_until = time.monotonic() + 3600.0
+        else:
+            self._navigation_mode = "following"
+            self._parked_until = 0.0
+        self._ensure_timer_running()
+        self.update()
+
+    def start_circle_talk_trace(self) -> None:
+        if not bool(self._settings_store.get("circle_while_talking_enabled", True)):
+            return
+        self._circle_talk_active = True
+        self._circle_talk_points.clear()
+        self._ensure_timer_running()
+
+    def finish_circle_talk_trace(self) -> Optional[Tuple[int, int, int, int]]:
+        self._circle_talk_active = False
+        pts = list(self._circle_talk_points)
+        self._circle_talk_points.clear()
+        if len(pts) < 10:
+            self.update()
+            return None
+        xs = [pt_item[0] for pt_item in pts]
+        ys = [pt_item[1] for pt_item in pts]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        if (max_x - min_x) < 42.0 or (max_y - min_y) < 34.0:
+            self.update()
+            return None
+        pad = 16
+        rect_tuple = (
+            max(0, int(min_x) - pad),
+            max(0, int(min_y) - pad),
+            min(max(1, self.width()), int(max_x - min_x) + pad * 2),
+            min(max(1, self.height()), int(max_y - min_y) + pad * 2),
+        )
+        self.update()
+        return rect_tuple
+
+    def start_walkthrough_wait(self, target_rect: QRectF, wait_mode: str = "click") -> None:
+        self._walkthrough_wait_rect = QRectF(target_rect)
+        self._walkthrough_wait_mode = str(wait_mode or "click").strip().lower()
+        self._walkthrough_hover_since = 0.0
+        try:
+            self._walkthrough_prev_lbutton = bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+        except Exception:
+            self._walkthrough_prev_lbutton = False
+        self._ensure_timer_running()
+
+    def cancel_walkthrough_wait(self) -> None:
+        self._walkthrough_wait_rect = None
+        self._walkthrough_wait_mode = ""
+        self._walkthrough_hover_since = 0.0
+
+    def _hit_test_interactive(self, local_x: float, local_y: float) -> Optional[Tuple[_ActiveDrawingItem, str, Any]]:
+        pt = QPointF(local_x, local_y)
+        for item in reversed(self._drawings):
+            if item.command.kind == "paper":
+                card_w = max(200.0, float(item.command.width))
+                card_x = float(item.command.x)
+                card_y = float(item.command.y)
+                # Header action buttons at top right of paper header: Pin, Save PNG, Close
+                btn_close = QRectF(card_x + card_w - 26.0, card_y + 4.0, 20.0, 20.0)
+                btn_save = QRectF(card_x + card_w - 50.0, card_y + 4.0, 20.0, 20.0)
+                btn_pin = QRectF(card_x + card_w - 74.0, card_y + 4.0, 20.0, 20.0)
+                if btn_close.contains(pt):
+                    return item, "card_close", None
+                if btn_save.contains(pt):
+                    return item, "card_save", None
+                if btn_pin.contains(pt):
+                    return item, "card_pin", None
+                # Checklist interactive rows inside paper cards
+                parsed_rows = _parse_paper_body_rows(item.command.body)
+                for row_obj in parsed_rows:
+                    if row_obj.kind == "list":
+                        list_top = card_y + PAPER_HEADER_HEIGHT + 54.0
+                        for opt_idx, opt_text in enumerate(row_obj.extra_items):
+                            row_rect = QRectF(card_x + 16.0, list_top + opt_idx * 22.0, card_w - 32.0, 20.0)
+                            if row_rect.contains(pt):
+                                return item, "checklist_toggle", (opt_idx, opt_text)
+                    elif row_obj.kind == "quiz":
+                        opt_top = card_y + PAPER_HEADER_HEIGHT + 72.0
+                        for opt_idx, opt_text in enumerate(row_obj.extra_items):
+                            opt_rect = QRectF(card_x + 16.0, opt_top + opt_idx * 24.0, card_w - 32.0, 22.0)
+                            if opt_rect.contains(pt):
+                                return item, "quiz_pick", (opt_idx, opt_text, row_obj.text)
+            elif item.command.kind == "button":
+                btn_rect = QRectF(item.command.x, item.command.y, max(110.0, item.command.width), max(32.0, item.command.height))
+                if btn_rect.contains(pt):
+                    return item, "overlay_button", item.command.body
+        return None
 
     def start_interactive_lasso_mode(self) -> None:
         """
@@ -2341,6 +2758,54 @@ class OverlayCanvasWindow(QWidget):
             self.update()
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position()
+            hit = self._hit_test_interactive(float(pos.x()), float(pos.y()))
+            if hit is not None:
+                target_item, hit_kind, hit_payload = hit
+                if hit_kind == "card_close":
+                    if target_item in self._drawings:
+                        self._drawings.remove(target_item)
+                    self._sync_clear_button_visibility()
+                    self.update()
+                elif hit_kind == "card_pin":
+                    target_item.is_pinned = not target_item.is_pinned
+                    if target_item.is_pinned:
+                        target_item.expires_at = max(target_item.expires_at, time.monotonic() + 3600.0)
+                    self.update()
+                elif hit_kind == "card_save":
+                    pix = target_item.cached_paper_pixmap or _render_paper_card_to_pixmap(target_item.command, target_item.seed_value)
+                    buf = QBuffer()
+                    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+                    pix.save(buf, "PNG")
+                    saved_path = jarvis_roamies_core.save_card_image_to_downloads(bytes(buf.data()), target_item.command.label or "card")
+                    buf.close()
+                    self.cardSavedAsImage.emit(saved_path)
+                    self.set_bubble_message(f"Saved card to Downloads", word_by_word=False, hold_seconds=2.5)
+                elif hit_kind == "checklist_toggle":
+                    opt_idx, opt_text = hit_payload
+                    prev_checked = target_item.checked_items.get(opt_idx, "[x]" in opt_text.lower())
+                    new_checked = not prev_checked
+                    target_item.checked_items[opt_idx] = new_checked
+                    clean_item = re.sub(r"^\s*\[[ xX]?\]\s*", "", str(opt_text)).strip()
+                    self.checklistItemToggled.emit(clean_item, new_checked)
+                    self.update()
+                elif hit_kind == "quiz_pick":
+                    opt_idx, opt_text, q_text = hit_payload
+                    target_item.quiz_selected[0] = opt_idx
+                    is_right = opt_text.strip().startswith("*")
+                    self.quizAnswered.emit(q_text, is_right)
+                    self.set_bubble_message("Correct!" if is_right else "Try again!", word_by_word=False, hold_seconds=2.2)
+                    self.update()
+                elif hit_kind == "overlay_button":
+                    spec_str = str(hit_payload or "")
+                    if "|" in spec_str:
+                        act_do, act_val = spec_str.split("|", 1)
+                    else:
+                        act_do, act_val = "ask", spec_str
+                    self.actionPillTriggered.emit(act_do.strip().lower(), act_val.strip())
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
@@ -2714,13 +3179,24 @@ class OverlayCanvasWindow(QWidget):
             delay_seconds = max(0.0, scheduled_start - now_seconds)
             self._next_stroke_schedule_time = scheduled_start + stroke_duration + 0.08
 
+        is_pinned_card = bool((prepared_command.extra_data or {}).get("keep_card"))
+        hold_dur = 3600.0 if is_pinned_card else DEFAULT_DRAWING_HOLD_SECONDS
+        model3d_obj = None
+        if prepared_command.kind == "paper" and "3d:" in (prepared_command.body or "").lower():
+            for body_part in (prepared_command.body or "").split("|"):
+                if body_part.strip().lower().startswith(("3d:", "model3d:", "model:")):
+                    model3d_obj = jarvis_roamies_visuals.Jarvis3DModelRenderer(body_part.split(":", 1)[1].strip())
+                    break
+
         drawing_item = _ActiveDrawingItem(
             command=prepared_command,
             created_at=now_seconds,
             delay_seconds=delay_seconds,
             duration_seconds=stroke_duration,
-            expires_at=now_seconds + delay_seconds + stroke_duration + DEFAULT_DRAWING_HOLD_SECONDS,
+            expires_at=now_seconds + delay_seconds + stroke_duration + hold_dur,
             seed_value=self._next_drawing_seed,
+            is_pinned=is_pinned_card,
+            model3d_renderer=model3d_obj,
         )
         self._prebuild_drawing_cache(drawing_item)
         self._drawings.append(drawing_item)
@@ -2916,6 +3392,16 @@ class OverlayCanvasWindow(QWidget):
         self._sync_clear_button_visibility()
         self.update()
 
+    def clear_unpinned_drawings(self) -> None:
+        """Clears drawings when switching apps while leaving user-pinned cards intact."""
+        kept = [item for item in self._drawings if item.is_pinned]
+        if len(kept) == len(self._drawings):
+            return
+        self._drawings = kept
+        self._next_stroke_schedule_time = 0.0
+        self._sync_clear_button_visibility()
+        self.update()
+
     def has_active_drawings(self) -> bool:
         return bool(self._drawings)
 
@@ -2985,6 +3471,17 @@ class OverlayCanvasWindow(QWidget):
 
         if key_name == "drawing_speed":
             self._drawing_speed = str(value or jarvis_config.DEFAULT_SETTINGS["drawing_speed"])
+            return
+
+        if key_name == "companion_look":
+            self._companion_look = str(value or "jarvis").strip().lower()
+            self._ensure_timer_running()
+            self.update()
+            return
+
+        if key_name == "companion_size":
+            self._companion_size = str(value or "default").strip().lower()
+            self.update()
             return
 
     def benchmark_frame_ms(self, iterations: int = 60) -> Dict[str, float]:
@@ -3254,6 +3751,49 @@ class OverlayCanvasWindow(QWidget):
         mouse_moved = math.hypot(mouse_x - self._last_mouse_position[0], mouse_y - self._last_mouse_position[1]) > 0.5
         self._last_mouse_position = (mouse_x, mouse_y)
 
+        if self._emotion_feel and self._emotion_feel_until > 0.0 and now_seconds >= self._emotion_feel_until:
+            self._emotion_feel = None
+            self._emotion_feel_until = 0.0
+            changed = True
+
+        if self._circle_talk_active:
+            if (not self._circle_talk_points) or math.hypot(mouse_x - self._circle_talk_points[-1][0], mouse_y - self._circle_talk_points[-1][1]) >= 4.0:
+                self._circle_talk_points.append((mouse_x, mouse_y))
+                changed = True
+
+        if self._walkthrough_wait_rect is not None:
+            inside_wait = self._walkthrough_wait_rect.contains(QPointF(mouse_x, mouse_y))
+            if self._walkthrough_wait_mode == "hover":
+                if inside_wait:
+                    if self._walkthrough_hover_since <= 0.0:
+                        self._walkthrough_hover_since = now_seconds
+                    elif (now_seconds - self._walkthrough_hover_since) >= 0.55:
+                        self._walkthrough_wait_rect = None
+                        self.walkthroughStepCompleted.emit()
+                else:
+                    self._walkthrough_hover_since = 0.0
+            else:
+                try:
+                    lbutton_down = bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+                except Exception:
+                    lbutton_down = False
+                if inside_wait and lbutton_down and (not self._walkthrough_prev_lbutton):
+                    self._walkthrough_wait_rect = None
+                    self._walkthrough_prev_lbutton = lbutton_down
+                    self.walkthroughStepCompleted.emit()
+                self._walkthrough_prev_lbutton = lbutton_down
+
+        if self._drawings and (not self._interactive_lasso_active) and (not self._game_mode_parked):
+            want_interactive = self._hit_test_interactive(mouse_x, mouse_y) is not None
+            if want_interactive != self._hover_interactive_active:
+                self._hover_interactive_active = want_interactive
+                self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not want_interactive)
+                self._apply_win32_styles()
+        elif self._hover_interactive_active and not self._drawings:
+            self._hover_interactive_active = False
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self._apply_win32_styles()
+
         if (
             self._shake_to_detach_enabled
             and not self._hide_floating_cursor
@@ -3382,6 +3922,8 @@ class OverlayCanvasWindow(QWidget):
                                 self._cursor_y_spring.set_target(tip_point[1] + 10.0)
                                 self._target_hold_until = max(self._target_hold_until, now_seconds + 2.6)
                                 self._navigation_mode = "pointing"
+                    if item.model3d_renderer is not None:
+                        changed = True
                     if elapsed_item <= item.duration_seconds + 0.05 or (item.expires_at - now_seconds) <= DRAWING_FADE_OUT_SECONDS:
                         changed = True
             if self._was_actively_drawing and not active_drawing_now:
@@ -3437,8 +3979,15 @@ class OverlayCanvasWindow(QWidget):
             if item.command.kind != "paper":
                 self._paint_drawing_item(painter, item, now_seconds)
 
-        # 2. Draw-to-Ask highlight stroke
+        # 2. Draw-to-Ask highlight stroke + Circle-while-Talking trail
         self._paint_highlight_stroke(painter, now_seconds)
+        if len(self._circle_talk_points) >= 2:
+            circle_path = _build_smooth_catmull_rom_path(self._circle_talk_points)
+            painter.save()
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#78FFE2"), 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            painter.drawPath(circle_path)
+            painter.restore()
 
         # 3. Companion cursor & cursor message bubble
         cursor_opacity = _clamp_float(self._cursor_opacity_spring.value, 0.0, 1.0)
@@ -3474,13 +4023,34 @@ class OverlayCanvasWindow(QWidget):
         if command.kind == "paper":
             if item.cached_paper_pixmap is None:
                 item.cached_paper_pixmap = _render_paper_card_to_pixmap(command, item.seed_value)
+            lift_offset = (1.0 - draw_progress) * 12.0
             painter.save()
             painter.setOpacity(draw_progress * fade_alpha)
-            lift_offset = (1.0 - draw_progress) * 12.0
             painter.drawPixmap(
                 QPointF(command.x - 14.0, command.y - 14.0 + lift_offset),
                 item.cached_paper_pixmap,
             )
+            # Interactive card top-right action controls: Pin, Save PNG, Close
+            card_w = max(200.0, float(command.width))
+            card_y = float(command.y) + lift_offset
+            ctrl_font = jarvis_theme.ui_font(9.0, QFont.Weight.Bold)
+            painter.setFont(ctrl_font)
+            btn_specs = (
+                (command.x + card_w - 74.0, "PIN" if item.is_pinned else "Pin", "#78FFE2" if item.is_pinned else "#94A3B8"),
+                (command.x + card_w - 50.0, "PNG", "#93C5FD"),
+                (command.x + card_w - 26.0, "x", "#FCA5A5"),
+            )
+            for bx, btxt, bhex in btn_specs:
+                brect = QRectF(bx, card_y + 5.0, 20.0, 18.0)
+                painter.setPen(QPen(QColor(bhex), 0.9))
+                painter.setBrush(QColor(22, 24, 32, 220))
+                painter.drawRoundedRect(brect, 4.0, 4.0)
+                painter.setPen(QColor(bhex))
+                painter.drawText(brect, Qt.AlignmentFlag.AlignCenter, btxt if len(btxt) <= 3 else btxt[:3])
+            # Live animated 3D viewport overlay inside 3D cards
+            if item.model3d_renderer is not None and draw_progress > 0.35:
+                view_rect = QRectF(command.x + 20.0, card_y + PAPER_HEADER_HEIGHT + 44.0, card_w - 40.0, max(90.0, float(command.height) - PAPER_HEADER_HEIGHT - 64.0))
+                item.model3d_renderer.paint_into_rect(painter, view_rect, now_seconds)
             painter.restore()
             return
 
@@ -3489,8 +4059,6 @@ class OverlayCanvasWindow(QWidget):
             jarvis_theme.DRAWING_TONES["yellow"] if command.kind == "highlight" else jarvis_theme.SCREEN_MARKER_BLUE,
         )
 
-        if command.kind in ("target", "strike", "check", "cross", "num", "connect", "spotlight"):
-            return command
         if command.kind == "underline":
             if draw_progress >= 0.99:
                 self._paint_cached_or_live_stroke_item(
@@ -3543,6 +4111,8 @@ class OverlayCanvasWindow(QWidget):
                 self._paint_highlight_wash(painter, command, tone_color, draw_progress, fade_alpha)
         elif command.kind == "target":
             self._paint_target_mark(painter, command, tone_color, draw_progress, fade_alpha, now_seconds)
+        elif command.kind == "walkthrough_step":
+            self._paint_target_mark(painter, command, tone_color, draw_progress, fade_alpha, now_seconds)
         elif command.kind == "strike":
             self._paint_strike_mark(painter, command, tone_color, draw_progress, fade_alpha)
         elif command.kind in ("check", "cross"):
@@ -3553,11 +4123,58 @@ class OverlayCanvasWindow(QWidget):
             self._paint_connect_mark(painter, command, tone_color, draw_progress, fade_alpha, now_seconds)
         elif command.kind == "spotlight":
             self._paint_spotlight_mark(painter, command, tone_color, draw_progress, fade_alpha)
+        elif command.kind == "hover":
+            self._paint_target_mark(painter, command, QColor("#78FFE2"), draw_progress, fade_alpha, now_seconds)
+        elif command.kind in ("line", "arrow", "trace", "curve"):
+            end_x = command.x + (command.width if abs(command.width) > 1.0 else 120.0)
+            end_y = command.y + command.height
+            painter.save()
+            painter.setOpacity(draw_progress * fade_alpha)
+            painter.setPen(QPen(tone_color, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            if command.kind == "curve":
+                path = QPainterPath(QPointF(command.x, command.y))
+                path.quadTo(QPointF((command.x + end_x) * 0.5, min(command.y, end_y) - 36.0), QPointF(end_x, end_y))
+                painter.drawPath(path)
+            else:
+                painter.drawLine(QPointF(command.x, command.y), QPointF(end_x, end_y))
+            painter.restore()
+            if command.label and draw_progress > 0.3:
+                _paint_callout_pill(painter, (command.x + end_x) * 0.5, min(command.y, end_y) - 22.0, command.label, tone_color, opacity=fade_alpha)
+        elif command.kind == "circle":
+            painter.save()
+            painter.setOpacity(draw_progress * fade_alpha)
+            painter.setPen(QPen(tone_color, 2.4))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QPointF(command.x, command.y), max(16.0, command.width * 0.5), max(16.0, command.width * 0.5))
+            painter.restore()
+        elif command.kind == "rect":
+            painter.save()
+            painter.setOpacity(draw_progress * fade_alpha)
+            painter.setPen(QPen(tone_color, 2.2))
+            painter.setBrush(jarvis_theme.with_alpha(tone_color, 26))
+            painter.drawRoundedRect(QRectF(command.x, command.y, max(28.0, command.width), max(22.0, command.height)), 8.0, 8.0)
+            painter.restore()
+        elif command.kind in ("write", "label"):
+            painter.save()
+            painter.setOpacity(draw_progress * fade_alpha)
+            painter.setFont(jarvis_theme.hand_font(15.0))
+            painter.setPen(tone_color)
+            painter.drawText(QRectF(command.x, command.y, 420.0, 42.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, command.label or command.body)
+            painter.restore()
+        elif command.kind == "button":
+            btn_rect = QRectF(command.x, command.y, max(110.0, command.width), max(32.0, command.height))
+            painter.save()
+            painter.setOpacity(draw_progress * fade_alpha)
+            painter.setPen(QPen(QColor("#78FFE2"), 1.6))
+            painter.setBrush(QColor(12, 26, 36, 238))
+            painter.drawRoundedRect(btn_rect, 10.0, 10.0)
+            painter.setFont(jarvis_theme.ui_font(10.5, QFont.Weight.Bold))
+            painter.setPen(QColor("#E8FFFA"))
+            painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter, command.label[:36])
+            painter.restore()
 
     def _compute_item_sprite_bounds(self, item: _ActiveDrawingItem) -> QRectF:
         command = item.command
-        if command.kind in ("target", "strike", "check", "cross", "num", "connect", "spotlight"):
-            return command
         if command.kind == "underline":
             bounds = QRectF(command.x - 48.0, command.y - 36.0, command.width + 72.0, 72.0)
         elif command.kind == "ring":
@@ -4183,6 +4800,25 @@ class OverlayCanvasWindow(QWidget):
         opacity: float,
         now_seconds: float,
     ) -> None:
+        if self._companion_look != "triangle":
+            state_mode = "listen" if self._is_listening else ("think" if self._is_thinking else ("talk" if self._is_speaking else "idle"))
+            painter.save()
+            painter.setOpacity(opacity)
+            jarvis_roamies_visuals.paint_companion_avatar(
+                painter=painter,
+                center_x=center.x(),
+                center_y=center.y(),
+                look_id=self._companion_look,
+                size_mode=self._companion_size,
+                anim_time=now_seconds,
+                audio_level=self._smoothed_audio_level,
+                state_mode=state_mode,
+                emotion_feel=self._emotion_feel,
+                accent_color=self._cursor_color,
+            )
+            painter.restore()
+            return
+
         listening_weight = _clamp_float(self._listening_morph_spring.value, 0.0, 1.0)
         thinking_weight = _clamp_float(self._thinking_morph_spring.value, 0.0, 1.0)
         normal_weight = _clamp_float(1.0 - max(listening_weight, thinking_weight), 0.0, 1.0)

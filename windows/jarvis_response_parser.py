@@ -50,11 +50,16 @@ _POINT_TAG_PATTERN = re.compile(
 
 _COMMAND_NAMES_PATTERN = (
     r"(underline|ring|point|box|frame|paper|highlight|scroll|"
+    r"target|strike|check|cross|num|connect|spotlight|edit_drawing|photo|"
     r"open_browser|open_url|search_web|open_app|press_keys|type_text|"
     r"open_side_by_side|window_action|set_clipboard|write_file|system_control|"
     r"run_shell_read|request_admin_permission|"
     r"write_project_file|read_project_file|run_project_command|open_project|"
-    r"click_ui|inspect_ui|agent_done)"
+    r"click_ui|inspect_ui|agent_done|"
+    r"read_window|list_windows|act_in_app|find_text_on_screen|search_files|list_files|"
+    r"plan_steps|remember_commitment|snooze_reminder|list_commitments|show_list|"
+    r"start_focus|stop_focus|save_skill|use_skill|forget_skill|install_skill|"
+    r"schedule_job|list_jobs|learn_fact|forget_fact)"
 )
 
 _CALL_LINE_PATTERN = re.compile(
@@ -662,20 +667,34 @@ def build_vision_system_prompt(
         prompt_sections.extend(
             [
                 "Visual-Thinking Archetypes (`paper(...)` Overlay Cards): identify the underlying structure (Process/Workflow, Hierarchy/Classification, Cause-and-Effect, Comparison/Vs, Lifecycle/Timeline, Decision Tree, Formula, or System Architecture) and emit 2 to 3 clear visual `paper(...)` cards in empty margin corners (`top-left (24,92)`, `top-right (1180,92)`, `bottom-left (24,382)`).",
-                "Supported visual row syntax inside a `paper(...)` body (`|` separated, keep nodes to 1-4 words):",
+                "Supported visual row syntax inside a `paper(...)` body (`|` separated, keep nodes short):",
                 "- Flowchart row: `Step 1 -> Step 2 -> Step 3`",
                 "- Hierarchy tree row: `tree: Main Concept > Category A, Category B`",
                 "- Comparison row: `compare: Concept A vs Concept B`",
                 "- Decision branch row: `if: Condition? -> Path A / Path B`",
+                "- Bar chart row: `bars: Python=95% ; Rust=98% ; JS=85%`",
+                "- Timeline row: `timeline: 1991 -> Python 0.9 | 2008 -> Python 3.0`",
+                "- Table row: `table: Feature, Free, Pro ; Voice, yes, yes ; Team, no, yes` (`yes`/`no` draw ticks/crosses)",
+                "- Worked math step: `math: E = m*c^2 => Energy scales with speed of light squared`",
+                "- Interactive mind map: `mindmap: CPU -> Control Unit, ALU, Registers`",
+                "- Clickable quiz question (for 'test me' requests): `quiz: What is LIFO? ? Stack | Queue | Heap *Stack :: Last In First Out`",
+                "- Interactive checklist: `list: [ ] Review OS notes ; [x] Finish labs`",
+                "- Photo illustration: `photo: Human heart anatomy :: Cross-section diagram`",
                 "- Section header: `section: Section Title` and Document icon node: `doc: Real Example`",
                 "- Memory clue / pattern footer: `clue: Short Memory Trick or Pattern (e.g. I-P-O)`",
                 "Card 1 (`top-left`): paper(24, 92, 310, 270, \"Structure Visual\", \"Visual Map\", \"Input -> Process -> Output | tree: Concept > Part A, Part B | clue:I-P-O\")",
                 "Card 2 (`top-right`): paper(1180, 92, 310, 270, \"Connections\", \"Real-Life Link\", \"Why -> Mechanism | section:Real-Life Example | doc:Case Study | clue:Cause->Effect\")",
                 "Card 3 (`bottom-left`): paper(24, 382, 310, 250, \"Pattern & Recall\", \"Takeaway\", \"compare: Concept A vs Concept B | doc:Exam Hook | clue:Memory Trick\")",
-                f"Also emit 2 to 5 horizontal underlines, each right before the spoken sentence discussing that line (y = text baseline + 4px, x = left edge of the phrase on the page, width = phrase width inside the page text, not empty margins, in 0..{screen_width} x 0..{screen_height}, 4th arg = exact 2 to 6 words on screen):",
-                "underline(420, 310, 260, \"exact phrase on screen\")",
-                "Optionally move the cursor subtly without a label using `point(420, 310, \"\")` — keep labels out of `point(...)`.",
-                "Avoid `ring(...)`, `box(...)`, `frame(...)`, `highlight(...)`, or labeled `point(x, y, \"label\")` callouts; use crisp `underline(...)` strokes and `paper(...)` diagram cards.",
+                f"Screen marks synced to sentences (x, y, width/height/radius in 0..{screen_width} x 0..{screen_height}):",
+                "- `underline(x, y, width, \"exact visible phrase\")` — underline key words right as you speak them",
+                "- `target(x, y, radius, \"click target name\")` — concentric walkthrough target ring",
+                "- `strike(x, y, width, \"outdated text\")` — crisp strikethrough across superseded words",
+                "- `check(x, y, \"valid item\")` / `cross(x, y, \"wrong item\")` — green tick or red cross badge",
+                "- `num(x, y, \"1\")` — numbered walkthrough badge",
+                "- `connect(x1, y1, x2, y2, \"flow label\")` — animated flow arrow linking two parts on screen",
+                "- `spotlight(x, y, width, height, \"focus region\")` — highlight a specific panel or region",
+                "- `edit_drawing(\"recolor|move|erase|clear\", \"p1|all\", \"amber\")` — modify drawn overlays",
+                "- `point(420, 310, \"\")` — subtly move cursor to an unlabeled coordinate",
             ]
         )
 
@@ -704,6 +723,15 @@ def build_vision_system_prompt(
                 "write_file(\"Desktop/notes.md\", \"file content to save safely under Desktop, Documents, or D:\\Projects\")",
                 "system_control(\"mute|unmute|volume_up|volume_down|play_pause|next_track|prev_track|show_desktop|screenshot\")",
                 "run_shell_read(\"Get-CimInstance Win32_OperatingSystem | Select FreePhysicalMemory,TotalVisibleMemorySize\", \"System memory status\")",
+                "read_window(\"front|app name\") / list_windows() / find_text_on_screen(\"text\")",
+                "act_in_app(\"front|app name\", \"click:Save | type:hello | key:Enter\")",
+                "list_files(\"D:\\Projects\\my-app\") / search_files(\"pattern\", \"D:\\Projects\\my-app\")",
+                "plan_steps(\"Step one | Step two | Step three\", \"1\")",
+                "remember_commitment(\"Push repo\", \"in 30 minutes\", \"daily\") / show_list() / list_commitments() / snooze_reminder(\"10\")",
+                "start_focus(\"25\", \"Deep coding\") / stop_focus()",
+                "save_skill(\"Skill Name\", \"When to use it\", \"1. Step one\\n2. Step two\") / use_skill(\"Skill Name\") / forget_skill(\"Skill Name\") / install_skill(\"owner/repo\", \"skill\")",
+                "schedule_job(\"Morning summary\", \"Check AI news\", \"at 9am\", \"daily\") / list_jobs()",
+                "learn_fact(\"User is studying BTech CSE\") / forget_fact(\"CSE\")",
                 "request_admin_permission(\"action title\", \"risk explanation\")",
                 "Example when user says 'put VS Code and Edge side by side':",
                 "open_side_by_side(\"Visual Studio Code\", \"Microsoft Edge\")",
@@ -1161,6 +1189,13 @@ def parse_command_line(
         "write_project_file",
         "run_project_command",
         "open_project",
+        "act_in_app",
+        "search_files",
+        "plan_steps",
+        "start_focus",
+        "use_skill",
+        "install_skill",
+        "photo",
     ):
         primary_arg = _parse_string(arguments[0], "").strip() if arguments else ""
         if not primary_arg:
@@ -1173,9 +1208,53 @@ def parse_command_line(
             header=secondary_arg,
         )
 
-    if command_name in ("read_project_file", "click_ui", "inspect_ui", "agent_done"):
+    if command_name in (
+        "remember_commitment",
+        "schedule_job",
+        "save_skill",
+        "edit_drawing",
+    ):
+        arg_one = _parse_string(arguments[0], "").strip() if arguments else ""
+        if not arg_one and command_name != "edit_drawing":
+            return None
+        arg_two = _parse_string(arguments[1], "").strip() if len(arguments) >= 2 else ""
+        arg_three = _parse_string(arguments[2], "").strip() if len(arguments) >= 3 else ""
+        return DrawingCommand(
+            kind=command_name,
+            label=arg_one,
+            header=arg_two,
+            body=arg_three,
+        )
+
+    if command_name in (
+        "read_project_file",
+        "click_ui",
+        "inspect_ui",
+        "agent_done",
+        "read_window",
+        "list_windows",
+        "find_text_on_screen",
+        "list_files",
+        "snooze_reminder",
+        "list_commitments",
+        "show_list",
+        "stop_focus",
+        "forget_skill",
+        "list_jobs",
+        "learn_fact",
+        "forget_fact",
+    ):
         single_arg = _parse_string(arguments[0], "").strip() if arguments else ""
-        if not single_arg and command_name not in ("inspect_ui", "agent_done"):
+        if not single_arg and command_name not in (
+            "inspect_ui",
+            "agent_done",
+            "read_window",
+            "list_windows",
+            "list_commitments",
+            "show_list",
+            "stop_focus",
+            "list_jobs",
+        ):
             return None
         return DrawingCommand(
             kind=command_name,
@@ -1218,22 +1297,44 @@ def parse_command_line(
         tone = _parse_string(arguments[4], "blue").lower() if len(arguments) >= 5 else "blue"
         return DrawingCommand(kind="underline", x=coord_x, y=coord_y, width=width, label=label, tone=tone)
 
-    if command_name == "ring":
+    if command_name == "strike":
+        width = max(24.0, _parse_float(arguments[2], 160.0) * scale_x) if len(arguments) >= 3 else 160.0
+        label = _parse_string(arguments[3]) if len(arguments) >= 4 else ""
+        tone = _parse_string(arguments[4], "red").lower() if len(arguments) >= 5 else "red"
+        return DrawingCommand(kind="strike", x=coord_x, y=coord_y, width=width, label=label, tone=tone)
+
+    if command_name in ("ring", "target"):
         radius = max(14.0, _parse_float(arguments[2], 32.0) * ((scale_x + scale_y) * 0.5)) if len(arguments) >= 3 else 32.0
         label = _parse_string(arguments[3]) if len(arguments) >= 4 else ""
         tone = _parse_string(arguments[4], "blue").lower() if len(arguments) >= 5 else "blue"
-        return DrawingCommand(kind="ring", x=coord_x, y=coord_y, radius=radius, label=label, tone=tone)
+        return DrawingCommand(kind=command_name, x=coord_x, y=coord_y, radius=radius, label=label, tone=tone)
 
-    if command_name == "point":
+    if command_name in ("point", "check", "cross", "num"):
         label = _parse_string(arguments[2]) if len(arguments) >= 3 else ""
-        tone = _parse_string(arguments[3], "blue").lower() if len(arguments) >= 4 else "blue"
-        return DrawingCommand(kind="point", x=coord_x, y=coord_y, label=label, tone=tone)
+        default_tone = "green" if command_name == "check" else ("red" if command_name == "cross" else "blue")
+        tone = _parse_string(arguments[3], default_tone).lower() if len(arguments) >= 4 else default_tone
+        return DrawingCommand(kind=command_name, x=coord_x, y=coord_y, label=label, tone=tone)
 
-    if command_name in ("box", "highlight"):
+    if command_name == "connect":
+        end_x = _parse_float(arguments[2], coord_x + 120.0) * scale_x if len(arguments) >= 3 else coord_x + 120.0
+        end_y = _parse_float(arguments[3], coord_y + 40.0) * scale_y if len(arguments) >= 4 else coord_y + 40.0
+        label = _parse_string(arguments[4]) if len(arguments) >= 5 else ""
+        tone = _parse_string(arguments[5], "blue").lower() if len(arguments) >= 6 else "blue"
+        return DrawingCommand(
+            kind="connect",
+            x=coord_x,
+            y=coord_y,
+            width=end_x,
+            height=end_y,
+            label=label,
+            tone=tone,
+        )
+
+    if command_name in ("box", "highlight", "frame", "spotlight"):
         width = max(24.0, _parse_float(arguments[2], 160.0) * scale_x) if len(arguments) >= 3 else 160.0
         height = max(20.0, _parse_float(arguments[3], 48.0) * scale_y) if len(arguments) >= 4 else 48.0
         label = _parse_string(arguments[4]) if len(arguments) >= 5 else ""
-        default_tone = "yellow" if command_name == "highlight" else "blue"
+        default_tone = "yellow" if command_name in ("highlight", "spotlight") else "blue"
         tone = _parse_string(arguments[5], default_tone).lower() if len(arguments) >= 6 else default_tone
         return DrawingCommand(
             kind=command_name,

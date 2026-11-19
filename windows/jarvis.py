@@ -1026,6 +1026,130 @@ def run_strict_selftest() -> int:
             and (not run_blocked_ok)
         )
 
+        # Cloned Roamies capabilities verification
+        hands_wins = jarvis_services.RoamiesHandsService.list_windows()
+        hands_front = jarvis_services.RoamiesHandsService.locate_window("front")
+        beats_player = jarvis_services.RoamiesVoiceBeatsPlayer(
+            settings_store,
+            jarvis_services.SoundEffectsPlayer(settings_store),
+        )
+        beats_dir_exists = os.path.isdir(settings_store.get_roamies_beats_dir())
+        beat_rate, beat_pcm = beats_player.extract_pcm_bytes("On it.")
+        beats_ok = (beat_rate == 24000 and len(beat_pcm) > 1000) if beats_dir_exists else True
+
+        roamies_marks_script = (
+            'plan_steps("Inspect window | Write file | Open VS Code", "1")\n'
+            'target(300, 220, 28, "Run Button")\n'
+            'strike(260, 260, 140, "old label")\n'
+            'check(420, 220, "Valid")\n'
+            'cross(460, 220, "Invalid")\n'
+            'num(220, 220, "1")\n'
+            'connect(260, 260, 480, 320, "flow")\n'
+            'spotlight(240, 200, 180, 70, "Focus")\n'
+            'edit_drawing("recolor", "p1", "amber")\n'
+            'Applying Roamies visual marks now.'
+        )
+        parsed_roamies_marks = jarvis_response_parser.parse_model_response(roamies_marks_script)
+        roamies_card_body = (
+            "bars: Python=95% ; Rust=99% | "
+            "timeline: v1 -> Launch ; v2 -> UIA3 | "
+            "table: Feature, Basic, Pro ; Voice, yes, yes ; UIA, no, yes | "
+            "math: F = m * a => Force scales with mass | "
+            "mindmap: Agent -> Sight, Hands, Memory | "
+            "quiz: LIFO? *Stack ; Queue :: Stack pops last item | "
+            "list: [ ] Review code ; [x] Run tests"
+        )
+        parsed_roamies_rows = jarvis_overlay_windows._parse_paper_body_rows(roamies_card_body)
+        roamies_pixmap = jarvis_overlay_windows._render_paper_card_to_pixmap(
+            jarvis_response_parser.DrawingCommand(
+                kind="paper",
+                x=32.0,
+                y=96.0,
+                width=330.0,
+                height=390.0,
+                label="Roamies Visuals",
+                header="Multi-Mode Card",
+                body=roamies_card_body,
+            ),
+            seed_value=19,
+        )
+        roamies_overlay = jarvis_overlay_windows.OverlayCanvasWindow(settings_store)
+        for mark_cmd in parsed_roamies_marks.commands:
+            if mark_cmd.kind in ("target", "strike", "check", "cross", "num", "connect", "spotlight"):
+                roamies_overlay.add_drawing_command(mark_cmd)
+        roamies_overlay.set_plan_steps(["Inspect window", "Write file", "Open VS Code"], active_index=1)
+        recolor_ok = roamies_overlay.apply_drawing_edit("recolor", "p1", "amber")
+        erase_ok = roamies_overlay.apply_drawing_edit("erase", "p1", "")
+        clear_ok = roamies_overlay.apply_drawing_edit("clear", "", "")
+        roamies_overlay.clear_plan_steps()
+        roamies_overlay.close()
+
+        with tempfile.TemporaryDirectory() as roamies_tmp_dir:
+            commitments_svc = jarvis_services.CommitmentsReminderService(
+                storage_path=os.path.join(roamies_tmp_dir, "commitments.json")
+            )
+            added_c = commitments_svc.add_commitment("Push Jarvis PR", due_str="in 1 minutes", repeat_str="daily")
+            snooze_ok, _ = commitments_svc.snooze_commitment("15")
+            card_preview = commitments_svc.format_today_later_card_body()
+            due_immediate = commitments_svc.pop_due_commitments(now_ts=time.time() + 1800.0)
+
+            focus_svc = jarvis_services.FocusGuardianService(settings_store)
+            focus_start_ok, _ = focus_svc.start_focus(25.0, "Study DSA")
+            base_focus_ts = time.time()
+            nudge_early = focus_svc.check_foreground_distraction("YouTube - Music", now_ts=base_focus_ts)
+            nudge_late = focus_svc.check_foreground_distraction("YouTube - Music", now_ts=base_focus_ts + 25.0)
+            focus_stop_ok, _ = focus_svc.stop_focus()
+
+            skills_svc = jarvis_services.SkillsManagerService(skills_dir=os.path.join(roamies_tmp_dir, "skills"))
+            skill_save_ok, skill_slug, _ = skills_svc.save_skill("Deploy App", "Deploy build steps", "1. Build\n2. Verify")
+            skill_bad_ok, _bad_slug, _ = skills_svc.save_skill("Bad Skill", "Bad", "rm -rf /")
+            skill_read_text = skills_svc.read_skill("Deploy App") or ""
+            skill_del_ok = skills_svc.delete_skill(skill_slug)
+
+            jobs_svc = jarvis_services.ScheduledJobsService(
+                storage_path=os.path.join(roamies_tmp_dir, "jobs.json")
+            )
+            job_entry = jobs_svc.schedule_job("Morning Brief", "Summarize AI news", due_str="in 1 minutes", repeat_str="daily")
+            due_jobs = jobs_svc.take_due_jobs(now_ts=time.time() + 1800.0)
+            jobs_svc.mark_job_result(job_entry["id"], "Summarized 5 articles", succeeded=True)
+
+            facts_svc = jarvis_services.LearnedFactsService(
+                storage_path=os.path.join(roamies_tmp_dir, "facts.json")
+            )
+            learned_row = facts_svc.learn_fact("User is studying CS")
+            facts_prompt = facts_svc.format_for_prompt()
+            forgot_ok, _ = facts_svc.forget_fact(learned_row["id"])
+
+        roamies_clone_ok = (
+            isinstance(hands_wins, list)
+            and (hands_front is None or isinstance(hands_front, dict))
+            and beats_ok
+            and len(parsed_roamies_marks.commands) >= 9
+            and ("applying roamies visual marks now." in parsed_roamies_marks.spoken_text.lower())
+            and [row_item.kind for row_item in parsed_roamies_rows] == [
+                "bars", "timeline", "table", "math", "mindmap", "quiz", "list"
+            ]
+            and (not roamies_pixmap.isNull())
+            and recolor_ok
+            and erase_ok
+            and clear_ok
+            and bool(added_c.get("id"))
+            and snooze_ok
+            and ("Push Jarvis PR" in card_preview)
+            and len(due_immediate) == 1
+            and focus_start_ok
+            and (nudge_early is None)
+            and (nudge_late is not None and "youtube" in nudge_late.lower())
+            and focus_stop_ok
+            and skill_save_ok
+            and (not skill_bad_ok)
+            and ("Build" in skill_read_text)
+            and skill_del_ok
+            and len(due_jobs) == 1
+            and ("User is studying CS" in facts_prompt)
+            and forgot_ok
+        )
+
         regression_safety_ok = (
             len(twitter_cmds) == 1
             and twitter_cmds[0].kind == "open_url"
@@ -1053,6 +1177,7 @@ def run_strict_selftest() -> int:
             and mentor_visuals_ok
             and universal_api_ok
             and jarvis_agent_upgrade_ok
+            and roamies_clone_ok
         )
 
         parser_ok = (

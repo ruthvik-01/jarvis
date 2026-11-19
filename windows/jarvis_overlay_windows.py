@@ -95,9 +95,11 @@ class _PaperNode:
 class _PaperRow:
     """Parsed structural row from a `paper` command body."""
 
-    kind: str  # "section" | "flow" | "compare" | "tree" | "decision" | "clue" | "note"
+    kind: str  # "section" | "flow" | "compare" | "tree" | "decision" | "clue" | "bars" | "timeline" | "table" | "math" | "mindmap" | "quiz" | "list" | "photo" | "note"
     text: str = ""
     nodes: List[_PaperNode] = field(default_factory=list)
+    extra_items: List[str] = field(default_factory=list)
+    note_text: str = ""
 
 
 @dataclass
@@ -585,6 +587,107 @@ def _parse_paper_body_rows(body_text: str) -> List[_PaperRow]:
                 parsed_rows.append(_PaperRow(kind="section", text=section_title))
             continue
 
+        if lowered_segment.startswith(("bars:", "bar:", "chart:")):
+            _flush_pending_topics()
+            bars_raw = cleaned_segment.split(":", 1)[1].strip()
+            bar_entries = [item.strip() for item in re.split(r"\s*;\s*|\s*,\s*", bars_raw) if item.strip()]
+            if bar_entries:
+                parsed_rows.append(_PaperRow(kind="bars", text="Comparison", extra_items=bar_entries[:5]))
+            continue
+
+        if lowered_segment.startswith(("timeline:", "dates:")):
+            _flush_pending_topics()
+            timeline_raw = cleaned_segment.split(":", 1)[1].strip()
+            timeline_events = [item.strip() for item in re.split(r"\s*;\s*", timeline_raw) if item.strip()]
+            if timeline_events:
+                parsed_rows.append(_PaperRow(kind="timeline", text="Timeline", extra_items=timeline_events[:5]))
+            continue
+
+        if lowered_segment.startswith("table:"):
+            _flush_pending_topics()
+            table_raw = cleaned_segment.split(":", 1)[1].strip()
+            table_lines = [item.strip() for item in re.split(r"\s*;\s*", table_raw) if item.strip()]
+            if table_lines:
+                parsed_rows.append(_PaperRow(kind="table", text="Table", extra_items=table_lines[:6]))
+            continue
+
+        if lowered_segment.startswith(("math:", "formula:", "eq:")):
+            _flush_pending_topics()
+            math_raw = cleaned_segment.split(":", 1)[1].strip()
+            if "=>" in math_raw:
+                eq_part, eq_note = math_raw.split("=>", 1)
+            else:
+                eq_part, eq_note = math_raw, ""
+            parsed_rows.append(_PaperRow(kind="math", text=eq_part.strip(), note_text=eq_note.strip()))
+            continue
+
+        if lowered_segment.startswith(("mindmap:", "map:")):
+            _flush_pending_topics()
+            map_raw = cleaned_segment.split(":", 1)[1].strip()
+            if "->" in map_raw:
+                root_topic, branch_raw = map_raw.split("->", 1)
+                branch_nodes = [
+                    _PaperNode(label=_compact_diagram_node_label(item.strip()))
+                    for item in re.split(r"\s*;\s*|\s*,\s*", branch_raw)
+                    if item.strip()
+                ]
+                parsed_rows.append(
+                    _PaperRow(
+                        kind="mindmap",
+                        text=_compact_diagram_node_label(root_topic),
+                        nodes=branch_nodes[:6],
+                    )
+                )
+            else:
+                parsed_rows.append(_PaperRow(kind="mindmap", text=_compact_diagram_node_label(map_raw)))
+            continue
+
+        if lowered_segment.startswith("quiz:"):
+            _flush_pending_topics()
+            quiz_raw = cleaned_segment.split(":", 1)[1].strip()
+            explain_text = ""
+            if "::" in quiz_raw:
+                quiz_raw, explain_text = quiz_raw.split("::", 1)
+            if "?" in quiz_raw:
+                q_text, opts_raw = quiz_raw.split("?", 1)
+                q_text = q_text.strip() + "?"
+            else:
+                q_text, opts_raw = "Quick Check?", quiz_raw
+            opts_list = [opt.strip() for opt in re.split(r"\s*;\s*|\s*/\s*", opts_raw) if opt.strip()]
+            parsed_rows.append(
+                _PaperRow(
+                    kind="quiz",
+                    text=q_text,
+                    extra_items=opts_list[:4],
+                    note_text=explain_text.strip(),
+                )
+            )
+            continue
+
+        if lowered_segment.startswith(("list:", "checklist:", "todo:")):
+            _flush_pending_topics()
+            list_raw = cleaned_segment.split(":", 1)[1].strip()
+            list_entries = [item.strip() for item in re.split(r"\s*;\s*", list_raw) if item.strip()]
+            if list_entries:
+                parsed_rows.append(_PaperRow(kind="list", text="Checklist", extra_items=list_entries[:6]))
+            continue
+
+        if lowered_segment.startswith("photo:"):
+            _flush_pending_topics()
+            photo_raw = cleaned_segment.split(":", 1)[1].strip()
+            if "::" in photo_raw:
+                photo_query, photo_caption = photo_raw.split("::", 1)
+            else:
+                photo_query, photo_caption = photo_raw, photo_raw
+            parsed_rows.append(
+                _PaperRow(
+                    kind="photo",
+                    text=photo_query.strip(),
+                    note_text=photo_caption.strip(),
+                )
+            )
+            continue
+
         normalized_arrow_segment = cleaned_segment.replace("→", "->").replace("=>", "->")
         has_vs_separator = bool(re.search(r"\b(?:vs\.?|versus)\b", cleaned_segment, flags=re.IGNORECASE))
         if lowered_segment.startswith(("compare:", "vs:")) or has_vs_separator:
@@ -905,6 +1008,22 @@ def _render_paper_card_to_pixmap(
                 natural_heights.append(78.0)
             elif row.kind == "clue":
                 natural_heights.append(36.0)
+            elif row.kind == "bars":
+                natural_heights.append(max(56.0, 22.0 + len(row.extra_items) * 22.0))
+            elif row.kind == "timeline":
+                natural_heights.append(max(58.0, 14.0 + len(row.extra_items) * 24.0))
+            elif row.kind == "table":
+                natural_heights.append(max(62.0, 14.0 + len(row.extra_items) * 22.0))
+            elif row.kind == "math":
+                natural_heights.append(56.0 if row.note_text else 42.0)
+            elif row.kind == "mindmap":
+                natural_heights.append(max(76.0, len(row.nodes) * 28.0 + 10.0))
+            elif row.kind == "quiz":
+                natural_heights.append(max(78.0, 34.0 + len(row.extra_items) * 24.0))
+            elif row.kind == "list":
+                natural_heights.append(max(54.0, 14.0 + len(row.extra_items) * 22.0))
+            elif row.kind == "photo":
+                natural_heights.append(92.0)
             else:
                 natural_heights.append(34.0)
 
@@ -982,6 +1101,92 @@ def _render_paper_card_to_pixmap(
                 _paint_paper_clue_row(
                     painter=painter,
                     clue_text=row.text,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "bars":
+                _paint_paper_bars_row(
+                    painter=painter,
+                    bar_entries=row.extra_items,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "timeline":
+                _paint_paper_timeline_row(
+                    painter=painter,
+                    timeline_entries=row.extra_items,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "table":
+                _paint_paper_table_row(
+                    painter=painter,
+                    table_rows=row.extra_items,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "math":
+                _paint_paper_math_row(
+                    painter=painter,
+                    formula_text=row.text,
+                    note_text=row.note_text,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "mindmap":
+                _paint_paper_mindmap_row(
+                    painter=painter,
+                    root_label=row.text,
+                    branch_nodes=row.nodes,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                    seed_value=seed_value + row_index * 131,
+                )
+            elif row.kind == "quiz":
+                _paint_paper_quiz_row(
+                    painter=painter,
+                    question_text=row.text,
+                    option_items=row.extra_items,
+                    explain_text=row.note_text,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "list":
+                _paint_paper_checklist_row(
+                    painter=painter,
+                    list_items=row.extra_items,
+                    origin_x=inner_margin_x,
+                    origin_y=cursor_y,
+                    row_width=inner_width,
+                    row_height=row_height,
+                    accent_color=accent_color,
+                )
+            elif row.kind == "photo":
+                _paint_paper_photo_row(
+                    painter=painter,
+                    query_or_url=row.text,
+                    caption_text=row.note_text,
                     origin_x=inner_margin_x,
                     origin_y=cursor_y,
                     row_width=inner_width,
@@ -1379,6 +1584,348 @@ def _paint_paper_clue_row(
     painter.restore()
 
 
+def _paint_paper_bars_row(
+    painter: QPainter,
+    bar_entries: List[str],
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+) -> None:
+    """Renders proportional horizontal comparison bars (`Label=Value`)."""
+    parsed_pairs: List[Tuple[str, float, str]] = []
+    for entry_raw in bar_entries[:5]:
+        if "=" in entry_raw:
+            lbl_raw, val_raw = entry_raw.split("=", 1)
+        elif ":" in entry_raw:
+            lbl_raw, val_raw = entry_raw.split(":", 1)
+        else:
+            lbl_raw, val_raw = entry_raw, "50"
+        num_match = re.search(r"([0-9]+(?:\.[0-9]+)?)", val_raw)
+        numeric_val = float(num_match.group(1)) if num_match else 50.0
+        parsed_pairs.append((lbl_raw.strip()[:16], max(0.1, numeric_val), val_raw.strip()[:12]))
+    if not parsed_pairs:
+        return
+    max_val = max(pair[1] for pair in parsed_pairs) or 1.0
+    slot_height = row_height / max(1, len(parsed_pairs))
+    palette = [accent_color, QColor("#2DD4BF"), QColor("#F59E0B"), QColor("#A78BFA"), QColor("#34D399")]
+
+    painter.save()
+    lbl_font = jarvis_theme.barlow_font(10.0, semibold=True)
+    for bar_idx, (bar_lbl, bar_val, bar_display) in enumerate(parsed_pairs):
+        item_y = origin_y + bar_idx * slot_height + 2.0
+        label_rect = QRectF(origin_x, item_y, 76.0, slot_height - 4.0)
+        painter.setFont(lbl_font)
+        painter.setPen(jarvis_theme.DRAWING_INK)
+        painter.drawText(label_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, bar_lbl)
+
+        bar_area_x = origin_x + 80.0
+        bar_area_w = max(40.0, row_width - 126.0)
+        fill_w = max(8.0, bar_area_w * _clamp_float(bar_val / max_val, 0.05, 1.0))
+        bar_h = min(13.0, max(8.0, slot_height - 8.0))
+        bar_y = item_y + (slot_height - 4.0 - bar_h) * 0.5
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(39, 39, 46, 200))
+        painter.drawRoundedRect(QRectF(bar_area_x, bar_y, bar_area_w, bar_h), 4.0, 4.0)
+        painter.setBrush(palette[bar_idx % len(palette)])
+        painter.drawRoundedRect(QRectF(bar_area_x, bar_y, fill_w, bar_h), 4.0, 4.0)
+
+        val_rect = QRectF(bar_area_x + bar_area_w + 4.0, item_y, 40.0, slot_height - 4.0)
+        painter.setPen(QColor("#A1A1AA"))
+        painter.drawText(val_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, bar_display)
+    painter.restore()
+
+
+def _paint_paper_timeline_row(
+    painter: QPainter,
+    timeline_entries: List[str],
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+) -> None:
+    """Renders chronological milestones connected by a vertical timeline rail."""
+    if not timeline_entries:
+        return
+    slot_height = row_height / max(1, len(timeline_entries))
+    rail_x = origin_x + 12.0
+    painter.save()
+    if len(timeline_entries) >= 2:
+        painter.setPen(QPen(QColor(82, 82, 91, 220), 1.8))
+        painter.drawLine(
+            QPointF(rail_x, origin_y + slot_height * 0.5),
+            QPointF(rail_x, origin_y + row_height - slot_height * 0.5),
+        )
+    font_when = jarvis_theme.barlow_font(9.5, semibold=True)
+    font_desc = jarvis_theme.barlow_font(10.0, semibold=False)
+    for idx, raw_item in enumerate(timeline_entries[:5]):
+        center_y = origin_y + (idx + 0.5) * slot_height
+        painter.setPen(QPen(accent_color, 1.5))
+        painter.setBrush(QColor(24, 24, 30, 245))
+        painter.drawEllipse(QPointF(rail_x, center_y), 4.2, 4.2)
+
+        normalized_item = raw_item.replace("→", "->")
+        if "->" in normalized_item:
+            when_str, event_str = normalized_item.split("->", 1)
+        else:
+            when_str, event_str = f"Step {idx + 1}", normalized_item
+        when_rect = QRectF(origin_x + 24.0, center_y - 10.0, 58.0, 20.0)
+        painter.setFont(font_when)
+        painter.setPen(accent_color)
+        painter.drawText(when_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, when_str.strip()[:10])
+        desc_rect = QRectF(origin_x + 84.0, center_y - 10.0, max(40.0, row_width - 88.0), 20.0)
+        painter.setFont(font_desc)
+        painter.setPen(jarvis_theme.DRAWING_INK)
+        painter.drawText(desc_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, event_str.strip()[:36])
+    painter.restore()
+
+
+def _paint_paper_table_row(
+    painter: QPainter,
+    table_rows: List[str],
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+) -> None:
+    """Renders compact side-by-side comparison table (`yes` -> ✓, `no` -> ✗)."""
+    parsed_grid = [
+        [cell.strip()[:16] for cell in raw_row.split(",") if cell.strip()]
+        for raw_row in table_rows[:6]
+    ]
+    parsed_grid = [row_cells for row_cells in parsed_grid if row_cells]
+    if not parsed_grid:
+        return
+    col_count = max(len(row_cells) for row_cells in parsed_grid)
+    col_width = row_width / max(1, col_count)
+    cell_height = row_height / max(1, len(parsed_grid))
+
+    painter.save()
+    hdr_font = jarvis_theme.barlow_font(9.5, semibold=True)
+    cell_font = jarvis_theme.barlow_font(9.5, semibold=False)
+    for r_idx, row_cells in enumerate(parsed_grid):
+        row_y = origin_y + r_idx * cell_height
+        is_header = r_idx == 0
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(34, 42, 58, 220) if is_header else QColor(24, 24, 30, 180 if r_idx % 2 else 110))
+        painter.drawRoundedRect(QRectF(origin_x, row_y + 1.0, row_width, cell_height - 2.0), 4.0, 4.0)
+        for c_idx in range(col_count):
+            cell_text = row_cells[c_idx] if c_idx < len(row_cells) else ""
+            cell_rect = QRectF(origin_x + c_idx * col_width + 4.0, row_y + 1.0, col_width - 8.0, cell_height - 2.0)
+            lowered_cell = cell_text.lower()
+            align_flag = Qt.AlignmentFlag.AlignLeft if c_idx == 0 else Qt.AlignmentFlag.AlignCenter
+            if not is_header and lowered_cell in ("yes", "true", "✓"):
+                painter.setFont(hdr_font)
+                painter.setPen(QColor("#34D399"))
+                painter.drawText(cell_rect, Qt.AlignmentFlag.AlignVCenter | align_flag, "✓")
+            elif not is_header and lowered_cell in ("no", "false", "✗"):
+                painter.setFont(hdr_font)
+                painter.setPen(QColor("#F87171"))
+                painter.drawText(cell_rect, Qt.AlignmentFlag.AlignVCenter | align_flag, "✗")
+            else:
+                painter.setFont(hdr_font if is_header else cell_font)
+                painter.setPen(accent_color if is_header else jarvis_theme.DRAWING_INK)
+                painter.drawText(cell_rect, Qt.AlignmentFlag.AlignVCenter | align_flag, cell_text)
+    painter.restore()
+
+
+def _paint_paper_math_row(
+    painter: QPainter,
+    formula_text: str,
+    note_text: str,
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+) -> None:
+    """Renders worked mathematical equation step + short explanation."""
+    painter.save()
+    box_rect = QRectF(origin_x + 2.0, origin_y + 2.0, row_width - 4.0, row_height - 4.0)
+    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 130), 1.1))
+    painter.setBrush(QColor(22, 26, 36, 228))
+    painter.drawRoundedRect(box_rect, 6.0, 6.0)
+
+    eq_rect = box_rect.adjusted(10.0, 4.0, -10.0, -16.0 if note_text else -4.0)
+    painter.setFont(jarvis_theme.barlow_font(12.0, semibold=True))
+    painter.setPen(jarvis_theme.DRAWING_INK)
+    painter.drawText(eq_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, formula_text[:48])
+
+    if note_text:
+        note_rect = QRectF(box_rect.left() + 10.0, box_rect.bottom() - 18.0, box_rect.width() - 20.0, 15.0)
+        painter.setFont(jarvis_theme.barlow_font(9.5, semibold=False))
+        painter.setPen(QColor("#A1A1AA"))
+        painter.drawText(note_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, note_text[:54])
+    painter.restore()
+
+
+def _paint_paper_mindmap_row(
+    painter: QPainter,
+    root_label: str,
+    branch_nodes: List[_PaperNode],
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+    seed_value: int,
+) -> None:
+    """Renders central topic hub branching out to subtopic pills."""
+    if not branch_nodes:
+        _paint_sketched_node_box(
+            painter,
+            QRectF(origin_x + 12.0, origin_y + 6.0, row_width - 24.0, row_height - 12.0),
+            root_label,
+            True,
+            accent_color,
+            seed_value,
+        )
+        return
+    hub_width = min(104.0, row_width * 0.36)
+    hub_rect = QRectF(origin_x + 2.0, origin_y + (row_height - 34.0) * 0.5, hub_width, 34.0)
+    _paint_sketched_node_box(painter, hub_rect, root_label, True, accent_color, seed_value)
+
+    branch_area_x = hub_rect.right() + 18.0
+    branch_w = max(60.0, row_width - hub_width - 22.0)
+    slot_h = row_height / max(1, len(branch_nodes))
+    for idx, child_node in enumerate(branch_nodes[:6]):
+        pill_h = min(24.0, max(18.0, slot_h - 4.0))
+        pill_y = origin_y + (idx + 0.5) * slot_h - pill_h * 0.5
+        pill_rect = QRectF(branch_area_x, pill_y, branch_w, pill_h)
+        _paint_paper_arrow(
+            painter,
+            hub_rect.right() + 2.0,
+            hub_rect.center().y(),
+            pill_rect.left() - 2.0,
+            pill_rect.center().y(),
+            accent_color,
+            seed_value + idx * 19,
+        )
+        _paint_sketched_node_box(painter, pill_rect, child_node.label, False, accent_color, seed_value + idx * 29)
+
+
+def _paint_paper_quiz_row(
+    painter: QPainter,
+    question_text: str,
+    option_items: List[str],
+    explain_text: str,
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+) -> None:
+    """Renders compact interactive-style quiz card row inside paper."""
+    painter.save()
+    q_rect = QRectF(origin_x + 4.0, origin_y + 2.0, row_width - 8.0, 24.0)
+    painter.setFont(jarvis_theme.barlow_font(10.5, semibold=True))
+    painter.setPen(accent_color)
+    painter.drawText(q_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, question_text[:52])
+
+    opts_y = origin_y + 27.0
+    opt_h = max(18.0, (row_height - 32.0) / max(1, len(option_items)))
+    painter.setFont(jarvis_theme.barlow_font(9.5, semibold=False))
+    for idx, raw_opt in enumerate(option_items[:4]):
+        is_correct = raw_opt.startswith("*")
+        display_opt = raw_opt.lstrip("*").strip()[:40]
+        row_rect = QRectF(origin_x + 6.0, opts_y + idx * opt_h + 1.0, row_width - 12.0, opt_h - 3.0)
+        painter.setPen(QPen(QColor("#34D399") if is_correct else QColor(63, 63, 70, 200), 1.0))
+        painter.setBrush(QColor(22, 42, 34, 210) if is_correct else QColor(24, 24, 30, 210))
+        painter.drawRoundedRect(row_rect, 4.0, 4.0)
+        painter.setPen(QColor("#6EE7B7") if is_correct else jarvis_theme.DRAWING_INK)
+        prefix_sym = "✓ " if is_correct else f"{chr(65 + idx)}. "
+        painter.drawText(row_rect.adjusted(6.0, 0.0, -6.0, 0.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, prefix_sym + display_opt)
+    painter.restore()
+
+
+def _paint_paper_checklist_row(
+    painter: QPainter,
+    list_items: List[str],
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+) -> None:
+    """Renders Today/Later commitment checkboxes inside paper."""
+    if not list_items:
+        return
+    slot_h = row_height / max(1, len(list_items))
+    painter.save()
+    painter.setFont(jarvis_theme.barlow_font(10.0, semibold=False))
+    for idx, raw_item in enumerate(list_items[:6]):
+        stripped = raw_item.strip()
+        is_done = stripped.lower().startswith(("[x]", "done:"))
+        label_str = re.sub(r"^(?:\[[x\s]\]|done:)\s*", "", stripped, flags=re.IGNORECASE).strip()
+        box_y = origin_y + idx * slot_h + (slot_h - 12.0) * 0.5
+        box_rect = QRectF(origin_x + 6.0, box_y, 12.0, 12.0)
+        painter.setPen(QPen(QColor("#34D399") if is_done else accent_color, 1.3))
+        painter.setBrush(QColor("#34D399") if is_done else Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(box_rect, 3.0, 3.0)
+        if is_done:
+            painter.setPen(QColor("#09090B"))
+            painter.drawText(box_rect, Qt.AlignmentFlag.AlignCenter, "✓")
+        painter.setPen(QColor("#71717A") if is_done else jarvis_theme.DRAWING_INK)
+        text_rect = QRectF(origin_x + 24.0, origin_y + idx * slot_h, max(40.0, row_width - 28.0), slot_h)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label_str[:46])
+    painter.restore()
+
+
+def _paint_paper_photo_row(
+    painter: QPainter,
+    query_or_url: str,
+    caption_text: str,
+    origin_x: float,
+    origin_y: float,
+    row_width: float,
+    row_height: float,
+    accent_color: QColor,
+) -> None:
+    """Renders cached Wikipedia/image thumbnail or clean visual placeholder frame inside paper."""
+    frame_rect = QRectF(origin_x + 4.0, origin_y + 2.0, row_width - 8.0, row_height - 20.0)
+    painter.save()
+    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 140), 1.1))
+    painter.setBrush(QColor(20, 24, 34, 235))
+    painter.drawRoundedRect(frame_rect, 6.0, 6.0)
+
+    loaded_image: Optional[QImage] = None
+    try:
+        import jarvis_services
+
+        cached_bytes = jarvis_services.WikipediaPhotoService.get_cached_image_bytes(query_or_url)
+        if cached_bytes:
+            img_obj = QImage()
+            if img_obj.loadFromData(cached_bytes):
+                loaded_image = img_obj
+    except Exception:
+        loaded_image = None
+
+    if loaded_image is not None and not loaded_image.isNull():
+        scaled_img = loaded_image.scaled(
+            int(max(24, frame_rect.width() - 4)),
+            int(max(24, frame_rect.height() - 4)),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        draw_x = frame_rect.left() + (frame_rect.width() - scaled_img.width()) * 0.5
+        draw_y = frame_rect.top() + (frame_rect.height() - scaled_img.height()) * 0.5
+        painter.drawImage(QPointF(draw_x, draw_y), scaled_img)
+    else:
+        painter.setFont(jarvis_theme.barlow_font(10.0, semibold=True))
+        painter.setPen(accent_color)
+        painter.drawText(frame_rect, Qt.AlignmentFlag.AlignCenter, f"Photo: {query_or_url[:30]}")
+
+    if caption_text:
+        cap_rect = QRectF(origin_x + 6.0, frame_rect.bottom() + 2.0, row_width - 12.0, 16.0)
+        painter.setFont(jarvis_theme.barlow_font(9.5, semibold=False))
+        painter.setPen(QColor("#A1A1AA"))
+        painter.drawText(cap_rect, Qt.AlignmentFlag.AlignCenter, caption_text[:44])
+    painter.restore()
+
+
 def _paint_sketched_node_box(
     painter: QPainter,
     box_rect: QRectF,
@@ -1407,8 +1954,9 @@ def _paint_sketched_node_box(
     painter.setPen(QPen(border_color, border_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
     painter.drawPath(outline_path)
 
-    text_area = box_rect.adjusted(7.0, 4.0, -7.0, -4.0)
-    font_size = 11.5
+    vert_pad = 1.5 if box_rect.height() < 28.0 else 4.0
+    text_area = box_rect.adjusted(7.0, vert_pad, -7.0, -vert_pad)
+    font_size = 10.5 if box_rect.height() < 28.0 else 11.5
     label_font = jarvis_theme.barlow_font(font_size, semibold=highlighted)
     metrics = QFontMetricsF(label_font)
     while font_size > 8.5 and metrics.horizontalAdvance(label) > text_area.width() * 1.02:
@@ -1670,6 +2218,10 @@ class OverlayCanvasWindow(QWidget):
         self._next_drawing_seed = 1001
         self._next_stroke_schedule_time = 0.0
         self._was_actively_drawing = False
+        self._plan_steps_items: List[str] = []
+        self._plan_steps_active_index: int = -1
+        self._plan_steps_skipped: Dict[int, str] = {}
+        self._plan_steps_expires_at: float = 0.0
 
         # Bottom LiveCaption state & sprite cache
         self._caption_text = ""
@@ -2081,6 +2633,8 @@ class OverlayCanvasWindow(QWidget):
             except Exception:
                 pass
             return converted
+        if command.kind in ("target", "strike", "check", "cross", "num", "connect", "spotlight"):
+            return command
         if command.kind == "underline":
             return jarvis_response_parser.DrawingCommand(
                 kind="underline",
@@ -2101,10 +2655,14 @@ class OverlayCanvasWindow(QWidget):
         if command.kind == "paper":
             return 0.42
         is_slow = (self._drawing_speed or "slow_smooth").strip().lower() == "slow_smooth"
-        if command.kind in ("underline", "highlight"):
+        if command.kind in ("underline", "highlight", "strike"):
             if is_slow:
                 return _clamp_float(0.72 + command.width / 1200.0, 0.75, 1.15)
             return _clamp_float(0.36 + command.width / 2200.0, 0.38, 0.58)
+        if command.kind in ("check", "cross", "num"):
+            return 0.32 if is_slow else 0.18
+        if command.kind in ("target", "connect", "spotlight"):
+            return 0.55 if is_slow else 0.30
         return 0.80 if is_slow else 0.42
 
     def _active_stroke_tip_point(
@@ -2112,6 +2670,11 @@ class OverlayCanvasWindow(QWidget):
         command: jarvis_response_parser.DrawingCommand,
         eased_progress: float,
     ) -> Optional[Tuple[float, float]]:
+        if command.kind == "strike":
+            tip_x = command.x + max(12.0, command.width) * eased_progress
+            return (tip_x, command.y)
+        if command.kind in ("target", "check", "cross", "num"):
+            return (command.x, command.y)
         if command.kind == "underline":
             tip_x = command.x + max(12.0, command.width) * eased_progress
             return (tip_x, command.y)
@@ -2589,6 +3152,14 @@ class OverlayCanvasWindow(QWidget):
     def _leading_edge_for_command(command: jarvis_response_parser.DrawingCommand) -> Optional[Tuple[float, float]]:
         if command.kind == "point":
             return (command.x, command.y)
+        if command.kind == "strike":
+            return (command.x + command.width, command.y)
+        if command.kind in ("target", "check", "cross", "num"):
+            return (command.x, command.y)
+        if command.kind == "connect":
+            return (command.width, command.height)
+        if command.kind == "spotlight":
+            return (command.x + command.width * 0.5, command.y)
         if command.kind == "underline":
             return (command.x + command.width, command.y)
         if command.kind == "ring":
@@ -2645,6 +3216,8 @@ class OverlayCanvasWindow(QWidget):
         if self._is_caption_visible(now_seconds):
             return True
         if self._drawings:
+            return True
+        if self._plan_steps_items and self._plan_steps_expires_at > now_seconds:
             return True
         return False
 
@@ -2875,7 +3448,9 @@ class OverlayCanvasWindow(QWidget):
             if self._bubble_words and self._bubble_opacity > 0.01:
                 self._paint_cursor_bubble(painter, cursor_center, cursor_opacity * self._bubble_opacity, bounds)
 
-        # 4. Bottom LiveCaption bar
+        # 4. Bottom LiveCaption bar & Plan Steps HUD
+        if self._plan_steps_items and self._plan_steps_expires_at > now_seconds:
+            self._paint_plan_steps_hud(painter, bounds, now_seconds)
         if self._is_caption_visible(now_seconds):
             self._paint_live_caption(painter, bounds)
 
@@ -2914,6 +3489,8 @@ class OverlayCanvasWindow(QWidget):
             jarvis_theme.DRAWING_TONES["yellow"] if command.kind == "highlight" else jarvis_theme.SCREEN_MARKER_BLUE,
         )
 
+        if command.kind in ("target", "strike", "check", "cross", "num", "connect", "spotlight"):
+            return command
         if command.kind == "underline":
             if draw_progress >= 0.99:
                 self._paint_cached_or_live_stroke_item(
@@ -2964,9 +3541,23 @@ class OverlayCanvasWindow(QWidget):
                 )
             else:
                 self._paint_highlight_wash(painter, command, tone_color, draw_progress, fade_alpha)
+        elif command.kind == "target":
+            self._paint_target_mark(painter, command, tone_color, draw_progress, fade_alpha, now_seconds)
+        elif command.kind == "strike":
+            self._paint_strike_mark(painter, command, tone_color, draw_progress, fade_alpha)
+        elif command.kind in ("check", "cross"):
+            self._paint_check_or_cross_mark(painter, command, tone_color, draw_progress, fade_alpha)
+        elif command.kind == "num":
+            self._paint_num_mark(painter, command, tone_color, draw_progress, fade_alpha)
+        elif command.kind == "connect":
+            self._paint_connect_mark(painter, command, tone_color, draw_progress, fade_alpha, now_seconds)
+        elif command.kind == "spotlight":
+            self._paint_spotlight_mark(painter, command, tone_color, draw_progress, fade_alpha)
 
     def _compute_item_sprite_bounds(self, item: _ActiveDrawingItem) -> QRectF:
         command = item.command
+        if command.kind in ("target", "strike", "check", "cross", "num", "connect", "spotlight"):
+            return command
         if command.kind == "underline":
             bounds = QRectF(command.x - 48.0, command.y - 36.0, command.width + 72.0, 72.0)
         elif command.kind == "ring":
@@ -3274,6 +3865,285 @@ class OverlayCanvasWindow(QWidget):
                 tone_color,
                 opacity=fade_alpha * progress,
             )
+
+    def _paint_target_mark(
+        self,
+        painter: QPainter,
+        command: jarvis_response_parser.DrawingCommand,
+        tone_color: QColor,
+        progress: float,
+        fade_alpha: float,
+        now_seconds: float,
+    ) -> None:
+        radius = max(14.0, command.radius)
+        pulse = 1.0 + 0.12 * math.sin(now_seconds * 5.0)
+        painter.save()
+        painter.setOpacity(fade_alpha)
+        outer_r = radius * progress * pulse
+        painter.setPen(QPen(jarvis_theme.with_alpha(tone_color, 130), 1.8))
+        painter.setBrush(jarvis_theme.with_alpha(tone_color, 26))
+        painter.drawEllipse(QPointF(command.x, command.y), outer_r, outer_r)
+
+        inner_r = max(6.0, radius * 0.56 * progress)
+        painter.setPen(QPen(tone_color, 2.5))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(command.x, command.y), inner_r, inner_r)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(tone_color)
+        painter.drawEllipse(QPointF(command.x, command.y), 3.2, 3.2)
+        painter.restore()
+        if command.label and progress > 0.35:
+            _paint_callout_pill(
+                painter,
+                command.x,
+                max(14.0, command.y - radius - 26.0),
+                command.label,
+                tone_color,
+                opacity=fade_alpha * progress,
+            )
+
+    def _paint_strike_mark(
+        self,
+        painter: QPainter,
+        command: jarvis_response_parser.DrawingCommand,
+        tone_color: QColor,
+        progress: float,
+        fade_alpha: float,
+    ) -> None:
+        strike_color = _resolve_tone_color(command.tone or "red", QColor("#F87171"))
+        span_w = max(20.0, command.width) * progress
+        painter.save()
+        painter.setOpacity(fade_alpha)
+        painter.setPen(QPen(QColor(0, 0, 0, 140), 4.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(command.x, command.y), QPointF(command.x + span_w, command.y))
+        painter.setPen(QPen(strike_color, 2.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(command.x, command.y), QPointF(command.x + span_w, command.y))
+        painter.restore()
+
+    def _paint_check_or_cross_mark(
+        self,
+        painter: QPainter,
+        command: jarvis_response_parser.DrawingCommand,
+        tone_color: QColor,
+        progress: float,
+        fade_alpha: float,
+    ) -> None:
+        is_check = command.kind == "check"
+        badge_color = QColor("#34D399") if is_check else QColor("#F87171")
+        radius = 12.0 * _clamp_float(progress, 0.25, 1.0)
+        painter.save()
+        painter.setOpacity(fade_alpha)
+        painter.setPen(QPen(badge_color, 1.8))
+        painter.setBrush(QColor(14, 18, 24, 232))
+        painter.drawEllipse(QPointF(command.x, command.y), radius, radius)
+
+        painter.setPen(QPen(badge_color, 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        if is_check:
+            painter.drawLine(QPointF(command.x - 5.0, command.y + 0.5), QPointF(command.x - 1.2, command.y + 4.5))
+            painter.drawLine(QPointF(command.x - 1.2, command.y + 4.5), QPointF(command.x + 5.6, command.y - 4.0))
+        else:
+            painter.drawLine(QPointF(command.x - 4.2, command.y - 4.2), QPointF(command.x + 4.2, command.y + 4.2))
+            painter.drawLine(QPointF(command.x + 4.2, command.y - 4.2), QPointF(command.x - 4.2, command.y + 4.2))
+        painter.restore()
+
+    def _paint_num_mark(
+        self,
+        painter: QPainter,
+        command: jarvis_response_parser.DrawingCommand,
+        tone_color: QColor,
+        progress: float,
+        fade_alpha: float,
+    ) -> None:
+        num_text = (command.label or "1").strip()[:4]
+        radius = 12.5 * _clamp_float(progress, 0.3, 1.0)
+        painter.save()
+        painter.setOpacity(fade_alpha)
+        painter.setPen(QPen(QColor("#F4F4F6"), 1.5))
+        painter.setBrush(tone_color)
+        painter.drawEllipse(QPointF(command.x, command.y), radius, radius)
+        painter.setFont(jarvis_theme.ui_font(10.5, QFont.Weight.Bold))
+        painter.setPen(QColor("#09090B"))
+        painter.drawText(
+            QRectF(command.x - radius, command.y - radius, radius * 2.0, radius * 2.0),
+            Qt.AlignmentFlag.AlignCenter,
+            num_text,
+        )
+        painter.restore()
+
+    def _paint_connect_mark(
+        self,
+        painter: QPainter,
+        command: jarvis_response_parser.DrawingCommand,
+        tone_color: QColor,
+        progress: float,
+        fade_alpha: float,
+        now_seconds: float,
+    ) -> None:
+        start_pt = QPointF(command.x, command.y)
+        end_pt = QPointF(command.width, command.height)
+        mid_x = (start_pt.x() + end_pt.x()) * 0.5
+        mid_y = min(start_pt.y(), end_pt.y()) - 42.0
+        curve_path = QPainterPath()
+        curve_path.moveTo(start_pt)
+        curve_path.quadTo(QPointF(mid_x, mid_y), end_pt)
+
+        painter.save()
+        painter.setOpacity(fade_alpha)
+        painter.setPen(QPen(QColor(0, 0, 0, 140), 4.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(curve_path)
+        painter.setPen(QPen(tone_color, 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawPath(curve_path)
+
+        # Animated flowing dots along connector (matching Roamies flow: true)
+        for dot_idx in range(3):
+            phase = (now_seconds * 0.65 + dot_idx / 3.0) % 1.0
+            dot_pt = curve_path.pointAtPercent(phase)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#F4F4F6"))
+            painter.drawEllipse(dot_pt, 3.2, 3.2)
+
+        if progress > 0.45:
+            tip_pt = curve_path.pointAtPercent(1.0)
+            prev_pt = curve_path.pointAtPercent(0.92)
+            angle = math.atan2(tip_pt.y() - prev_pt.y(), tip_pt.x() - prev_pt.x())
+            painter.setPen(QPen(tone_color, 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            for wing in (-0.52, 0.52):
+                painter.drawLine(
+                    tip_pt,
+                    QPointF(tip_pt.x() - 10.0 * math.cos(angle + wing), tip_pt.y() - 10.0 * math.sin(angle + wing)),
+                )
+        painter.restore()
+        if command.label and progress > 0.35:
+            label_pt = curve_path.pointAtPercent(0.5)
+            _paint_callout_pill(painter, label_pt.x(), max(14.0, label_pt.y() - 22.0), command.label, tone_color, opacity=fade_alpha)
+
+    def _paint_spotlight_mark(
+        self,
+        painter: QPainter,
+        command: jarvis_response_parser.DrawingCommand,
+        tone_color: QColor,
+        progress: float,
+        fade_alpha: float,
+    ) -> None:
+        spot_rect = QRectF(command.x, command.y, max(40.0, command.width), max(28.0, command.height))
+        painter.save()
+        painter.setOpacity(fade_alpha * progress)
+        painter.setPen(QPen(tone_color, 2.2))
+        painter.setBrush(jarvis_theme.with_alpha(tone_color, 34))
+        painter.drawRoundedRect(spot_rect, 10.0, 10.0)
+        painter.restore()
+        if command.label and progress > 0.35:
+            _paint_callout_pill(
+                painter,
+                spot_rect.center().x(),
+                max(14.0, spot_rect.top() - 26.0),
+                command.label,
+                tone_color,
+                opacity=fade_alpha * progress,
+            )
+
+    def set_plan_steps(
+        self,
+        steps_list: List[str],
+        active_index: int = 0,
+        skipped_map: Optional[Dict[int, str]] = None,
+        hold_seconds: float = 25.0,
+    ) -> None:
+        self._plan_steps_items = [step.strip() for step in steps_list if step and step.strip()][:8]
+        self._plan_steps_active_index = max(0, int(active_index))
+        self._plan_steps_skipped = dict(skipped_map or {})
+        self._plan_steps_expires_at = time.monotonic() + hold_seconds if self._plan_steps_items else 0.0
+        self._ensure_timer_running()
+        self.update()
+
+    def clear_plan_steps(self) -> None:
+        self._plan_steps_items = []
+        self._plan_steps_active_index = -1
+        self._plan_steps_skipped = {}
+        self._plan_steps_expires_at = 0.0
+        self.update()
+
+    def apply_drawing_edit(self, action_verb: str, target_spec: str = "", param_value: str = "") -> bool:
+        """Applies Roamies `edit` operations (`recolor`, `move`, `erase`, `clear`) to active marks."""
+        verb = (action_verb or "").strip().lower()
+        if verb == "clear":
+            self.clear_all_drawings()
+            return True
+        if not self._drawings:
+            return False
+        target_index = -1
+        idx_match = re.search(r"(\d+)", target_spec or "")
+        if idx_match:
+            parsed_idx = int(idx_match.group(1)) - 1
+            if 0 <= parsed_idx < len(self._drawings):
+                target_index = parsed_idx
+        item = self._drawings[target_index]
+        if verb == "erase":
+            self._drawings.pop(target_index)
+            self._sync_clear_button_visibility()
+            self.update()
+            return True
+        if verb == "recolor" and param_value:
+            item.command.tone = param_value.strip().lower()
+            item.cached_paper_pixmap = None
+            item.cached_stroke_pixmap = None
+            self.update()
+            return True
+        if verb == "move":
+            offset_parts = [float(num) for num in re.findall(r"-?\d+(?:\.\d+)?", param_value or "")]
+            dx_px = offset_parts[0] if len(offset_parts) >= 1 else 24.0
+            dy_px = offset_parts[1] if len(offset_parts) >= 2 else 0.0
+            item.command.x += dx_px
+            item.command.y += dy_px
+            item.cached_path = None
+            item.cached_stroke_pixmap = None
+            self._prebuild_drawing_cache(item)
+            self.update()
+            return True
+        return False
+
+    def _paint_plan_steps_hud(
+        self,
+        painter: QPainter,
+        bounds: QRectF,
+        now_seconds: float,
+    ) -> None:
+        if not self._plan_steps_items:
+            return
+        remaining = self._plan_steps_expires_at - now_seconds
+        alpha = 1.0 if remaining > 0.6 else _clamp_float(remaining / 0.6, 0.0, 1.0)
+        if alpha <= 0.01:
+            return
+        card_w = 276.0
+        row_h = 24.0
+        card_h = 34.0 + len(self._plan_steps_items) * row_h + 10.0
+        card_rect = QRectF(max(20.0, bounds.width() - card_w - 24.0), 138.0, card_w, card_h)
+
+        painter.save()
+        painter.setOpacity(alpha)
+        painter.setPen(QPen(QColor(63, 63, 70, 220), 1.1))
+        painter.setBrush(QColor(14, 14, 18, 236))
+        painter.drawRoundedRect(card_rect, 12.0, 12.0)
+
+        painter.setFont(jarvis_theme.ui_font(10.5, QFont.Weight.Bold))
+        painter.setPen(QColor("#F4F4F6"))
+        painter.drawText(QRectF(card_rect.left() + 12.0, card_rect.top() + 8.0, card_w - 24.0, 20.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "PLAN STEPS")
+
+        painter.setFont(jarvis_theme.ui_font(10.0, QFont.Weight.Medium))
+        for step_idx, step_text in enumerate(self._plan_steps_items):
+            row_y = card_rect.top() + 34.0 + step_idx * row_h
+            is_done = step_idx < self._plan_steps_active_index
+            is_current = step_idx == self._plan_steps_active_index
+            is_skipped = (step_idx + 1) in self._plan_steps_skipped
+            badge_char = "✓" if is_done else ("–" if is_skipped else ("▸" if is_current else "•"))
+            badge_col = QColor("#34D399") if is_done else (QColor("#F59E0B") if is_current else QColor("#71717A"))
+            painter.setPen(badge_col)
+            painter.drawText(QRectF(card_rect.left() + 12.0, row_y, 16.0, row_h), Qt.AlignmentFlag.AlignCenter, badge_char)
+            painter.setPen(QColor("#71717A") if is_done else QColor("#E4E4E7"))
+            painter.drawText(QRectF(card_rect.left() + 30.0, row_y, card_w - 42.0, row_h), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, step_text[:36])
+        painter.restore()
 
     def _paint_highlight_stroke(self, painter: QPainter, now_seconds: float) -> None:
         if len(self._highlight_points) < 2:

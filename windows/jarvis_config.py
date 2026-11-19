@@ -378,6 +378,22 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "agent_actions_enabled": True,
     "projects_root_dir": r"D:\Projects",
     "autonomous_agent_max_steps": 6,
+    # Roamies Companion & Productivity Integrations
+    "voice_beats_enabled": True,
+    "focus_distraction_sites": [
+        "youtube",
+        "reddit",
+        "twitter",
+        "x.com",
+        "netflix",
+        "instagram",
+        "twitch",
+        "tiktok",
+        "discord",
+    ],
+    "game_mode_auto_pause": True,
+    "roamies_hands_path": r"D:\Projects\Roamies\roamies-hands.exe",
+    "roamies_beats_dir": r"D:\Projects\Roamies\sidecar\beats",
     # General
     "launch_at_login": False,
     "show_in_taskbar": False,
@@ -604,6 +620,16 @@ class SettingsStore(QObject):
         with self._lock:
             configured_root = str(self._values.get("projects_root_dir", r"D:\Projects") or r"D:\Projects").strip()
             return os.path.realpath(configured_root)
+
+    def get_roamies_hands_path(self) -> str:
+        """Returns configured path to roamies-hands.exe for native Win32/UIA/OCR assistance."""
+        with self._lock:
+            return str(self._values.get("roamies_hands_path", r"D:\Projects\Roamies\roamies-hands.exe") or "").strip()
+
+    def get_roamies_beats_dir(self) -> str:
+        """Returns configured path to pre-recorded 24 kHz PCM voice beats directory."""
+        with self._lock:
+            return str(self._values.get("roamies_beats_dir", r"D:\Projects\Roamies\sidecar\beats") or "").strip()
 
     def set_secret(self, secret_name: str, secret_value: str) -> None:
         secret_value = secret_value.strip()

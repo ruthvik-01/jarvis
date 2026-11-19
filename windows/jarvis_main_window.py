@@ -2376,6 +2376,53 @@ class JarvisMainWindow(QMainWindow):
         page_layout.addWidget(agent_card)
 
         page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("ROAMIES FOCUS, SKILLS & HANDS"))
+        companion_card = _build_card_frame()
+        companion_layout = QVBoxLayout(companion_card)
+        companion_layout.setContentsMargins(16, 12, 16, 14)
+        companion_layout.setSpacing(10)
+
+        self._voice_beats_toggle = ToggleSwitch()
+        self._voice_beats_toggle.toggled.connect(
+            lambda checked: self._set_setting_from_ui("voice_beats_enabled", checked)
+        )
+        companion_layout.addWidget(
+            _build_setting_row(
+                "Voice Beats (24 kHz Instant Replies)",
+                "Play instant conversational acknowledgments ('On it.', 'Checking.') right as voice turns begin.",
+                self._voice_beats_toggle,
+            )
+        )
+        companion_layout.addWidget(_build_hairline_divider())
+
+        companion_buttons_row = QHBoxLayout()
+        companion_buttons_row.setSpacing(8)
+        companion_actions = [
+            ("Show To-Do List", "show_list", "show"),
+            ("Start 25m Focus", "start_focus", "25"),
+            ("Stop Focus", "stop_focus", "stop"),
+            ("Inspect Active Window", "read_window", "front"),
+        ]
+        for btn_text, cmd_kind, cmd_arg in companion_actions:
+            action_btn = QPushButton(btn_text)
+            action_btn.setObjectName("SecondaryActionButton")
+            action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            action_btn.clicked.connect(
+                lambda _checked=False, target_kind=cmd_kind, target_arg=cmd_arg: self.agentCommandRequested.emit(
+                    target_kind, target_arg
+                )
+            )
+            companion_buttons_row.addWidget(action_btn)
+        companion_buttons_row.addStretch(1)
+        companion_layout.addLayout(companion_buttons_row)
+
+        self._agents_summary_label = QLabel("Commitments, skills, and Roamies Hands engine ready.")
+        self._agents_summary_label.setObjectName("RowSubtitleLabel")
+        self._agents_summary_label.setWordWrap(True)
+        companion_layout.addWidget(self._agents_summary_label)
+        page_layout.addWidget(companion_card)
+
+        page_layout.addSpacing(4)
         page_layout.addWidget(_build_section_label("LOCAL ASSISTANT EXECUTION"))
         info_card = _build_card_frame()
         info_layout = QVBoxLayout(info_card)
@@ -2415,24 +2462,100 @@ class JarvisMainWindow(QMainWindow):
         return page_widget
 
     def _build_routines_page(self) -> QWidget:
-        return self._build_byok_info_page(
-            section_title="LOCAL ROUTINES",
-            headline="On-demand Windows workflows",
-            paragraphs=[
-                (
-                    "Quick Notch Composer",
-                    "Double-tap Ctrl at any time to type a request from anywhere on your desktop.",
-                ),
-                (
-                    "Hands-Free Dictation",
-                    "Double-tap Win while holding Ctrl to dictate continuously into notes, docs, or code editors.",
-                ),
-                (
-                    "Zero Background Cloud Daemons",
-                    "Because this Windows build runs strictly with your local BYOK keys, no remote cron servers run in the background.",
-                ),
-            ],
-        )
+        page_widget, page_layout = self._create_page_canvas()
+        page_layout.addWidget(_build_section_label("COMMITMENTS, SKILLS & SCHEDULED JOBS"))
+
+        routines_card = _build_card_frame()
+        routines_layout = QVBoxLayout(routines_card)
+        routines_layout.setContentsMargins(16, 12, 16, 14)
+        routines_layout.setSpacing(8)
+
+        hdr_row = QHBoxLayout()
+        hdr_title = QLabel("Active Reminders, Learned Skills & Routines")
+        hdr_title.setObjectName("CardHeadlineLabel")
+        hdr_row.addWidget(hdr_title, 1)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setObjectName("SecondaryActionButton")
+        refresh_btn.setFixedWidth(74)
+        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        refresh_btn.clicked.connect(self._refresh_companion_status_labels)
+        hdr_row.addWidget(refresh_btn)
+        routines_layout.addLayout(hdr_row)
+
+        routines_layout.addWidget(_build_hairline_divider())
+        self._routines_commitments_label = QLabel("Open commitments: loading...")
+        self._routines_commitments_label.setObjectName("RowSubtitleLabel")
+        self._routines_commitments_label.setWordWrap(True)
+        routines_layout.addWidget(self._routines_commitments_label)
+
+        routines_layout.addWidget(_build_hairline_divider())
+        self._routines_skills_label = QLabel("Saved skills: loading...")
+        self._routines_skills_label.setObjectName("RowSubtitleLabel")
+        self._routines_skills_label.setWordWrap(True)
+        routines_layout.addWidget(self._routines_skills_label)
+
+        routines_layout.addWidget(_build_hairline_divider())
+        self._routines_jobs_label = QLabel("Scheduled jobs: loading...")
+        self._routines_jobs_label.setObjectName("RowSubtitleLabel")
+        self._routines_jobs_label.setWordWrap(True)
+        routines_layout.addWidget(self._routines_jobs_label)
+        page_layout.addWidget(routines_card)
+
+        page_layout.addSpacing(4)
+        page_layout.addWidget(_build_section_label("LOCAL ROUTINES"))
+        info_card = _build_card_frame()
+        info_layout = QVBoxLayout(info_card)
+        info_layout.setContentsMargins(16, 14, 16, 14)
+        info_layout.setSpacing(10)
+        headline_label = QLabel("On-demand Windows workflows & background companion")
+        headline_label.setObjectName("CardHeadlineLabel")
+        info_layout.addWidget(headline_label)
+        for item_title, item_body in [
+            ("Quick Notch Composer", "Double-tap Ctrl at any time to type a request from anywhere on your desktop."),
+            ("Hands-Free Dictation", "Double-tap Win while holding Ctrl to dictate continuously into notes, docs, or code editors."),
+            ("Reminders & Scheduled Routines", "Say 'remind me in 20 minutes...' or 'schedule a daily job at 9am...' to queue local routines."),
+        ]:
+            info_layout.addWidget(_build_hairline_divider())
+            block_title = QLabel(item_title)
+            block_title.setObjectName("RowTitleLabel")
+            block_body = QLabel(item_body)
+            block_body.setObjectName("RowSubtitleLabel")
+            block_body.setWordWrap(True)
+            info_layout.addWidget(block_title)
+            info_layout.addWidget(block_body)
+        page_layout.addWidget(info_card)
+        page_layout.addStretch(1)
+        return page_widget
+
+    def _refresh_companion_status_labels(self) -> None:
+        try:
+            import jarvis_services
+
+            commitments = jarvis_services.CommitmentsReminderService().list_commitments()
+            today_items = commitments.get("today", [])
+            later_items = commitments.get("later", [])
+            open_total = len(today_items) + len(later_items)
+            skills_list = jarvis_services.SkillsManagerService().list_skills()
+            jobs_list = jarvis_services.ScheduledJobsService().list_jobs()
+            facts_list = jarvis_services.LearnedFactsService().list_facts()
+            hands_available = jarvis_services.RoamiesHandsService.resolve_hands_exe(
+                self._settings_store.get_roamies_hands_path()
+            ) is not None
+            summary_line = (
+                f"Roamies Hands Engine: {'Ready' if hands_available else 'UIA Fallback'} · "
+                f"Open Commitments: {open_total} · Saved Skills: {len(skills_list)} · "
+                f"Scheduled Jobs: {len(jobs_list)} · Saved Facts: {len(facts_list)}"
+            )
+            self._agents_summary_label.setText(summary_line)
+
+            today_preview = ", ".join(item["text"][:32] for item in (today_items + later_items)[:4]) or "None"
+            self._routines_commitments_label.setText(f"Commitments ({open_total}): {today_preview}")
+            skills_preview = ", ".join(item["name"][:28] for item in skills_list[:5]) or "None yet"
+            self._routines_skills_label.setText(f"Learned Skills ({len(skills_list)}): {skills_preview}")
+            jobs_preview = ", ".join(item["title"][:28] for item in jobs_list[:4]) or "None scheduled"
+            self._routines_jobs_label.setText(f"Scheduled Jobs ({len(jobs_list)}): {jobs_preview}")
+        except Exception:
+            pass
 
     def _build_byok_info_page(
         self,
@@ -3247,11 +3370,15 @@ class JarvisMainWindow(QMainWindow):
             self._agent_actions_toggle.setCheckedInstant(
                 bool(self._settings_store.get("agent_actions_enabled", True))
             )
+            self._voice_beats_toggle.setCheckedInstant(
+                bool(self._settings_store.get("voice_beats_enabled", True))
+            )
 
             for field_def in SECRET_FIELD_DEFINITIONS:
                 secret_name = field_def["secret_name"]
                 self._secret_inputs[secret_name].setText(self._settings_store.get_secret(secret_name))
             self._refresh_secret_statuses()
+            self._refresh_companion_status_labels()
         finally:
             self._updating_from_store = False
 
@@ -3279,6 +3406,8 @@ class JarvisMainWindow(QMainWindow):
                 self._screen_recordings_toggle.setCheckedInstant(bool(new_value))
             elif key_name == "earcons_enabled":
                 self._earcons_toggle.setCheckedInstant(bool(new_value))
+            elif key_name == "voice_beats_enabled":
+                self._voice_beats_toggle.setCheckedInstant(bool(new_value))
             elif key_name == "drawing_sounds_enabled":
                 self._drawing_sounds_toggle.setCheckedInstant(bool(new_value))
             elif key_name == "remember_style_notes":

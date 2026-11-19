@@ -380,6 +380,13 @@ class JarvisMemoryService(QObject):
         except Exception:
             pass
 
+        try:
+            facts_summary = LearnedFactsService().format_for_prompt()
+            if facts_summary:
+                sections.append("Saved User Facts (call forget_fact(id) if user asks to forget):\n" + facts_summary)
+        except Exception:
+            pass
+
         combined_context = "\n\n".join(sections).strip()
         if len(combined_context) > max_chars:
             combined_context = combined_context[-max_chars:]
@@ -584,6 +591,742 @@ class SoundEffectsPlayer(QObject):
                 pass
 
         threading.Thread(target=preview_worker, daemon=True).start()
+
+
+class RoamiesVoiceBeatsPlayer:
+    """Instant 24 kHz PCM16 pre-recorded conversational acknowledgment beats cloned from Roamies."""
+
+    def __init__(self, settings_store: jarvis_config.SettingsStore, sound_player: SoundEffectsPlayer) -> None:
+        self._settings_store = settings_store
+        self._sound_player = sound_player
+        self._lock = threading.Lock()
+        self._sample_rate = 24000
+        self._sets: Dict[str, Dict[str, Any]] = {}
+        self._wav_cache: Dict[str, pygame.mixer.Sound] = {}
+        self.reload_index()
+
+    def reload_index(self) -> int:
+        beats_dir = self._settings_store.get_roamies_beats_dir()
+        index_path = os.path.join(beats_dir, "index.json") if beats_dir else ""
+        if not index_path or not os.path.isfile(index_path):
+            return 0
+        try:
+            with open(index_path, "r", encoding="utf-8") as index_handle:
+                payload = json.load(index_handle)
+            with self._lock:
+                self._sample_rate = int(payload.get("rate", 24000) or 24000)
+                sets_dict = payload.get("sets")
+                self._sets = dict(sets_dict) if isinstance(sets_dict, dict) else {}
+            return len(self._sets)
+        except Exception:
+            return 0
+
+    def list_available_phrases(self) -> List[str]:
+        with self._lock:
+            for set_entry in self._sets.values():
+                beats_map = set_entry.get("beats")
+                if isinstance(beats_map, dict) and beats_map:
+                    return list(beats_map.keys())
+        return []
+
+    def extract_pcm_bytes(self, phrase: str = "", preferred_set: str = "") -> Tuple[int, bytes]:
+        beats_dir = self._settings_store.get_roamies_beats_dir()
+        if not beats_dir:
+            return (self._sample_rate, b"")
+        with self._lock:
+            if not self._sets:
+                return (self._sample_rate, b"")
+            chosen_set = (
+                self._sets.get(preferred_set)
+                if preferred_set and preferred_set in self._sets
+                else next(iter(self._sets.values()))
+            )
+            beats_map = chosen_set.get("beats") if isinstance(chosen_set, dict) else None
+            rel_pcm_file = str(chosen_set.get("file", "")) if isinstance(chosen_set, dict) else ""
+            rate_hz = self._sample_rate
+        if not isinstance(beats_map, dict) or not beats_map or not rel_pcm_file:
+            return (rate_hz, b"")
+
+        pcm_path = os.path.join(beats_dir, rel_pcm_file)
+        if not os.path.isfile(pcm_path):
+            return (rate_hz, b"")
+
+        target_phrase = phrase
+        if not target_phrase or target_phrase not in beats_map:
+            lowered_query = (phrase or "").strip().lower()
+            matched_key = next(
+                (key_name for key_name in beats_map if lowered_query and lowered_query in key_name.lower()),
+                "",
+            )
+            if not matched_key:
+                default_candidates = [key_name for key_name in ("On it.", "One sec.", "Checking.", "Got it.", "Let's see.") if key_name in beats_map]
+                matched_key = random.choice(default_candidates) if default_candidates else next(iter(beats_map.keys()))
+            target_phrase = matched_key
+
+        span = beats_map.get(target_phrase)
+        if not isinstance(span, list) or len(span) != 2:
+            return (rate_hz, b"")
+        byte_offset = max(0, int(span[0]))
+        byte_length = max(0, int(span[1]))
+        if byte_length <= 0:
+            return (rate_hz, b"")
+        try:
+            with open(pcm_path, "rb") as pcm_handle:
+                pcm_handle.seek(byte_offset)
+                return (rate_hz, pcm_handle.read(byte_length))
+        except OSError:
+            return (rate_hz, b"")
+
+    def play_thinking_beat(self, phrase: str = "", volume: float = 0.42) -> bool:
+        if not bool(self._settings_store.get("voice_beats_enabled", True)):
+            return False
+        if not getattr(self._sound_player, "_mixer_ready", False):
+            return False
+        rate_hz, pcm_bytes = self.extract_pcm_bytes(phrase=phrase)
+        if not pcm_bytes:
+            return False
+        try:
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+            if samples.size == 0:
+                return False
+            # Upsample 24 kHz mono -> 48 kHz stereo matching SoundEffectsPlayer's 48 kHz mixer cleanly
+            if rate_hz == 24000:
+                samples = np.repeat(samples, 2)
+            stereo = np.column_stack((samples, samples)).astype(np.int16)
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as wav_writer:
+                wav_writer.setnchannels(2)
+                wav_writer.setsampwidth(2)
+                wav_writer.setframerate(48000 if rate_hz == 24000 else rate_hz)
+                wav_writer.writeframes(stereo.tobytes())
+            wav_buffer.seek(0)
+            sound_obj = pygame.mixer.Sound(file=wav_buffer)
+            sound_obj.set_volume(max(0.0, min(1.0, float(volume))))
+            sound_obj.play()
+            return True
+        except Exception:
+            return False
+
+
+class WikipediaPhotoService:
+    """Clones Roamies `see_photo` / `photo:` illustration fetching & in-memory caching."""
+
+    _cache: Dict[str, bytes] = {}
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_cached_image_bytes(cls, query_or_url: str) -> Optional[bytes]:
+        key_text = (query_or_url or "").strip()
+        if not key_text:
+            return None
+        with cls._lock:
+            return cls._cache.get(key_text)
+
+    @classmethod
+    def fetch_photo(cls, query_or_url: str, timeout_sec: float = 5.0) -> Tuple[Optional[bytes], str]:
+        cleaned_key = (query_or_url or "").strip()
+        if not cleaned_key:
+            return (None, "")
+        with cls._lock:
+            cached = cls._cache.get(cleaned_key)
+            if cached:
+                return (cached, cleaned_key)
+
+        try:
+            img_url = cleaned_key
+            resolved_title = cleaned_key
+            if not cleaned_key.lower().startswith(("http://", "https://")):
+                summary_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(cleaned_key.replace(' ', '_'))}"
+                resp = requests.get(
+                    summary_url,
+                    headers={"User-Agent": "JarvisCompanion/1.2 (desktop educational visual helper)"},
+                    timeout=timeout_sec,
+                )
+                if not resp.ok:
+                    return (None, "")
+                summary_json = resp.json()
+                resolved_title = str(summary_json.get("title") or cleaned_key)
+                thumb_obj = summary_json.get("thumbnail") or summary_json.get("originalimage") or {}
+                img_url = str(thumb_obj.get("source") or "")
+                if not img_url:
+                    return (None, resolved_title)
+
+            img_resp = requests.get(
+                img_url,
+                headers={"User-Agent": "JarvisCompanion/1.2"},
+                timeout=timeout_sec,
+            )
+            if not img_resp.ok or len(img_resp.content) < 64:
+                return (None, resolved_title)
+            img_bytes = bytes(img_resp.content)
+            with cls._lock:
+                if len(cls._cache) >= 24:
+                    oldest_key = next(iter(cls._cache))
+                    cls._cache.pop(oldest_key, None)
+                cls._cache[cleaned_key] = img_bytes
+            return (img_bytes, resolved_title)
+        except Exception:
+            return (None, "")
+
+
+class CommitmentsReminderService:
+    """Persistent Today/Later commitment list & timed reminder scheduler cloned from Roamies."""
+
+    def __init__(self, storage_path: str = "") -> None:
+        default_dir = os.path.join(jarvis_config.WINDOWS_DIRECTORY, "memory")
+        self._storage_path = storage_path or os.path.join(default_dir, "commitments.json")
+        self._lock = threading.RLock()
+        self._items: List[Dict[str, Any]] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self._storage_path):
+            return
+        try:
+            with open(self._storage_path, "r", encoding="utf-8") as file_handle:
+                parsed = json.load(file_handle)
+            if isinstance(parsed, list):
+                self._items = [entry for entry in parsed if isinstance(entry, dict)]
+        except Exception:
+            self._items = []
+
+    def _save(self) -> None:
+        os.makedirs(os.path.dirname(self._storage_path), exist_ok=True)
+        tmp_path = self._storage_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file_handle:
+            json.dump(self._items, file_handle, indent=2)
+        os.replace(tmp_path, self._storage_path)
+
+    @staticmethod
+    def parse_due_timestamp(due_str: str, now_ts: Optional[float] = None) -> Optional[float]:
+        cleaned = (due_str or "").strip().lower()
+        if not cleaned:
+            return None
+        base_ts = float(now_ts if now_ts is not None else time.time())
+        rel_match = re.search(r"\bin\s+(\d+(?:\.\d+)?)\s*(sec|secs|second|seconds|min|mins|minute|minutes|hr|hrs|hour|hours|day|days)\b", cleaned)
+        if rel_match:
+            qty = float(rel_match.group(1))
+            unit = rel_match.group(2)
+            if unit.startswith(("sec",)):
+                return base_ts + qty
+            if unit.startswith(("min",)):
+                return base_ts + qty * 60.0
+            if unit.startswith(("hr", "hour")):
+                return base_ts + qty * 3600.0
+            if unit.startswith("day"):
+                return base_ts + qty * 86400.0
+
+        now_dt = datetime.fromtimestamp(base_ts)
+        time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", cleaned)
+        if time_match and ("at " in cleaned or "tomorrow" in cleaned or "today" in cleaned or time_match.group(3)):
+            hour_val = int(time_match.group(1))
+            minute_val = int(time_match.group(2) or 0)
+            meridiem = (time_match.group(3) or "").lower()
+            if meridiem == "pm" and hour_val < 12:
+                hour_val += 12
+            elif meridiem == "am" and hour_val == 12:
+                hour_val = 0
+            target_dt = now_dt.replace(hour=hour_val % 24, minute=minute_val % 60, second=0, microsecond=0)
+            if "tomorrow" in cleaned or target_dt.timestamp() <= base_ts:
+                target_dt = target_dt.fromtimestamp(target_dt.timestamp() + 86400.0)
+            return target_dt.timestamp()
+        if "tomorrow" in cleaned:
+            return base_ts + 86400.0
+        return None
+
+    def add_commitment(self, text: str, due_str: str = "", repeat_str: str = "") -> Dict[str, Any]:
+        cleaned_text = (text or "").strip()
+        due_ts = self.parse_due_timestamp(due_str)
+        entry = {
+            "id": f"c_{int(time.time() * 1000)}_{random.randint(100, 999)}",
+            "text": cleaned_text,
+            "due_text": (due_str or "").strip(),
+            "due_ts": due_ts,
+            "repeat": (repeat_str or "").strip().lower(),
+            "done": False,
+            "reminded_at": 0.0,
+            "created_at": time.time(),
+        }
+        with self._lock:
+            self._items.append(entry)
+            self._save()
+        return entry
+
+    def list_commitments(self, include_done: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+        now_dt = datetime.now()
+        end_of_today_ts = now_dt.replace(hour=23, minute=59, second=59, microsecond=999999).timestamp()
+        today_list: List[Dict[str, Any]] = []
+        later_list: List[Dict[str, Any]] = []
+        with self._lock:
+            for item in self._items:
+                if item.get("done") and not include_done:
+                    continue
+                due_ts = item.get("due_ts")
+                if due_ts is None or float(due_ts) <= end_of_today_ts:
+                    today_list.append(dict(item))
+                else:
+                    later_list.append(dict(item))
+        return {"today": today_list, "later": later_list}
+
+    def snooze_commitment(self, query_or_minutes: str = "10") -> Tuple[bool, str]:
+        minutes_match = re.search(r"(\d+)", query_or_minutes or "")
+        snooze_minutes = max(1, int(minutes_match.group(1))) if minutes_match else 10
+        new_due_ts = time.time() + snooze_minutes * 60.0
+        with self._lock:
+            open_items = [item for item in self._items if not item.get("done")]
+            if not open_items:
+                return False, "No active reminders to snooze."
+            target = open_items[-1]
+            query_lower = (query_or_minutes or "").strip().lower()
+            if query_lower and not query_lower.isdigit():
+                for candidate in reversed(open_items):
+                    if query_lower in str(candidate.get("text", "")).lower():
+                        target = candidate
+                        break
+            target["due_ts"] = new_due_ts
+            target["reminded_at"] = 0.0
+            self._save()
+            return True, f"Snoozed '{target['text']}' for {snooze_minutes} minutes."
+
+    def complete_commitment(self, query_or_id: str) -> Tuple[bool, str]:
+        needle = (query_or_id or "").strip().lower()
+        with self._lock:
+            for item in reversed(self._items):
+                if item.get("done"):
+                    continue
+                if needle == str(item.get("id", "")).lower() or needle in str(item.get("text", "")).lower():
+                    item["done"] = True
+                    self._save()
+                    return True, f"Marked '{item['text']}' done."
+        return False, f"No matching open item for '{query_or_id}'."
+
+    def pop_due_commitments(self, now_ts: Optional[float] = None) -> List[Dict[str, Any]]:
+        check_ts = float(now_ts if now_ts is not None else time.time())
+        due_now: List[Dict[str, Any]] = []
+        changed = False
+        with self._lock:
+            for item in self._items:
+                if item.get("done"):
+                    continue
+                due_ts = item.get("due_ts")
+                if due_ts is None or float(due_ts) > check_ts:
+                    continue
+                last_reminded = float(item.get("reminded_at") or 0.0)
+                if last_reminded > 0.0 and (check_ts - last_reminded) < 120.0:
+                    continue
+                item["reminded_at"] = check_ts
+                repeat_rule = str(item.get("repeat") or "").lower()
+                if "daily" in repeat_rule:
+                    item["due_ts"] = float(due_ts) + 86400.0
+                    item["reminded_at"] = 0.0
+                elif "week" in repeat_rule and "weekday" not in repeat_rule:
+                    item["due_ts"] = float(due_ts) + 7.0 * 86400.0
+                    item["reminded_at"] = 0.0
+                due_now.append(dict(item))
+                changed = True
+            if changed:
+                self._save()
+        return due_now
+
+    def format_today_later_card_body(self) -> str:
+        grouped = self.list_commitments(include_done=False)
+        sections: List[str] = []
+        if grouped["today"]:
+            today_entries = [f"[ ] {item['text'][:38]}" for item in grouped["today"][:5]]
+            sections.append("section:Today | list:" + " ; ".join(today_entries))
+        if grouped["later"]:
+            later_entries = [f"[ ] {item['text'][:38]}" for item in grouped["later"][:4]]
+            sections.append("section:Later | list:" + " ; ".join(later_entries))
+        if not sections:
+            return "section:Today | list:[✓] All caught up!"
+        return " | ".join(sections)
+
+
+class FocusGuardianService:
+    """Tracks focus blocks and monitors active window titles for distraction nudges (Roamies clone)."""
+
+    def __init__(self, settings_store: jarvis_config.SettingsStore) -> None:
+        self._settings_store = settings_store
+        self._lock = threading.RLock()
+        self._until_ts: float = 0.0
+        self._task_title: str = ""
+        self._distraction_started_at: float = 0.0
+        self._last_nudge_at: float = 0.0
+
+    def start_focus(self, minutes: float = 25.0, task_title: str = "Focused work") -> Tuple[bool, str]:
+        clamped_minutes = max(1.0, min(240.0, float(minutes or 25.0)))
+        clean_task = (task_title or "Focused work").strip()[:100]
+        with self._lock:
+            self._until_ts = time.time() + clamped_minutes * 60.0
+            self._task_title = clean_task
+            self._distraction_started_at = 0.0
+            self._last_nudge_at = 0.0
+        return True, f"Focus mode started for {int(round(clamped_minutes))} minutes ({clean_task})."
+
+    def stop_focus(self) -> Tuple[bool, str]:
+        with self._lock:
+            was_active = self._until_ts > time.time()
+            task_label = self._task_title
+            self._until_ts = 0.0
+            self._task_title = ""
+            self._distraction_started_at = 0.0
+        if was_active:
+            return True, f"Ended focus block ({task_label})."
+        return True, "No focus block was running."
+
+    def is_active(self, now_ts: Optional[float] = None) -> bool:
+        check_ts = float(now_ts if now_ts is not None else time.time())
+        with self._lock:
+            return self._until_ts > check_ts
+
+    def get_status_summary(self) -> str:
+        now_ts = time.time()
+        with self._lock:
+            if self._until_ts <= now_ts:
+                return "Idle"
+            remaining_min = max(1, int(round((self._until_ts - now_ts) / 60.0)))
+            return f"Focusing on {self._task_title} ({remaining_min}m left)"
+
+    def check_foreground_distraction(
+        self,
+        window_title: str,
+        now_ts: Optional[float] = None,
+        linger_threshold_sec: float = 20.0,
+    ) -> Optional[str]:
+        check_ts = float(now_ts if now_ts is not None else time.time())
+        with self._lock:
+            if self._until_ts <= check_ts:
+                return None
+            lowered_title = (window_title or "").lower()
+            distraction_keywords = self._settings_store.get(
+                "focus_distraction_sites",
+                jarvis_config.DEFAULT_SETTINGS["focus_distraction_sites"],
+            )
+            matched_site = next(
+                (str(site).lower() for site in (distraction_keywords or []) if str(site).strip().lower() in lowered_title),
+                "",
+            )
+            if not matched_site:
+                self._distraction_started_at = 0.0
+                return None
+            if self._distraction_started_at <= 0.0:
+                self._distraction_started_at = check_ts
+                return None
+            if (check_ts - self._distraction_started_at) < linger_threshold_sec:
+                return None
+            if self._last_nudge_at > 0.0 and (check_ts - self._last_nudge_at) < 90.0:
+                return None
+            self._last_nudge_at = check_ts
+            return f"Heads up — you're in a focus block for {self._task_title}. Ready to jump back from {matched_site}?"
+
+
+class SkillsManagerService:
+    """Manages learned and installed SKILL.md reusable playbooks under windows/skills/."""
+
+    DANGEROUS_PATTERNS = (
+        r"\brm\s+-rf\s+[/~]",
+        r"\binvoke-expression\b",
+        r"\biex\s*\(",
+        r"curl\s+[^\n|]+\|\s*(?:sh|bash|powershell)",
+        r"(?:\.ssh[/\\]id_rsa|keychain|dump.*password)",
+    )
+
+    def __init__(self, skills_dir: str = "") -> None:
+        self._skills_dir = skills_dir or os.path.join(jarvis_config.WINDOWS_DIRECTORY, "skills")
+
+    @staticmethod
+    def slugify(raw_name: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", (raw_name or "").strip().lower()).strip("-")
+        return slug[:48] or "custom-skill"
+
+    @classmethod
+    def screen_skill_safety(cls, raw_text: str) -> Optional[str]:
+        for pattern in cls.DANGEROUS_PATTERNS:
+            if re.search(pattern, raw_text or "", flags=re.IGNORECASE):
+                return f"Unsafe instruction matched security filter ({pattern})"
+        return None
+
+    def save_skill(self, name: str, description: str, steps: str) -> Tuple[bool, str, str]:
+        unsafe_reason = self.screen_skill_safety(steps + "\n" + description)
+        if unsafe_reason:
+            return False, "", unsafe_reason
+        slug = self.slugify(name)
+        skill_folder = os.path.join(self._skills_dir, slug)
+        skill_md_path = os.path.join(skill_folder, "SKILL.md")
+        created_new = not os.path.exists(skill_md_path)
+        os.makedirs(skill_folder, exist_ok=True)
+        decoded_steps = (steps or "").replace("\\n", "\n") if ("\\n" in (steps or "") and "\n" not in (steps or "")) else (steps or "")
+        file_text = (
+            f"---\nname: {name.strip()}\ndescription: {description.strip()}\n---\n\n"
+            f"# {name.strip()}\n\n{decoded_steps.strip()}\n"
+        )
+        with open(skill_md_path, "w", encoding="utf-8") as skill_handle:
+            skill_handle.write(file_text)
+        action_verb = "Learned" if created_new else "Updated"
+        return True, slug, f"{action_verb} skill '{slug}'."
+
+    def list_skills(self) -> List[Dict[str, str]]:
+        if not os.path.isdir(self._skills_dir):
+            return []
+        found: List[Dict[str, str]] = []
+        for entry_name in sorted(os.listdir(self._skills_dir)):
+            skill_md_path = os.path.join(self._skills_dir, entry_name, "SKILL.md")
+            if not os.path.isfile(skill_md_path):
+                continue
+            try:
+                content = open(skill_md_path, "r", encoding="utf-8", errors="replace").read(2000)
+                title_match = re.search(r"^name:\s*(.+)$", content, flags=re.MULTILINE)
+                desc_match = re.search(r"^description:\s*(.+)$", content, flags=re.MULTILINE)
+                found.append(
+                    {
+                        "slug": entry_name,
+                        "name": title_match.group(1).strip() if title_match else entry_name,
+                        "description": desc_match.group(1).strip() if desc_match else "",
+                        "path": skill_md_path,
+                    }
+                )
+            except Exception:
+                continue
+        return found
+
+    def read_skill(self, name_or_slug: str) -> Optional[str]:
+        slug = self.slugify(name_or_slug)
+        direct_path = os.path.join(self._skills_dir, slug, "SKILL.md")
+        if os.path.isfile(direct_path):
+            return open(direct_path, "r", encoding="utf-8", errors="replace").read(12000)
+        needle = (name_or_slug or "").strip().lower()
+        for skill_item in self.list_skills():
+            if needle in skill_item["slug"].lower() or needle in skill_item["name"].lower():
+                return open(skill_item["path"], "r", encoding="utf-8", errors="replace").read(12000)
+        return None
+
+    def delete_skill(self, name_or_slug: str) -> bool:
+        slug = self.slugify(name_or_slug)
+        skill_folder = os.path.join(self._skills_dir, slug)
+        if os.path.isdir(skill_folder):
+            shutil.rmtree(skill_folder, ignore_errors=True)
+            return True
+        needle = (name_or_slug or "").strip().lower()
+        for skill_item in self.list_skills():
+            if needle == skill_item["name"].lower():
+                shutil.rmtree(os.path.dirname(skill_item["path"]), ignore_errors=True)
+                return True
+        return False
+
+    def install_skill_from_source(self, source_spec: str, pick_skill: str = "") -> Tuple[bool, str]:
+        cleaned_source = (source_spec or "").strip()
+        if not cleaned_source:
+            return False, "No skill source URL or owner/repo provided."
+        if os.path.isfile(cleaned_source):
+            raw_content = open(cleaned_source, "r", encoding="utf-8", errors="replace").read(24000)
+            skill_title = pick_skill or os.path.basename(os.path.dirname(cleaned_source)) or "local-skill"
+            ok, slug, status = self.save_skill(skill_title, f"Imported from {cleaned_source}", raw_content)
+            return ok, status
+        repo_match = re.match(r"^(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", cleaned_source)
+        candidate_urls: List[str] = []
+        if cleaned_source.lower().startswith(("http://", "https://")) and cleaned_source.lower().endswith(".md"):
+            candidate_urls.append(cleaned_source)
+        elif repo_match:
+            repo_slug = repo_match.group(1)
+            skill_subpath = f"skills/{self.slugify(pick_skill)}/SKILL.md" if pick_skill else "SKILL.md"
+            candidate_urls.extend(
+                [
+                    f"https://raw.githubusercontent.com/{repo_slug}/main/{skill_subpath}",
+                    f"https://raw.githubusercontent.com/{repo_slug}/master/{skill_subpath}",
+                ]
+            )
+        for fetch_url in candidate_urls:
+            try:
+                resp = requests.get(fetch_url, timeout=6.0)
+                if resp.ok and len(resp.text.strip()) > 20:
+                    ok, _slug, status = self.save_skill(
+                        pick_skill or cleaned_source.split("/")[-1],
+                        f"Installed from {cleaned_source}",
+                        resp.text[:24000],
+                    )
+                    return ok, status
+            except Exception:
+                continue
+        return False, f"Could not fetch SKILL.md from {cleaned_source}"
+
+
+class ScheduledJobsService:
+    """One-shot or repeating autonomous background routines cloned from Roamies."""
+
+    def __init__(self, storage_path: str = "") -> None:
+        default_dir = os.path.join(jarvis_config.WINDOWS_DIRECTORY, "memory")
+        self._storage_path = storage_path or os.path.join(default_dir, "scheduled_jobs.json")
+        self._lock = threading.RLock()
+        self._jobs: List[Dict[str, Any]] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self._storage_path):
+            return
+        try:
+            with open(self._storage_path, "r", encoding="utf-8") as file_handle:
+                parsed = json.load(file_handle)
+            if isinstance(parsed, list):
+                self._jobs = [entry for entry in parsed if isinstance(entry, dict)]
+        except Exception:
+            self._jobs = []
+
+    def _save(self) -> None:
+        os.makedirs(os.path.dirname(self._storage_path), exist_ok=True)
+        tmp_path = self._storage_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file_handle:
+            json.dump(self._jobs, file_handle, indent=2)
+        os.replace(tmp_path, self._storage_path)
+
+    def schedule_job(
+        self,
+        title: str,
+        brief: str,
+        due_str: str = "",
+        repeat_str: str = "",
+        job_type: str = "researcher",
+    ) -> Dict[str, Any]:
+        due_ts = CommitmentsReminderService.parse_due_timestamp(due_str or "in 60 minutes")
+        job_entry = {
+            "id": f"job_{int(time.time() * 1000)}_{random.randint(100, 999)}",
+            "title": (title or "Routine").strip()[:60],
+            "brief": (brief or title).strip()[:2000],
+            "due_ts": due_ts,
+            "repeat": (repeat_str or "").strip().lower(),
+            "type": job_type or "researcher",
+            "paused": False,
+            "last_run_at": 0.0,
+            "last_outcome": "",
+            "last_error": "",
+        }
+        with self._lock:
+            self._jobs.append(job_entry)
+            self._save()
+        return job_entry
+
+    def list_jobs(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._jobs]
+
+    def take_due_jobs(self, now_ts: Optional[float] = None) -> List[Dict[str, Any]]:
+        check_ts = float(now_ts if now_ts is not None else time.time())
+        due_jobs: List[Dict[str, Any]] = []
+        changed = False
+        with self._lock:
+            for item in self._jobs:
+                if item.get("paused"):
+                    continue
+                due_ts = item.get("due_ts")
+                if due_ts is None or float(due_ts) > check_ts:
+                    continue
+                repeat_rule = str(item.get("repeat") or "").lower()
+                item["last_run_at"] = check_ts
+                if "daily" in repeat_rule:
+                    item["due_ts"] = float(due_ts) + 86400.0
+                elif "hour" in repeat_rule:
+                    item["due_ts"] = float(due_ts) + 3600.0
+                else:
+                    item["due_ts"] = None
+                due_jobs.append(dict(item))
+                changed = True
+            if changed:
+                self._save()
+        return due_jobs
+
+    def mark_job_result(self, job_id: str, outcome_text: str, succeeded: bool = True) -> None:
+        with self._lock:
+            for item in self._jobs:
+                if item.get("id") == job_id:
+                    item["last_outcome"] = outcome_text[:180] if succeeded else ""
+                    item["last_error"] = "" if succeeded else outcome_text[:180]
+                    self._save()
+                    break
+
+
+class LearnedFactsService:
+    """Stores persistent user facts with IDs and forget support cloned from Roamies memory pass."""
+
+    def __init__(self, storage_path: str = "") -> None:
+        default_dir = os.path.join(jarvis_config.WINDOWS_DIRECTORY, "memory")
+        self._storage_path = storage_path or os.path.join(default_dir, "learned_facts.json")
+        self._lock = threading.RLock()
+        self._facts: List[Dict[str, str]] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self._storage_path):
+            return
+        try:
+            with open(self._storage_path, "r", encoding="utf-8") as file_handle:
+                parsed = json.load(file_handle)
+            if isinstance(parsed, list):
+                self._facts = [entry for entry in parsed if isinstance(entry, dict)]
+        except Exception:
+            self._facts = []
+
+    def _save(self) -> None:
+        os.makedirs(os.path.dirname(self._storage_path), exist_ok=True)
+        tmp_path = self._storage_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file_handle:
+            json.dump(self._facts, file_handle, indent=2)
+        os.replace(tmp_path, self._storage_path)
+
+    def learn_fact(self, fact_text: str) -> Dict[str, str]:
+        clean_fact = (fact_text or "").strip()[:280]
+        with self._lock:
+            for existing in self._facts:
+                if existing.get("text", "").lower() == clean_fact.lower():
+                    return dict(existing)
+            entry = {
+                "id": f"f_{len(self._facts) + 1}_{random.randint(10, 99)}",
+                "text": clean_fact,
+            }
+            self._facts.append(entry)
+            self._facts = self._facts[-40:]
+            self._save()
+            return dict(entry)
+
+    def forget_fact(self, query_or_id: str) -> Tuple[bool, str]:
+        needle = (query_or_id or "").strip().lower()
+        if not needle:
+            return False, "Specify fact text or ID to forget."
+        with self._lock:
+            before_count = len(self._facts)
+            self._facts = [
+                item
+                for item in self._facts
+                if needle != item.get("id", "").lower() and needle not in item.get("text", "").lower()
+            ]
+            removed_count = before_count - len(self._facts)
+            if removed_count > 0:
+                self._save()
+                return True, f"Forgot {removed_count} saved fact(s)."
+        return False, f"No saved fact matched '{query_or_id}'."
+
+    def list_facts(self) -> List[Dict[str, str]]:
+        with self._lock:
+            return [dict(item) for item in self._facts]
+
+    def format_for_prompt(self) -> str:
+        facts = self.list_facts()
+        if not facts:
+            return ""
+        return "\n".join(f"[{item['id']}] {item['text']}" for item in facts[-15:])
+
+    @staticmethod
+    def extract_facts_from_user_message(user_text: str) -> Optional[str]:
+        cleaned = re.sub(r"\s+", " ", (user_text or "").strip())
+        if len(cleaned) < 8 or len(cleaned) > 180:
+            return None
+        patterns = (
+            r"^remember\s+(?:that\s+)?(.+)$",
+            r"^note\s+(?:that\s+)?(i\s+am\s+.+|my\s+.+)$",
+        )
+        for pat in patterns:
+            matched = re.match(pat, cleaned, flags=re.IGNORECASE)
+            if matched and not re.search(r"\b(?:remind|minutes?|hours?|tomorrow|at\s+\d)\b", cleaned, flags=re.IGNORECASE):
+                return matched.group(1).strip()
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +1579,61 @@ class ScreenCaptureService:
                     continue
             split_bands.append((curr_start, curr_end))
         return split_bands
+
+    @classmethod
+    def snap_mark_to_screen_text(
+        cls,
+        command: jarvis_response_parser.DrawingCommand,
+        hands_exe: str = "",
+    ) -> jarvis_response_parser.DrawingCommand:
+        """Snaps a labeled mark (underline, target, strike, check, cross) to live OCR/UIA text bounds."""
+        cleaned_label = (command.label or "").strip()
+        if not cleaned_label or command.kind not in ("underline", "strike", "target", "check", "cross", "ring"):
+            return command
+        bounds = RoamiesHandsService.find_text_bounds(cleaned_label, spec="front", allow_scroll=False, hands_exe=hands_exe)
+        if bounds is None:
+            return command
+        bx, by, bw, bh = bounds
+        if bw < 8 or bh < 6:
+            return command
+        if command.kind == "underline":
+            return jarvis_response_parser.DrawingCommand(
+                kind="underline",
+                x=float(bx),
+                y=float(by + bh + 3),
+                width=float(max(28, bw)),
+                label=command.label,
+                tone=command.tone,
+                sentence_index=command.sentence_index,
+            )
+        if command.kind == "strike":
+            return jarvis_response_parser.DrawingCommand(
+                kind="strike",
+                x=float(bx),
+                y=float(by + bh * 0.52),
+                width=float(max(24, bw)),
+                label=command.label,
+                tone=command.tone,
+                sentence_index=command.sentence_index,
+            )
+        if command.kind in ("target", "ring"):
+            return jarvis_response_parser.DrawingCommand(
+                kind=command.kind,
+                x=float(bx + bw * 0.5),
+                y=float(by + bh * 0.5),
+                radius=float(max(18.0, min(64.0, max(bw, bh) * 0.55))),
+                label=command.label,
+                tone=command.tone,
+                sentence_index=command.sentence_index,
+            )
+        return jarvis_response_parser.DrawingCommand(
+            kind=command.kind,
+            x=float(max(14.0, bx - 16.0)),
+            y=float(by + bh * 0.5),
+            label=command.label,
+            tone=command.tone,
+            sentence_index=command.sentence_index,
+        )
 
     @classmethod
     def snap_drawing_command_to_content(
@@ -2967,6 +3765,29 @@ class VisionBrainService(QObject):
                 "click_ui",
                 "inspect_ui",
                 "agent_done",
+                "read_window",
+                "list_windows",
+                "act_in_app",
+                "find_text_on_screen",
+                "search_files",
+                "list_files",
+                "plan_steps",
+                "remember_commitment",
+                "snooze_reminder",
+                "list_commitments",
+                "show_list",
+                "start_focus",
+                "stop_focus",
+                "save_skill",
+                "use_skill",
+                "forget_skill",
+                "install_skill",
+                "schedule_job",
+                "list_jobs",
+                "learn_fact",
+                "forget_fact",
+                "edit_drawing",
+                "photo",
                 "scroll",
             }
             agent_actions_enabled = bool(self._settings_store.get("agent_actions_enabled", True))
@@ -3990,6 +4811,245 @@ class AgentScreenMonitorService(QObject):
             f"Recent window transitions: {transitions_text}\n"
             f"Last screen change ratio: {last_diff:.3f}"
         )
+
+
+class RoamiesHandsService:
+    """Bridge to reverse-engineered D:\\Projects\\Roamies\\roamies-hands.exe (UIA + Windows OCR + Win32 acts).
+
+    Provides hardware-accelerated Rust window inspection, OCR word bounding boxes, box refinement,
+    and reliable multi-step UI automation with graceful fallback to WindowsUIAService.
+    """
+
+    DEFAULT_HANDS_PATH = r"D:\Projects\Roamies\roamies-hands.exe"
+    RISKY_CLICK_WORDS = (
+        "delete", "remove", "erase", "empty trash", "clear all", "pay", "purchase",
+        "checkout", "buy now", "transfer", "send money", "submit order", "sign out",
+        "log out", "uninstall", "format", "shutdown", "reset",
+    )
+
+    @classmethod
+    def resolve_hands_exe(cls, override_path: str = "") -> Optional[str]:
+        candidates = [
+            (override_path or "").strip(),
+            cls.DEFAULT_HANDS_PATH,
+        ]
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                return candidate
+        return None
+
+    @classmethod
+    def run_hands_json(
+        cls,
+        subcommand: str,
+        *args: str,
+        timeout_sec: float = 5.0,
+        hands_exe: str = "",
+    ) -> Dict[str, Any]:
+        exe_path = cls.resolve_hands_exe(hands_exe)
+        if exe_path is None:
+            return {"ok": False, "error": "roamies-hands.exe not found"}
+        try:
+            proc_result = subprocess.run(
+                [exe_path, subcommand, *[str(arg_item) for arg_item in args]],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            raw_output = (proc_result.stdout or "").strip()
+            if not raw_output:
+                return {"ok": False, "error": (proc_result.stderr or "empty output").strip()}
+            return json.loads(raw_output)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @classmethod
+    def list_windows(cls, hands_exe: str = "") -> List[Dict[str, Any]]:
+        res = cls.run_hands_json("windows", timeout_sec=3.5, hands_exe=hands_exe)
+        wins = res.get("windows") if isinstance(res, dict) else None
+        if isinstance(wins, list) and wins:
+            return wins
+        fallback_titles = DesktopAgentService.list_open_window_titles()
+        return [{"id": idx + 1, "app": title, "title": title, "frontApp": idx == 0} for idx, title in enumerate(fallback_titles)]
+
+    @classmethod
+    def locate_window(cls, spec: str = "front", hands_exe: str = "") -> Optional[Dict[str, Any]]:
+        res = cls.run_hands_json("locate", spec or "front", timeout_sec=3.5, hands_exe=hands_exe)
+        win_obj = res.get("window") if isinstance(res, dict) and res.get("ok") else None
+        if isinstance(win_obj, dict):
+            return win_obj
+        if sys.platform == "win32":
+            hwnd = DesktopAgentService._current_foreground_hwnd()
+            if hwnd:
+                rect = wintypes.RECT()
+                if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return {
+                        "id": int(hwnd),
+                        "title": DesktopAgentService._window_title(hwnd),
+                        "bounds": [int(rect.left), int(rect.top), int(rect.right - rect.left), int(rect.bottom - rect.top)],
+                    }
+        return None
+
+    @classmethod
+    def read_window_controls(cls, spec: str = "front", hands_exe: str = "") -> Dict[str, Any]:
+        target_spec = "front" if (not spec or spec.lower() == "front") else (
+            spec if spec.startswith(("app:", "window:")) else f"app:{spec}"
+        )
+        res = cls.run_hands_json("ui", target_spec, timeout_sec=5.0, hands_exe=hands_exe)
+        if isinstance(res, dict) and res.get("ok") and res.get("controls"):
+            return res
+        uia_items = WindowsUIAService.get_active_window_ui_elements(max_elements=30)
+        return {
+            "ok": True,
+            "window": cls.locate_window(spec="front", hands_exe=hands_exe) or {"id": 0, "app": "Foreground", "title": ""},
+            "controls": [
+                {
+                    "id": idx + 1,
+                    "role": elem["control_type"],
+                    "label": elem["name"],
+                    "bounds": [elem["x"] - elem["width"] // 2, elem["y"] - elem["height"] // 2, elem["width"], elem["height"]],
+                }
+                for idx, elem in enumerate(uia_items)
+            ],
+        }
+
+    @classmethod
+    def find_text_bounds(
+        cls,
+        query_text: str,
+        spec: str = "front",
+        allow_scroll: bool = False,
+        hands_exe: str = "",
+    ) -> Optional[Tuple[int, int, int, int]]:
+        needle = (query_text or "").strip()
+        if not needle:
+            return None
+        target_spec = "front" if (not spec or spec.lower() in ("front", "screen")) else (
+            spec if spec.startswith(("app:", "window:")) else f"app:{spec}"
+        )
+        args = [target_spec, needle] + (["scroll"] if allow_scroll else [])
+        res = cls.run_hands_json("find-text", *args, timeout_sec=4.5, hands_exe=hands_exe)
+        matches = res.get("matches") if isinstance(res, dict) else None
+        if not isinstance(matches, list) or not matches:
+            ocr_res = cls.run_hands_json("ocr-find", target_spec, needle, timeout_sec=5.0, hands_exe=hands_exe)
+            matches = ocr_res.get("matches") if isinstance(ocr_res, dict) else None
+        if isinstance(matches, list) and matches:
+            first_hit = matches[0]
+            bounds = first_hit.get("bounds") or first_hit.get("rect")
+            if isinstance(bounds, list) and len(bounds) == 4:
+                return (int(bounds[0]), int(bounds[1]), int(bounds[2]), int(bounds[3]))
+        return None
+
+    @classmethod
+    def refine_boxes(cls, rects_list: List[List[int]], window_spec: str = "", hands_exe: str = "") -> List[Tuple[int, int, int, int]]:
+        args = [json.dumps(rects_list)] + ([window_spec] if window_spec else [])
+        res = cls.run_hands_json("refine", *args, timeout_sec=3.5, hands_exe=hands_exe)
+        boxes = res.get("boxes") if isinstance(res, dict) else None
+        if isinstance(boxes, list):
+            refined: List[Tuple[int, int, int, int]] = []
+            for box_item in boxes:
+                if isinstance(box_item, list) and len(box_item) == 4:
+                    refined.append((int(box_item[0]), int(box_item[1]), int(box_item[2]), int(box_item[3])))
+            return refined
+        return []
+
+    @classmethod
+    def is_risky_click_label(cls, label_text: str) -> Optional[str]:
+        lowered = (label_text or "").strip().lower()
+        for word in cls.RISKY_CLICK_WORDS:
+            if word in lowered:
+                return word
+        return None
+
+    @classmethod
+    def _parse_steps_spec(cls, steps_input: str) -> List[Dict[str, Any]]:
+        trimmed = (steps_input or "").strip()
+        if not trimmed:
+            return []
+        if trimmed.startswith("["):
+            try:
+                parsed = json.loads(trimmed)
+                if isinstance(parsed, list):
+                    return [item for item in parsed if isinstance(item, dict)]
+            except Exception:
+                pass
+        parsed_steps: List[Dict[str, Any]] = []
+        for segment in re.split(r"\s*\|\s*|\s*;\s*", trimmed):
+            part = segment.strip()
+            if not part:
+                continue
+            if ":" in part:
+                action_raw, val_raw = part.split(":", 1)
+                action = action_raw.strip().lower().replace(" ", "_")
+                val = val_raw.strip()
+                if action in ("click", "click_text"):
+                    parsed_steps.append({"do": "click_text", "text": val})
+                elif action == "click_at" and "," in val:
+                    coord_parts = [float(num) for num in re.findall(r"\d+(?:\.\d+)?", val)]
+                    if len(coord_parts) >= 2:
+                        parsed_steps.append({"do": "click_at", "x": coord_parts[0], "y": coord_parts[1]})
+                elif action == "type":
+                    parsed_steps.append({"do": "type", "text": val})
+                elif action == "key":
+                    parsed_steps.append({"do": "key", "key": val})
+                elif action == "scroll":
+                    parsed_steps.append({"do": "scroll", "direction": val or "down", "amount": 4})
+                elif action == "wait":
+                    parsed_steps.append({"do": "wait", "seconds": float(val) if val else 0.5})
+                else:
+                    parsed_steps.append({"do": action, "text": val})
+            else:
+                parsed_steps.append({"do": "click_text", "text": part})
+        return parsed_steps
+
+    @classmethod
+    def act_in_app(cls, target_spec: str, steps_input: str, hands_exe: str = "") -> Tuple[bool, str]:
+        steps = cls._parse_steps_spec(steps_input)
+        if not steps:
+            return False, "No steps supplied for act_in_app"
+        for step_obj in steps:
+            candidate_label = str(step_obj.get("text") or step_obj.get("label") or step_obj.get("option") or "")
+            risky_hit = cls.is_risky_click_label(candidate_label)
+            if risky_hit and not step_obj.get("confirmed"):
+                return False, f"Blocked risky UI click '{candidate_label}' ({risky_hit}) — requires admin confirmation"
+
+        payload: Dict[str, Any] = {"steps": steps}
+        clean_target = (target_spec or "front").strip()
+        if clean_target.lower() not in ("", "front"):
+            if clean_target.startswith("window:"):
+                payload["window"] = int(clean_target.split(":", 1)[1])
+            else:
+                payload["app"] = clean_target
+
+        res = cls.run_hands_json("act", json.dumps(payload), timeout_sec=10.0, hands_exe=hands_exe)
+        if isinstance(res, dict) and res.get("ok"):
+            return True, f"Executed {len(steps)} step(s) in {clean_target or 'active window'}"
+
+        # Fallback to native WindowsUIAService + Win32 when roamies-hands cannot match target window
+        executed = 0
+        for step_obj in steps:
+            do_verb = str(step_obj.get("do") or "")
+            if do_verb in ("click_text", "click") and step_obj.get("text"):
+                step_ok, _ = WindowsUIAService.find_and_click_control(str(step_obj["text"]))
+                if step_ok:
+                    executed += 1
+            elif do_verb == "click_at":
+                step_ok, _ = WindowsUIAService.find_and_click_control(f"{step_obj.get('x')},{step_obj.get('y')}")
+                if step_ok:
+                    executed += 1
+            elif do_verb == "type" and step_obj.get("text"):
+                if DesktopAgentService._send_text_to_focused_window(str(step_obj["text"]), focus_address_bar=False, submit_enter=False):
+                    executed += 1
+            elif do_verb == "key" and step_obj.get("key") and pyautogui is not None:
+                pyautogui.press(str(step_obj["key"]))
+                executed += 1
+            elif do_verb == "wait":
+                time.sleep(max(0.05, min(3.0, float(step_obj.get("seconds") or 0.4))))
+                executed += 1
+        if executed > 0:
+            return True, f"Completed {executed}/{len(steps)} UI step(s)"
+        return False, str(res.get("error") or "act_in_app failed")
 
 
 class WindowsUIAService:
@@ -5355,6 +6415,44 @@ class DesktopAgentService:
             return f"Clicking {argument_text[:28]}."
         if command.kind == "inspect_ui":
             return "Inspecting active window."
+        if command.kind == "read_window":
+            return f"Reading controls in {(argument_text or 'active window')[:26]}."
+        if command.kind == "list_windows":
+            return "Checking open windows."
+        if command.kind == "act_in_app":
+            return f"Acting in {(argument_text or 'app')[:26]}."
+        if command.kind == "find_text_on_screen":
+            return f"Locating {argument_text[:28]} on screen."
+        if command.kind in ("search_files", "list_files"):
+            return f"Checking files in {(command.header or argument_text or 'folder')[:26]}."
+        if command.kind == "plan_steps":
+            return "Updating checklist."
+        if command.kind == "remember_commitment":
+            return f"Saved reminder: {command.label[:28]}."
+        if command.kind == "snooze_reminder":
+            return "Snoozing reminder."
+        if command.kind in ("list_commitments", "show_list"):
+            return "Showing your list."
+        if command.kind == "start_focus":
+            return "Starting focus timer."
+        if command.kind == "stop_focus":
+            return "Ending focus mode."
+        if command.kind == "save_skill":
+            return f"Saved skill {command.label[:28]}."
+        if command.kind in ("use_skill", "install_skill"):
+            return f"Loading skill {argument_text[:28]}."
+        if command.kind == "forget_skill":
+            return f"Removing skill {argument_text[:28]}."
+        if command.kind == "schedule_job":
+            return f"Scheduled {command.label[:28]}."
+        if command.kind == "list_jobs":
+            return "Checking scheduled routines."
+        if command.kind in ("learn_fact", "forget_fact"):
+            return "Updating saved memory."
+        if command.kind == "photo":
+            return f"Showing photo for {argument_text[:26]}."
+        if command.kind == "edit_drawing":
+            return "Updating screen markings."
         if command.kind == "agent_done":
             return argument_text or "Completed."
         if command.kind == "search_web":
@@ -5777,6 +6875,119 @@ class DesktopAgentService:
             except Exception as exc:
                 return False, str(exc)
 
+        if command_kind == "read_window":
+            res = RoamiesHandsService.read_window_controls(argument_text or "front")
+            controls = res.get("controls") or []
+            if not controls:
+                return False, f"No controls readable in {argument_text or 'active window'}"
+            preview = ", ".join(
+                f"[{ctrl.get('id')}] {ctrl.get('role', 'ctrl')} '{str(ctrl.get('label', ''))[:26]}'"
+                for ctrl in controls[:14]
+            )
+            return True, preview
+
+        if command_kind == "list_windows":
+            wins = RoamiesHandsService.list_windows()
+            if not wins:
+                return True, "No open windows detected."
+            summary = " | ".join(
+                f"{win.get('app', '')}: {win.get('title', '')[:32]}".strip(": ")
+                for win in wins[:10]
+            )
+            return True, summary
+
+        if command_kind == "act_in_app":
+            return RoamiesHandsService.act_in_app(command.body or "front", command.header or command.label)
+
+        if command_kind == "find_text_on_screen":
+            bounds = RoamiesHandsService.find_text_bounds(argument_text, spec="front", allow_scroll=False)
+            if bounds is None:
+                return False, f"Could not find '{argument_text}' on screen"
+            return True, f"Found '{argument_text}' at {bounds}"
+
+        if command_kind == "list_files":
+            resolved_dir, err_msg = ProjectWorkspaceService.resolve_safe_workspace_path(argument_text or ".", default_to_projects=True)
+            if resolved_dir is None or not os.path.isdir(resolved_dir):
+                return False, err_msg or f"Not a workspace folder: {argument_text}"
+            entries = sorted(os.listdir(resolved_dir))[:40]
+            return True, ", ".join(entries) or "(empty folder)"
+
+        if command_kind == "search_files":
+            search_root_arg = (command.header or ".").strip()
+            resolved_dir, err_msg = ProjectWorkspaceService.resolve_safe_workspace_path(search_root_arg, default_to_projects=True)
+            if resolved_dir is None or not os.path.isdir(resolved_dir):
+                return False, err_msg or f"Not a workspace folder: {search_root_arg}"
+            pattern_text = (command.body or "").strip()
+            hits: List[str] = []
+            for walk_root, _dirs, file_names in os.walk(resolved_dir):
+                for fname in file_names[:60]:
+                    if any(skip in walk_root for skip in ("\\node_modules", "\\.git", "\\__pycache__")):
+                        continue
+                    fpath = os.path.join(walk_root, fname)
+                    try:
+                        text_blob = open(fpath, "r", encoding="utf-8", errors="ignore").read(40000)
+                        if re.search(pattern_text, text_blob, flags=re.IGNORECASE):
+                            hits.append(os.path.relpath(fpath, resolved_dir))
+                            if len(hits) >= 12:
+                                break
+                    except Exception:
+                        continue
+                if len(hits) >= 12:
+                    break
+            return True, ", ".join(hits) if hits else f"No matches for '{pattern_text}'"
+
+        if command_kind == "remember_commitment":
+            service = CommitmentsReminderService()
+            item = service.add_commitment(command.label or argument_text, command.header or "", command.body or "")
+            return True, f"Saved commitment: {item['text']}"
+
+        if command_kind == "snooze_reminder":
+            return CommitmentsReminderService().snooze_commitment(argument_text or "10")
+
+        if command_kind in ("list_commitments", "show_list"):
+            grouped = CommitmentsReminderService().list_commitments()
+            today_txt = "; ".join(item["text"] for item in grouped["today"][:5]) or "None"
+            later_txt = "; ".join(item["text"] for item in grouped["later"][:4]) or "None"
+            return True, f"Today: {today_txt} | Later: {later_txt}"
+
+        if command_kind == "save_skill":
+            ok, _slug, msg = SkillsManagerService().save_skill(command.label or "skill", command.header or "Saved skill", command.body or "")
+            return ok, msg
+
+        if command_kind == "use_skill":
+            skill_md = SkillsManagerService().read_skill(argument_text)
+            if not skill_md:
+                return False, f"No saved skill named '{argument_text}'"
+            return True, re.sub(r"\s+", " ", skill_md)[:320]
+
+        if command_kind == "forget_skill":
+            deleted = SkillsManagerService().delete_skill(argument_text)
+            return (True, f"Removed skill '{argument_text}'") if deleted else (False, f"No skill named '{argument_text}'")
+
+        if command_kind == "install_skill":
+            return SkillsManagerService().install_skill_from_source(command.body, command.header)
+
+        if command_kind == "schedule_job":
+            job = ScheduledJobsService().schedule_job(command.label or "Routine", command.body or command.label, command.header or "in 60 minutes")
+            return True, f"Scheduled '{job['title']}'"
+
+        if command_kind == "list_jobs":
+            jobs_list = ScheduledJobsService().list_jobs()
+            if not jobs_list:
+                return True, "No scheduled jobs."
+            return True, "; ".join(item["title"] for item in jobs_list[:8])
+
+        if command_kind == "learn_fact":
+            entry = LearnedFactsService().learn_fact(argument_text)
+            return True, f"Saved fact [{entry['id']}]: {entry['text']}"
+
+        if command_kind == "forget_fact":
+            return LearnedFactsService().forget_fact(argument_text)
+
+        if command_kind == "photo":
+            img_bytes, title_text = WikipediaPhotoService.fetch_photo(command.body or argument_text)
+            return (img_bytes is not None), (f"Loaded photo: {title_text}" if img_bytes else f"No photo found for '{command.body or argument_text}'")
+
         return False, f"Unknown agent command: {command_kind}"
 
     @classmethod
@@ -5819,6 +7030,47 @@ class DesktopAgentService:
         if not cleaned:
             return []
         lowered = cleaned.lower().strip(" .,!?")
+
+        remind_match = re.match(
+            r"^(?:please\s+)?remind\s+me(?:\s+(in\s+\d+\s*(?:mins?|minutes?|hrs?|hours?|days?)|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?|tomorrow(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?))?\s+(?:to\s+)?(.+)$",
+            lowered,
+        )
+        if remind_match:
+            due_part = (remind_match.group(1) or "").strip()
+            task_part = remind_match.group(2).strip(" .,!?")
+            if task_part:
+                return [
+                    jarvis_response_parser.DrawingCommand(
+                        kind="remember_commitment",
+                        label=task_part,
+                        header=due_part or "today",
+                        body="",
+                    )
+                ]
+
+        if re.match(r"^(?:show|open|view|what(?:'s|\s+is)\s+on)\s+(?:my\s+)?(?:to[\s\-]?do\s+list|todo\s+list|reminders?|commitments?|tasks?|list)$", lowered):
+            return [jarvis_response_parser.DrawingCommand(kind="show_list", label="Today & Later", body="show")]
+
+        snooze_match = re.match(r"^(?:please\s+)?snooze(?:\s+(?:for\s+)?(\d+)\s*(?:min|mins|minutes?)?)?$", lowered)
+        if snooze_match:
+            mins_val = snooze_match.group(1) or "10"
+            return [jarvis_response_parser.DrawingCommand(kind="snooze_reminder", label=mins_val, body=mins_val)]
+
+        focus_start_match = re.match(
+            r"^(?:please\s+)?(?:start\s+(?:a\s+)?focus(?:\s+mode|\s+block|\s+timer)?|focus)(?:\s+for\s+(\d+)\s*(?:min|mins|minutes?))?(?:\s+(?:on|for)\s+(.+))?$",
+            lowered,
+        )
+        if focus_start_match and ("stop" not in lowered and "end" not in lowered):
+            focus_mins = focus_start_match.group(1) or "25"
+            focus_task = (focus_start_match.group(2) or "Focused work").strip(" .,!?")
+            return [jarvis_response_parser.DrawingCommand(kind="start_focus", body=focus_mins, header=focus_task, label=focus_task)]
+
+        if re.match(r"^(?:please\s+)?(?:stop|end|cancel|exit)\s+(?:the\s+)?focus(?:\s+mode|\s+block|\s+timer)?$", lowered):
+            return [jarvis_response_parser.DrawingCommand(kind="stop_focus", label="stop_focus", body="stop")]
+
+        fact_text = LearnedFactsService.extract_facts_from_user_message(cleaned)
+        if fact_text:
+            return [jarvis_response_parser.DrawingCommand(kind="learn_fact", label=fact_text, body=fact_text)]
 
         settings_compound_match = re.match(
             r"^(?:please\s+)?(?:open|launch|go\s+to)\s+(?:windows\s+)?settings\s+(?:and|then)\s+(?:please\s+)?(?:search(?:\s+for)?|find|open|check|show|type)\s+(.+)$",

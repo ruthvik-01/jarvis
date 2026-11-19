@@ -47,6 +47,12 @@ class JarvisApplicationController(QObject):
         self.memory_service = jarvis_services.JarvisMemoryService()
         self.screen_monitor = jarvis_services.AgentScreenMonitorService()
         self.sound_player = jarvis_services.SoundEffectsPlayer(self.settings_store)
+        self.voice_beats = jarvis_services.RoamiesVoiceBeatsPlayer(self.settings_store, self.sound_player)
+        self.commitments_service = jarvis_services.CommitmentsReminderService()
+        self.focus_service = jarvis_services.FocusGuardianService(self.settings_store)
+        self.skills_service = jarvis_services.SkillsManagerService()
+        self.jobs_service = jarvis_services.ScheduledJobsService()
+        self.facts_service = jarvis_services.LearnedFactsService()
         self.mic_service = jarvis_services.MicrophoneStreamService(self.settings_store)
         self.tts_service = jarvis_services.StreamingTTSService(self.settings_store)
         self.brain_service = jarvis_services.VisionBrainService(self.settings_store)
@@ -60,6 +66,9 @@ class JarvisApplicationController(QObject):
         self._agent_monitor_timer = QTimer(self)
         self._agent_monitor_timer.setInterval(1500)
         self._agent_monitor_timer.timeout.connect(self._on_screen_monitor_tick)
+        self._companion_tick_timer = QTimer(self)
+        self._companion_tick_timer.setInterval(15000)
+        self._companion_tick_timer.timeout.connect(self._on_companion_periodic_tick)
         self._active_voice_mode = "idle"  # "idle" | "ptt" | "dictate" | "mic_test"
         self._last_highlight_points: List[Tuple[float, float]] = []
         self._speak_current_turn = False
@@ -244,6 +253,7 @@ class JarvisApplicationController(QObject):
         self.hotkey_service.start()
         if not auto_demo:
             self._agent_monitor_timer.start()
+            self._companion_tick_timer.start()
         self.sound_player.play_earcon("reveal-boot", volume=0.45)
 
         if auto_demo:
@@ -259,6 +269,7 @@ class JarvisApplicationController(QObject):
         self._quitting = True
         self._agent_worker_generation += 1
         self._agent_monitor_timer.stop()
+        self._companion_tick_timer.stop()
         self.memory_service.record_action("shutdown", "Jarvis", "Application session ended")
         self.aboutToQuit.emit()
 
@@ -644,6 +655,13 @@ class JarvisApplicationController(QObject):
         self._force_captions_for_turn = False
         self._sentences_enqueued_in_turn = 0
         self._active_tts_generation = self.tts_service.begin_turn()
+
+        if not preserve_scroll_session:
+            learned_fact = self.facts_service.extract_facts_from_user_message(prompt_text)
+            if learned_fact:
+                self.facts_service.learn_fact(learned_fact)
+            if speak_reply and not from_typed_notch:
+                self.voice_beats.play_thinking_beat()
 
         self.main_window.append_chat_message("user", displayed_user_message)
         self.main_window.update_streaming_assistant_message("Thinking...", is_generating=True)
@@ -1299,6 +1317,40 @@ class JarvisApplicationController(QObject):
     def _on_brain_drawing_command(self, command: jarvis_response_parser.DrawingCommand) -> None:
         if command.kind == "scroll":
             return
+        if command.kind == "plan_steps":
+            steps_list = [step_part.strip() for step_part in (command.body or "").split("|") if step_part.strip()]
+            active_idx = int(command.header) - 1 if (command.header or "").strip().isdigit() else 0
+            if steps_list:
+                self.overlay_window.set_plan_steps(steps_list, active_index=max(0, active_idx))
+            return
+        if command.kind == "edit_drawing":
+            self.overlay_window.apply_drawing_edit(command.label, command.header, command.body)
+            return
+        if command.kind == "show_list":
+            list_body = self.commitments_service.format_today_later_card_body()
+            list_card = jarvis_response_parser.DrawingCommand(
+                kind="paper",
+                x=26.0,
+                y=96.0,
+                width=330.0,
+                height=310.0,
+                label="Reminders & To-Do",
+                header="Today & Later",
+                body=list_body,
+                tone="blue",
+            )
+            self.overlay_window.add_drawing_command(list_card)
+            return
+        if command.kind == "start_focus":
+            mins_match = re.search(r"(\d+)", command.body or "")
+            mins_val = float(mins_match.group(1)) if mins_match else 25.0
+            _ok, focus_msg = self.focus_service.start_focus(minutes=mins_val, task_title=command.header or command.label or "Deep focus")
+            self.overlay_window.set_bubble_message(focus_msg, word_by_word=False, hold_seconds=3.2)
+            return
+        if command.kind == "stop_focus":
+            _ok, focus_msg = self.focus_service.stop_focus()
+            self.overlay_window.set_bubble_message(focus_msg, word_by_word=False, hold_seconds=2.8)
+            return
         agent_kinds = (
             "open_browser",
             "open_url",
@@ -1320,6 +1372,24 @@ class JarvisApplicationController(QObject):
             "click_ui",
             "inspect_ui",
             "agent_done",
+            "read_window",
+            "list_windows",
+            "act_in_app",
+            "find_text_on_screen",
+            "search_files",
+            "list_files",
+            "remember_commitment",
+            "snooze_reminder",
+            "list_commitments",
+            "save_skill",
+            "use_skill",
+            "forget_skill",
+            "install_skill",
+            "schedule_job",
+            "list_jobs",
+            "learn_fact",
+            "forget_fact",
+            "photo",
         )
         if command.kind in agent_kinds:
             admin_req = jarvis_services.DesktopAgentService.check_command_requires_admin(command)
@@ -1371,7 +1441,70 @@ class JarvisApplicationController(QObject):
         else:
             self.sound_player.play_synced_drawing_stroke_sound(duration_ms=duration_ms, volume=0.24)
 
+    def _on_companion_periodic_tick(self) -> None:
+        if self._quitting:
+            return
+        due_items = self.commitments_service.pop_due_commitments()
+        if due_items:
+            due_lines = " ; ".join(f"[ ] {item['text'][:38]}" for item in due_items[:4])
+            reminder_card = jarvis_response_parser.DrawingCommand(
+                kind="paper",
+                x=26.0,
+                y=96.0,
+                width=320.0,
+                height=240.0,
+                label="Reminders Due",
+                header="Commitments",
+                body=f"section:Due Now | list:{due_lines}",
+                tone="amber",
+            )
+            self.overlay_window.add_drawing_command(reminder_card)
+            self.sound_player.play_earcon("jarvis-text-send", volume=0.45)
+            spoken_nudge = f"Quick reminder: {due_items[0]['text']}."
+            self.overlay_window.set_bubble_message(spoken_nudge, word_by_word=False, hold_seconds=4.0)
+            if not self.brain_service.is_running and not self.tts_service.is_speaking:
+                gen_id = self.tts_service.begin_turn()
+                self.tts_service.enqueue_sentence(spoken_nudge, turn_generation=gen_id)
+                self.tts_service.mark_turn_complete(turn_generation=gen_id)
+
+        active_title = self.screen_monitor.get_foreground_window_title()
+        focus_nudge = self.focus_service.check_foreground_distraction(active_title)
+        if focus_nudge:
+            self.overlay_window.set_bubble_message(focus_nudge, word_by_word=False, hold_seconds=4.0)
+            self.sound_player.play_earcon("jarvis-error", volume=0.35)
+            if not self.brain_service.is_running and not self.tts_service.is_speaking:
+                gen_id = self.tts_service.begin_turn()
+                self.tts_service.enqueue_sentence(focus_nudge, turn_generation=gen_id)
+                self.tts_service.mark_turn_complete(turn_generation=gen_id)
+
+        if not self.brain_service.is_running:
+            due_jobs = self.jobs_service.take_due_jobs()
+            if due_jobs:
+                first_job = due_jobs[0]
+                self.memory_service.record_action("scheduled_job", first_job["title"], "Triggered due routine")
+                captured_worker_gen = self._agent_worker_generation
+                threading.Thread(
+                    target=self._run_autonomous_agent_worker,
+                    args=(first_job["brief"], captured_worker_gen),
+                    name="JarvisScheduledJobWorker",
+                    daemon=True,
+                ).start()
+
     def _on_main_window_agent_command(self, action_kind: str, argument_text: str) -> None:
+        if action_kind == "show_list":
+            self._on_brain_drawing_command(jarvis_response_parser.DrawingCommand(kind="show_list", body="show"))
+            self.sound_player.play_earcon("jarvis-text-send", volume=0.45)
+            return
+        if action_kind == "start_focus":
+            self._on_brain_drawing_command(
+                jarvis_response_parser.DrawingCommand(kind="start_focus", body=argument_text or "25", header="Deep Focus")
+            )
+            self.sound_player.play_earcon("jarvis-text-send", volume=0.45)
+            return
+        if action_kind == "stop_focus":
+            self._on_brain_drawing_command(jarvis_response_parser.DrawingCommand(kind="stop_focus", body="stop"))
+            self.sound_player.play_earcon("jarvis-text-send", volume=0.45)
+            return
         agent_command = jarvis_response_parser.DrawingCommand(
             kind=action_kind,
             body=argument_text,

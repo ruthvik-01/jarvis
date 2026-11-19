@@ -128,6 +128,7 @@ class _ActiveDrawingItem:
     quiz_selected: Dict[int, int] = field(default_factory=dict)
     expanded_branches: Dict[int, bool] = field(default_factory=dict)
     model3d_renderer: Optional[Any] = None
+    model3d_viewports: List[Tuple[QRectF, Any]] = field(default_factory=list)
     live_map_spec: Optional[Dict[str, Any]] = None
     interactive_rects: List[Tuple[QRectF, str, Any]] = field(default_factory=list)
 
@@ -1032,9 +1033,95 @@ def _paint_paper_document_icon(
     painter.restore()
 
 
+PAPER_CARD_THEMES: Dict[str, Dict[str, QColor]] = {
+    "blue": {
+        "bg_top": QColor(14, 24, 42, 246),
+        "bg_bottom": QColor(9, 15, 28, 248),
+        "header": QColor(20, 34, 60, 250),
+        "grid": QColor(96, 165, 250, 22),
+        "border": QColor(59, 130, 246, 195),
+        "accent": QColor("#3B82F6"),
+    },
+    "teal": {
+        "bg_top": QColor(10, 31, 34, 246),
+        "bg_bottom": QColor(7, 19, 22, 248),
+        "header": QColor(14, 44, 48, 250),
+        "grid": QColor(45, 212, 191, 22),
+        "border": QColor(20, 184, 166, 195),
+        "accent": QColor("#14B8A6"),
+    },
+    "green": {
+        "bg_top": QColor(12, 30, 23, 246),
+        "bg_bottom": QColor(8, 19, 14, 248),
+        "header": QColor(16, 42, 31, 250),
+        "grid": QColor(52, 211, 153, 22),
+        "border": QColor(34, 197, 94, 195),
+        "accent": QColor("#22C55E"),
+    },
+    "amber": {
+        "bg_top": QColor(34, 23, 10, 246),
+        "bg_bottom": QColor(21, 14, 7, 248),
+        "header": QColor(48, 32, 14, 250),
+        "grid": QColor(251, 191, 36, 22),
+        "border": QColor(245, 158, 11, 195),
+        "accent": QColor("#F59E0B"),
+    },
+    "purple": {
+        "bg_top": QColor(27, 16, 44, 246),
+        "bg_bottom": QColor(16, 10, 28, 248),
+        "header": QColor(38, 22, 62, 250),
+        "grid": QColor(192, 132, 252, 22),
+        "border": QColor(168, 85, 247, 195),
+        "accent": QColor("#A855F7"),
+    },
+    "violet": {
+        "bg_top": QColor(27, 16, 44, 246),
+        "bg_bottom": QColor(16, 10, 28, 248),
+        "header": QColor(38, 22, 62, 250),
+        "grid": QColor(192, 132, 252, 22),
+        "border": QColor(168, 85, 247, 195),
+        "accent": QColor("#A855F7"),
+    },
+    "coral": {
+        "bg_top": QColor(36, 16, 22, 246),
+        "bg_bottom": QColor(23, 10, 14, 248),
+        "header": QColor(50, 22, 30, 250),
+        "grid": QColor(251, 113, 133, 22),
+        "border": QColor(244, 63, 94, 195),
+        "accent": QColor("#F43F5E"),
+    },
+    "red": {
+        "bg_top": QColor(36, 15, 18, 246),
+        "bg_bottom": QColor(22, 9, 12, 248),
+        "header": QColor(50, 20, 24, 250),
+        "grid": QColor(248, 113, 113, 22),
+        "border": QColor(239, 68, 68, 195),
+        "accent": QColor("#EF4444"),
+    },
+    "sky": {
+        "bg_top": QColor(12, 28, 44, 246),
+        "bg_bottom": QColor(8, 18, 29, 248),
+        "header": QColor(18, 40, 62, 250),
+        "grid": QColor(56, 189, 248, 22),
+        "border": QColor(14, 165, 233, 195),
+        "accent": QColor("#38BDF8"),
+    },
+}
+
+
+def _resolve_card_theme(tone_name: str, seed_value: int = 0) -> Dict[str, QColor]:
+    cleaned = (tone_name or "").strip().lower()
+    if cleaned in PAPER_CARD_THEMES:
+        return PAPER_CARD_THEMES[cleaned]
+    ordered_keys = ("blue", "teal", "purple", "amber", "coral", "green", "sky")
+    chosen_key = ordered_keys[abs(int(seed_value)) % len(ordered_keys)]
+    return PAPER_CARD_THEMES[chosen_key]
+
+
 def _render_paper_card_to_pixmap(
     command: jarvis_response_parser.DrawingCommand,
     seed_value: int,
+    out_model3d_viewports: Optional[List[Tuple[QRectF, Any]]] = None,
 ) -> QPixmap:
     """
     Renders the cool-light gridded paper card (`DRAWING_PAPER_COOL`, `14px` corner
@@ -1076,38 +1163,43 @@ def _render_paper_card_to_pixmap(
     painter.translate(shadow_pad, shadow_pad)
 
     card_rect = QRectF(0.0, 0.0, card_width, card_height)
-    accent_color = _resolve_tone_color(command.tone, jarvis_theme.DRAWING_TONES["blue"])
+    card_theme = _resolve_card_theme(command.tone, seed_value=seed_value)
+    accent_color = _resolve_tone_color(command.tone, card_theme["accent"])
 
     # 1. Soft elevation shadow behind the paper card
-    for offset_y, expand_px, alpha_value in ((8.0, 4.0, 26), (4.0, 1.5, 42), (1.5, 0.5, 50)):
+    for offset_y, expand_px, alpha_value in ((8.0, 4.0, 28), (4.0, 1.5, 44), (1.5, 0.5, 54)):
         shadow_rect = card_rect.adjusted(-expand_px, -expand_px + offset_y, expand_px, expand_px + offset_y)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(0, 0, 0, alpha_value))
         painter.drawRoundedRect(shadow_rect, PAPER_CORNER_RADIUS + expand_px, PAPER_CORNER_RADIUS + expand_px)
 
-    # 2. Clipped cool-light paper body + header strip + graph grid
+    # 2. Clipped themed paper body + header strip + graph grid
     clip_path = QPainterPath()
     clip_path.addRoundedRect(card_rect, PAPER_CORNER_RADIUS, PAPER_CORNER_RADIUS)
 
     painter.save()
     painter.setClipPath(clip_path)
-    painter.fillRect(card_rect, jarvis_theme.DRAWING_PAPER_COOL)
+    bg_grad = QLinearGradient(0.0, 0.0, 0.0, card_height)
+    bg_grad.setColorAt(0.0, card_theme["bg_top"])
+    bg_grad.setColorAt(1.0, card_theme["bg_bottom"])
+    painter.fillRect(card_rect, bg_grad)
 
-    # Top header strip (`DRAWING_PAPER_HEADER`)
+    # Top header strip (`card_theme["header"]`) + glowing top accent bar
     header_rect = QRectF(0.0, 0.0, card_width, PAPER_HEADER_HEIGHT)
-    painter.fillRect(header_rect, jarvis_theme.DRAWING_PAPER_HEADER)
-    painter.setPen(QPen(QColor(42, 42, 52, 210), 1.0))
+    painter.fillRect(header_rect, card_theme["header"])
+    painter.fillRect(QRectF(0.0, 0.0, card_width, 2.4), accent_color)
+    painter.setPen(QPen(card_theme["border"], 1.0))
     painter.drawLine(QPointF(0.0, PAPER_HEADER_HEIGHT), QPointF(card_width, PAPER_HEADER_HEIGHT))
 
     header_label = jarvis_response_parser.clean_spoken_text(command.header or "")
     if header_label:
-        header_font = jarvis_theme.barlow_font(9.5, semibold=False)
+        header_font = jarvis_theme.barlow_font(9.5, semibold=True)
         painter.setFont(header_font)
-        painter.setPen(QColor(161, 161, 170, 235))
-        painter.drawText(header_rect, Qt.AlignmentFlag.AlignCenter, header_label)
+        painter.setPen(accent_color.lighter(135))
+        painter.drawText(header_rect, Qt.AlignmentFlag.AlignCenter, header_label.upper())
 
-    # Graph-paper grid lines (`DRAWING_GRID_LINE`)
-    painter.setPen(QPen(jarvis_theme.DRAWING_GRID_LINE, 1.0))
+    # Graph-paper grid lines (`card_theme["grid"]`)
+    painter.setPen(QPen(card_theme["grid"], 1.0))
     grid_x = PAPER_GRID_SPACING
     while grid_x < card_width:
         painter.drawLine(QPointF(grid_x, PAPER_HEADER_HEIGHT), QPointF(grid_x, card_height))
@@ -1430,11 +1522,15 @@ def _render_paper_card_to_pixmap(
                         if clean_part.lower().startswith("preset="):
                             model3d_spec = clean_part.split("=", 1)[1].strip()
                             break
-                jarvis_roamies_visuals.Jarvis3DModelRenderer(model3d_spec).paint_into_rect(
+                row_rect_3d = QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(64.0, row_height - 4.0))
+                renderer_3d = jarvis_roamies_visuals.Jarvis3DModelRenderer(model3d_spec)
+                renderer_3d.paint_into_rect(
                     painter=painter,
-                    rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(64.0, row_height - 4.0)),
+                    rect=row_rect_3d,
                     anim_time=0.35,
                 )
+                if out_model3d_viewports is not None:
+                    out_model3d_viewports.append((row_rect_3d, renderer_3d))
             elif row.kind == "sources":
                 if row.text.strip().startswith("["):
                     try:
@@ -1511,8 +1607,8 @@ def _render_paper_card_to_pixmap(
 
     painter.restore()
 
-    # Crisp subtle dark paper rim border
-    painter.setPen(QPen(QColor(63, 63, 70, 220), 1.1))
+    # Crisp themed rim border
+    painter.setPen(QPen(card_theme["border"], 1.35))
     painter.setBrush(Qt.BrushStyle.NoBrush)
     painter.drawRoundedRect(card_rect, PAPER_CORNER_RADIUS, PAPER_CORNER_RADIUS)
     painter.end()
@@ -3687,7 +3783,9 @@ class OverlayCanvasWindow(QWidget):
     def _prebuild_drawing_cache(self, item: _ActiveDrawingItem) -> None:
         command = item.command
         if command.kind == "paper":
-            item.cached_paper_pixmap = _render_paper_card_to_pixmap(command, item.seed_value)
+            viewports_out: List[Tuple[QRectF, Any]] = []
+            item.cached_paper_pixmap = _render_paper_card_to_pixmap(command, item.seed_value, out_model3d_viewports=viewports_out)
+            item.model3d_viewports = viewports_out
             item.cached_paper_size = (int(command.width), int(command.height))
         elif command.kind == "underline":
             points = _build_underline_wave_points(command.x, command.y, command.width, item.seed_value)
@@ -3943,7 +4041,7 @@ class OverlayCanvasWindow(QWidget):
                                 self._cursor_y_spring.set_target(tip_point[1] + 10.0)
                                 self._target_hold_until = max(self._target_hold_until, now_seconds + 2.6)
                                 self._navigation_mode = "pointing"
-                    if item.model3d_renderer is not None:
+                    if item.model3d_renderer is not None or item.model3d_viewports:
                         changed = True
                     if elapsed_item <= item.duration_seconds + 0.05 or (item.expires_at - now_seconds) <= DRAWING_FADE_OUT_SECONDS:
                         changed = True
@@ -4043,7 +4141,9 @@ class OverlayCanvasWindow(QWidget):
         command = item.command
         if command.kind == "paper":
             if item.cached_paper_pixmap is None:
-                item.cached_paper_pixmap = _render_paper_card_to_pixmap(command, item.seed_value)
+                viewports_out: List[Tuple[QRectF, Any]] = []
+                item.cached_paper_pixmap = _render_paper_card_to_pixmap(command, item.seed_value, out_model3d_viewports=viewports_out)
+                item.model3d_viewports = viewports_out
             lift_offset = (1.0 - draw_progress) * 12.0
             painter.save()
             painter.setOpacity(draw_progress * fade_alpha)
@@ -4068,10 +4168,15 @@ class OverlayCanvasWindow(QWidget):
                 painter.drawRoundedRect(brect, 4.0, 4.0)
                 painter.setPen(QColor(bhex))
                 painter.drawText(brect, Qt.AlignmentFlag.AlignCenter, btxt if len(btxt) <= 3 else btxt[:3])
-            # Live animated 3D viewport overlay inside 3D cards
-            if item.model3d_renderer is not None and draw_progress > 0.35:
-                view_rect = QRectF(command.x + 20.0, card_y + PAPER_HEADER_HEIGHT + 44.0, card_w - 40.0, max(90.0, float(command.height) - PAPER_HEADER_HEIGHT - 64.0))
-                item.model3d_renderer.paint_into_rect(painter, view_rect, now_seconds)
+            # Live animated 3D viewport overlays inside single-row or multi-row 3D cards at 60 FPS
+            if draw_progress > 0.35:
+                if item.model3d_viewports:
+                    for rel_rect, renderer_inst in item.model3d_viewports:
+                        screen_3d_rect = rel_rect.translated(command.x, card_y)
+                        renderer_inst.paint_into_rect(painter, screen_3d_rect, now_seconds)
+                elif item.model3d_renderer is not None:
+                    view_rect = QRectF(command.x + 20.0, card_y + PAPER_HEADER_HEIGHT + 44.0, card_w - 40.0, max(90.0, float(command.height) - PAPER_HEADER_HEIGHT - 64.0))
+                    item.model3d_renderer.paint_into_rect(painter, view_rect, now_seconds)
             painter.restore()
             return
 
@@ -5331,12 +5436,12 @@ def save_visual_snapshots(output_directory: str) -> List[str]:
     overlay.clear_caption()
     stem_card = jarvis_response_parser.DrawingCommand(
         kind="paper",
-        x=32.0,
-        y=72.0,
-        width=400.0,
+        x=24.0,
+        y=68.0,
+        width=380.0,
         height=720.0,
-        label="STEM & 3D Visuals",
-        header="Roamies Parity",
+        label="3D Simulation & STEM",
+        header="3D Simulation · ATOM",
         body=(
             "model3d:preset=atom|caption=Bohr Atom | "
             "molecule:smiles=CCO|caption=Ethanol | "
@@ -5344,28 +5449,43 @@ def save_visual_snapshots(output_directory: str) -> List[str]:
             "map:region=Europe|highlight=France,Germany | "
             "geometry:shapes=triangle 0,0 100,0 50,80"
         ),
-        tone="blue",
+        tone="purple",
     )
     media_card = jarvis_response_parser.DrawingCommand(
         kind="paper",
-        x=456.0,
-        y=72.0,
-        width=390.0,
-        height=540.0,
-        label="Agentic Task & Study Card",
-        header="Multi-Mode",
+        x=428.0,
+        y=68.0,
+        width=370.0,
+        height=390.0,
+        label="DNA Helix & Mechanics",
+        header="3D Simulation · DNA",
         body=(
+            "model3d:preset=dna|caption=Double Helix | "
             "flow: Inspect UIA -> Act in App | "
             "bars: Speed=96% ; Accuracy=99% | "
-            "sources:Roamies|https://github.com/KenKaiii/Roamies;Python|https://python.org | "
-            "ticket:AG-101|Watch It Work Active|Low Latency | "
-            "medal:Gold|60 FPS Verified | "
-            "legend:Blue=Target;Green=Completed"
+            "sources:Roamies|https://github.com/KenKaiii/Roamies;Python|https://python.org"
         ),
-        tone="green",
+        tone="teal",
+    )
+    contrast_card = jarvis_response_parser.DrawingCommand(
+        kind="paper",
+        x=428.0,
+        y=478.0,
+        width=370.0,
+        height=310.0,
+        label="Neural Net & Mastery",
+        header="3D Simulation · NEURAL",
+        body=(
+            "model3d:preset=neural|caption=Transformer | "
+            "ticket:AG-101|Show Me Mode Active|60 FPS 3D | "
+            "medal:Gold|Multi-Theme Cards | "
+            "legend:Purple=3D;Teal=Data;Amber=Recall"
+        ),
+        tone="amber",
     )
     overlay.add_drawing_command(stem_card)
     overlay.add_drawing_command(media_card)
+    overlay.add_drawing_command(contrast_card)
     overlay.add_drawing_command(
         jarvis_response_parser.DrawingCommand(
             kind="target",

@@ -907,24 +907,26 @@ class JarvisApplicationController(QObject):
 
             if intent_plan.intent_kind == "system_telemetry_and_settings":
                 self._executed_agent_command_in_turn = True
-                telemetry_lines = [
-                    segment.strip().rstrip(".")
-                    for segment in re.split(r"[;.\n]+", intent_plan.telemetry_response or "")
-                    if segment.strip()
-                ]
-                telemetry_body_parts = telemetry_lines[:3] or ["Telemetry Ready"]
-                telemetry_card = jarvis_response_parser.DrawingCommand(
-                    kind="paper",
-                    x=24.0,
-                    y=88.0,
-                    width=330.0,
-                    height=265.0,
-                    label="Live System",
-                    header=intent_plan.spoken_step_intro.rstrip(".")[:34] or "System Status",
-                    body=" -> ".join(telemetry_body_parts),
-                    sentence_index=0,
-                )
-                self.overlay_window.add_drawing_command(telemetry_card)
+                if jarvis_response_parser.is_show_me_visual_request(prompt_text):
+                    telemetry_lines = [
+                        segment.strip().rstrip(".")
+                        for segment in re.split(r"[;.\n]+", intent_plan.telemetry_response or "")
+                        if segment.strip()
+                    ]
+                    telemetry_body_parts = telemetry_lines[:3] or ["Telemetry Ready"]
+                    telemetry_card = jarvis_response_parser.DrawingCommand(
+                        kind="paper",
+                        x=24.0,
+                        y=88.0,
+                        width=330.0,
+                        height=265.0,
+                        label="Live System",
+                        header=intent_plan.spoken_step_intro.rstrip(".")[:34] or "System Status",
+                        body=" -> ".join(telemetry_body_parts),
+                        tone="teal",
+                        sentence_index=0,
+                    )
+                    self.overlay_window.add_drawing_command(telemetry_card)
                 if agent_actions_enabled and intent_plan.agent_commands:
                     captured_worker_gen = self._agent_worker_generation
                     threading.Thread(
@@ -969,7 +971,8 @@ class JarvisApplicationController(QObject):
                     max_scroll_steps=0,
                     memory_context=self.memory_service.build_memory_context_for_prompt(),
                     live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
-                    suppress_visual_notes=False,
+                    suppress_visual_notes=(not jarvis_response_parser.is_show_me_visual_request(prompt_text)),
+                    voice_reply_mode=bool(speak_reply),
                 )
                 return
 
@@ -1013,6 +1016,7 @@ class JarvisApplicationController(QObject):
             max_scroll_steps=self._max_scroll_steps if self._scroll_explain_active else 0,
             memory_context=self.memory_service.build_memory_context_for_prompt(),
             live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
+            voice_reply_mode=bool(speak_reply),
         )
 
     def _prepare_roamies_prompt_context(self, speak_reply: bool) -> None:
@@ -1165,7 +1169,8 @@ class JarvisApplicationController(QObject):
             max_scroll_steps=0,
             memory_context=self.memory_service.build_memory_context_for_prompt(),
             live_screen_context=self.screen_monitor.get_live_screen_context_summary(),
-            suppress_visual_notes=False,
+            suppress_visual_notes=(not jarvis_response_parser.is_show_me_visual_request(user_prompt)),
+            voice_reply_mode=bool(self._speak_current_turn),
         )
 
     def _emit_visual_feedback_if_present(self) -> None:

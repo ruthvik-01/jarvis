@@ -180,29 +180,99 @@ def resolve_3d_preset_or_parts(spec: Any) -> List[Dict[str, Any]]:
         except Exception:
             pass
     key = raw_text.lower()
-    if "piston" in key or "engine" in key:
+    for part_kv in raw_text.split("|"):
+        kv_clean = part_kv.strip()
+        if kv_clean.lower().startswith("preset="):
+            key = kv_clean.split("=", 1)[1].strip().lower()
+            break
+    if any(word in key for word in ("piston", "engine", "cylinder", "combustion", "motor")):
         return [
             {"shape": "cylinder", "at": [0.0, 0.0, 0.0], "size": [1.15, 1.9, 1.15], "tone": "sky", "label": "Cylinder"},
-            {"shape": "cylinder", "at": [0.0, -0.35, 0.0], "size": [0.78, 0.55, 0.78], "tone": "amber", "label": "Piston", "motion": {"do": "slide", "to": [0.0, 0.48, 0.0], "secs": 1.8}},
-            {"shape": "box", "at": [0.0, -0.82, 0.0], "size": [0.22, 0.75, 0.22], "tone": "teal", "motion": {"do": "slide", "to": [0.0, -0.05, 0.0], "secs": 1.8}},
+            {"shape": "cylinder", "at": [0.0, -0.35, 0.0], "size": [0.80, 0.56, 0.80], "tone": "amber", "label": "Piston", "motion": {"do": "slide", "to": [0.0, 0.48, 0.0], "secs": 1.6}},
+            {"shape": "box", "at": [0.0, -0.82, 0.0], "size": [0.24, 0.78, 0.24], "tone": "teal", "label": "Rod", "motion": {"do": "slide", "to": [0.0, -0.05, 0.0], "secs": 1.6}},
+            {"shape": "torus", "at": [0.0, -0.95, 0.0], "size": [0.65, 0.65, 0.65], "rot": [90, 0, 0], "tone": "coral", "label": "Crank", "motion": {"do": "spin", "axis": "z", "secs": 1.6}},
         ]
-    if "atom" in key or "electron" in key or "nucleus" in key:
+    if any(word in key for word in ("atom", "electron", "nucleus", "bohr", "quantum", "proton")):
         return [
-            {"shape": "sphere", "at": [0.0, 0.0, 0.0], "size": 0.65, "tone": "coral", "label": "Nucleus", "motion": {"do": "pulse", "secs": 1.8}},
-            {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [1.8, 1.8, 1.8], "rot": [55, 0, 20], "tone": "teal", "motion": {"do": "spin", "axis": "y", "secs": 5.0}},
-            {"shape": "sphere", "at": [0.78, 0.0, 0.0], "size": 0.22, "tone": "accent", "label": "e-", "motion": {"do": "orbit", "around": [0.0, 0.0, 0.0], "axis": "y", "secs": 2.4}},
+            {"shape": "sphere", "at": [0.0, 0.0, 0.0], "size": 0.68, "tone": "coral", "label": "Nucleus", "motion": {"do": "pulse", "secs": 1.6}},
+            {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [1.85, 1.85, 1.85], "rot": [55, 0, 20], "tone": "teal", "motion": {"do": "spin", "axis": "y", "secs": 4.2}},
+            {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [1.85, 1.85, 1.85], "rot": [-55, 0, -20], "tone": "sky", "motion": {"do": "spin", "axis": "x", "secs": 3.8}},
+            {"shape": "sphere", "at": [0.88, 0.0, 0.0], "size": 0.24, "tone": "amber", "label": "e- (1s)", "motion": {"do": "orbit", "around": [0.0, 0.0, 0.0], "axis": "y", "secs": 2.0}},
+            {"shape": "sphere", "at": [0.0, 0.88, 0.0], "size": 0.22, "tone": "lime", "label": "e- (2p)", "motion": {"do": "orbit", "around": [0.0, 0.0, 0.0], "axis": "z", "secs": 2.6}},
+        ]
+    if any(word in key for word in ("solar", "planet", "earth", "orbit", "sun", "moon", "galaxy", "star")):
+        return [
+            {"shape": "sphere", "at": [0.0, 0.0, 0.0], "size": 0.78, "tone": "amber", "label": "Sun", "motion": {"do": "pulse", "secs": 2.2}},
+            {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [1.55, 1.55, 1.55], "rot": [78, 0, 0], "tone": "sky"},
+            {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [2.25, 2.25, 2.25], "rot": [78, 0, 0], "tone": "lilac"},
+            {"shape": "sphere", "at": [0.76, 0.0, 0.0], "size": 0.26, "tone": "teal", "label": "Earth", "motion": {"do": "orbit", "around": [0.0, 0.0, 0.0], "axis": "y", "secs": 2.8}},
+            {"shape": "sphere", "at": [-1.10, 0.0, 0.0], "size": 0.22, "tone": "coral", "label": "Mars", "motion": {"do": "orbit", "around": [0.0, 0.0, 0.0], "axis": "y", "secs": 4.2}},
+        ]
+    if any(word in key for word in ("dna", "helix", "gene", "chromosome", "rna", "biology")):
+        return [
+            {"shape": "sphere", "at": [-0.55, 0.70, 0.0], "size": 0.26, "tone": "teal", "label": "Strand A", "motion": {"do": "orbit", "around": [0.0, 0.70, 0.0], "axis": "y", "secs": 2.8}},
+            {"shape": "sphere", "at": [0.55, 0.70, 0.0], "size": 0.26, "tone": "coral", "label": "Strand B", "motion": {"do": "orbit", "around": [0.0, 0.70, 0.0], "axis": "y", "secs": 2.8}},
+            {"shape": "box", "at": [0.0, 0.70, 0.0], "size": [0.95, 0.10, 0.10], "tone": "amber", "motion": {"do": "spin", "axis": "y", "secs": 2.8}},
+            {"shape": "sphere", "at": [0.0, 0.0, 0.55], "size": 0.26, "tone": "teal", "motion": {"do": "orbit", "around": [0.0, 0.0, 0.0], "axis": "y", "secs": 2.8}},
+            {"shape": "sphere", "at": [0.0, 0.0, -0.55], "size": 0.26, "tone": "coral", "motion": {"do": "orbit", "around": [0.0, 0.0, 0.0], "axis": "y", "secs": 2.8}},
+            {"shape": "box", "at": [0.0, 0.0, 0.0], "size": [0.10, 0.10, 0.95], "tone": "lime", "label": "Base Pair", "motion": {"do": "spin", "axis": "y", "secs": 2.8}},
+            {"shape": "sphere", "at": [0.55, -0.70, 0.0], "size": 0.26, "tone": "teal", "motion": {"do": "orbit", "around": [0.0, -0.70, 0.0], "axis": "y", "secs": 2.8}},
+            {"shape": "sphere", "at": [-0.55, -0.70, 0.0], "size": 0.26, "tone": "coral", "motion": {"do": "orbit", "around": [0.0, -0.70, 0.0], "axis": "y", "secs": 2.8}},
+            {"shape": "box", "at": [0.0, -0.70, 0.0], "size": [0.95, 0.10, 0.10], "tone": "lilac", "motion": {"do": "spin", "axis": "y", "secs": 2.8}},
+        ]
+    if any(word in key for word in ("heart", "pump", "ventricle", "atrium", "pulse", "cardiac")):
+        return [
+            {"shape": "sphere", "at": [-0.32, 0.28, 0.0], "size": [0.62, 0.68, 0.58], "tone": "coral", "label": "Right Atrium", "motion": {"do": "pulse", "secs": 1.1}},
+            {"shape": "sphere", "at": [0.32, 0.28, 0.0], "size": [0.62, 0.68, 0.58], "tone": "red", "label": "Left Atrium", "motion": {"do": "pulse", "secs": 1.1}},
+            {"shape": "cone", "at": [0.0, -0.45, 0.0], "size": [1.05, 1.10, 0.82], "rot": [180, 0, 0], "tone": "red", "label": "Ventricles", "motion": {"do": "pulse", "secs": 1.1}},
+            {"shape": "cylinder", "at": [0.10, 0.82, 0.0], "size": [0.28, 0.55, 0.28], "tone": "amber", "label": "Aorta"},
+        ]
+    if any(word in key for word in ("neural", "network", "layer", "ai", "transformer", "deep", "brain", "mlp", "cnn")):
+        return [
+            {"shape": "sphere", "at": [-0.85, 0.50, 0.0], "size": 0.28, "tone": "teal", "label": "Input Layer", "motion": {"do": "pulse", "secs": 1.8}},
+            {"shape": "sphere", "at": [-0.85, -0.50, 0.0], "size": 0.28, "tone": "teal", "motion": {"do": "pulse", "secs": 1.8}},
+            {"shape": "box", "at": [0.0, 0.55, 0.0], "size": [0.38, 0.38, 0.38], "tone": "lilac", "label": "Hidden / Attention", "motion": {"do": "spin", "axis": "y", "secs": 3.0}},
+            {"shape": "box", "at": [0.0, 0.0, 0.0], "size": [0.42, 0.42, 0.42], "tone": "accent", "motion": {"do": "spin", "axis": "x", "secs": 2.6}},
+            {"shape": "box", "at": [0.0, -0.55, 0.0], "size": [0.38, 0.38, 0.38], "tone": "lilac", "motion": {"do": "spin", "axis": "y", "secs": 3.0}},
+            {"shape": "sphere", "at": [0.85, 0.0, 0.0], "size": 0.36, "tone": "amber", "label": "Output Logits", "motion": {"do": "pulse", "secs": 1.4}},
+        ]
+    if any(word in key for word in ("cpu", "architecture", "stack", "pipeline", "server", "cloud", "database", "system", "os", "memory", "ram")):
+        return [
+            {"shape": "box", "at": [0.0, 0.68, 0.0], "size": [1.35, 0.34, 0.95], "tone": "teal", "label": "L1 Cache / Fast RAM", "motion": {"do": "slide", "to": [0.0, 0.80, 0.0], "secs": 2.2}},
+            {"shape": "box", "at": [0.0, 0.0, 0.0], "size": [1.55, 0.44, 1.10], "tone": "accent", "label": "ALU & Control Core", "motion": {"do": "spin", "axis": "y", "secs": 5.5}},
+            {"shape": "cylinder", "at": [0.0, -0.68, 0.0], "size": [1.45, 0.42, 1.45], "tone": "amber", "label": "Storage / Bus"},
+        ]
+    if any(word in key for word in ("gear", "clock", "machine", "robotics", "torque")):
+        return [
+            {"shape": "torus", "at": [-0.52, 0.0, 0.0], "size": [1.15, 1.15, 1.15], "rot": [90, 0, 0], "tone": "amber", "label": "Drive Gear", "motion": {"do": "spin", "axis": "z", "secs": 2.4}},
+            {"shape": "torus", "at": [0.58, 0.0, 0.0], "size": [0.95, 0.95, 0.95], "rot": [90, 0, 0], "tone": "teal", "label": "Pinion Gear", "motion": {"do": "spin", "axis": "z", "secs": 1.8}},
+            {"shape": "cylinder", "at": [-0.52, 0.0, 0.0], "size": [0.35, 0.55, 0.35], "rot": [90, 0, 0], "tone": "coral"},
+        ]
+    if any(word in key for word in ("wave", "pendulum", "oscillator", "frequency", "signal")):
+        return [
+            {"shape": "sphere", "at": [-0.80, -0.35, 0.0], "size": 0.34, "tone": "teal", "label": "Node 1", "motion": {"do": "slide", "to": [-0.80, 0.45, 0.0], "secs": 1.4}},
+            {"shape": "sphere", "at": [-0.26, 0.45, 0.0], "size": 0.34, "tone": "sky", "label": "Crest", "motion": {"do": "slide", "to": [-0.26, -0.35, 0.0], "secs": 1.4}},
+            {"shape": "sphere", "at": [0.26, -0.35, 0.0], "size": 0.34, "tone": "amber", "label": "Trough", "motion": {"do": "slide", "to": [0.26, 0.45, 0.0], "secs": 1.4}},
+            {"shape": "sphere", "at": [0.80, 0.45, 0.0], "size": 0.34, "tone": "coral", "label": "Node 4", "motion": {"do": "slide", "to": [0.80, -0.35, 0.0], "secs": 1.4}},
+        ]
+    if any(word in key for word in ("cube", "matrix", "tensor", "voxel", "block")):
+        return [
+            {"shape": "box", "at": [0.0, 0.0, 0.0], "size": [1.45, 1.45, 1.45], "tone": "sky", "label": "Outer Tensor"},
+            {"shape": "box", "at": [0.0, 0.0, 0.0], "size": [0.75, 0.75, 0.75], "tone": "amber", "label": "Inner Core", "motion": {"do": "spin", "axis": "y", "secs": 2.6}},
+            {"shape": "sphere", "at": [0.95, 0.0, 0.0], "size": 0.24, "tone": "teal", "label": "Vector", "motion": {"do": "orbit", "around": [0.0, 0.0, 0.0], "axis": "y", "secs": 2.4}},
         ]
     if "black" in key or "hole" in key:
         return [
-            {"shape": "sphere", "at": [0.0, 0.0, 0.0], "size": 0.85, "tone": "lilac", "label": "Event Horizon"},
-            {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [2.2, 0.38, 2.2], "rot": [12, 0, 8], "tone": "amber", "label": "Accretion Disk", "motion": {"do": "spin", "axis": "y", "secs": 3.5}},
-            {"shape": "cone", "at": [0.0, 0.95, 0.0], "size": [0.3, 0.95, 0.3], "tone": "sky", "label": "Relativistic Jet"},
+            {"shape": "sphere", "at": [0.0, 0.0, 0.0], "size": 0.85, "tone": "lilac", "label": "Event Horizon", "motion": {"do": "pulse", "secs": 2.0}},
+            {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [2.2, 0.38, 2.2], "rot": [12, 0, 8], "tone": "amber", "label": "Accretion Disk", "motion": {"do": "spin", "axis": "y", "secs": 3.0}},
+            {"shape": "cone", "at": [0.0, 0.95, 0.0], "size": [0.3, 0.95, 0.3], "tone": "sky", "label": "Relativistic Jet", "motion": {"do": "pulse", "secs": 1.5}},
         ]
     # Default 3D solar/gyro assembly
     return [
-        {"shape": "sphere", "at": [0.0, 0.0, 0.0], "size": 0.72, "tone": "amber", "label": "Core", "motion": {"do": "pulse", "secs": 2.4}},
-        {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [1.75, 1.75, 1.75], "rot": [35, 0, 15], "tone": "accent", "motion": {"do": "spin", "axis": "y", "secs": 4.2}},
-        {"shape": "sphere", "at": [0.85, 0.0, 0.0], "size": 0.26, "tone": "teal", "label": "Satellite", "motion": {"do": "orbit", "axis": "y", "secs": 3.2}},
+        {"shape": "sphere", "at": [0.0, 0.0, 0.0], "size": 0.72, "tone": "amber", "label": "Core", "motion": {"do": "pulse", "secs": 2.0}},
+        {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [1.75, 1.75, 1.75], "rot": [35, 0, 15], "tone": "accent", "motion": {"do": "spin", "axis": "y", "secs": 3.6}},
+        {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [1.35, 1.35, 1.35], "rot": [-40, 20, 0], "tone": "lilac", "motion": {"do": "spin", "axis": "x", "secs": 3.0}},
+        {"shape": "sphere", "at": [0.85, 0.0, 0.0], "size": 0.26, "tone": "teal", "label": "Orbiter", "motion": {"do": "orbit", "axis": "y", "secs": 2.4}},
     ]
 
 
@@ -303,9 +373,16 @@ class Jarvis3DModelRenderer:
 
         cx = rect.center().x()
         cy = rect.center().y()
-        proj_scale = min(rect.width(), rect.height()) * 0.40
+        proj_scale = min(rect.width(), rect.height()) * 0.68
         draw_tris: List[Tuple[float, QPolygonF, QColor, bool]] = []
         label_points: List[Tuple[float, float, str, QColor]] = []
+
+        # Subtle 3D floor reference grid inside viewport
+        painter.setPen(QPen(QColor(95, 145, 225, 38), 0.75, Qt.DotLine))
+        for grid_step in (-2, -1, 0, 1, 2):
+            gx_off = grid_step * (rect.width() * 0.14)
+            painter.drawLine(QPointF(cx + gx_off * 0.7, rect.bottom() - 22.0), QPointF(cx + gx_off * 1.15, rect.bottom() - 6.0))
+        painter.drawLine(QPointF(rect.left() + 26.0, rect.bottom() - 14.0), QPointF(rect.right() - 26.0, rect.bottom() - 14.0))
 
         default_cycles = {"spin": 4.0, "orbit": 6.0, "slide": 2.0, "pulse": 1.6}
         for item in self._items:
@@ -331,7 +408,7 @@ class Jarvis3DModelRenderer:
                     slide_k = 0.5 * (1.0 - math.cos(phase))
                     part_pos = part_pos + (target_to - part_pos) * slide_k
                 elif do_mode == "pulse":
-                    part_size = part_size * (1.0 + 0.14 * math.sin(phase))
+                    part_size = part_size * (1.0 + 0.16 * math.sin(phase))
 
             local_scaled = item["verts"] * part_size[None, None, :]
             world_verts = np.einsum("ij,mnj->mni", part_rot, local_scaled) + part_pos[None, None, :]
@@ -342,7 +419,7 @@ class Jarvis3DModelRenderer:
             cam_norms = np.einsum("ij,mj->mi", view_rot, world_norms)
 
             mean_z = cam_verts[:, :, 2].mean(axis=1)
-            denom = np.maximum(0.6, 3.2 - cam_verts[:, :, 2])
+            denom = np.maximum(0.6, 2.75 - cam_verts[:, :, 2])
             screen_x = cx + (cam_verts[:, :, 0] / denom) * proj_scale * 2.15
             screen_y = cy - (cam_verts[:, :, 1] / denom) * proj_scale * 2.15
 
@@ -354,23 +431,23 @@ class Jarvis3DModelRenderer:
                 tri_z = float(mean_z[tri_idx])
                 if (not is_glass) and cam_norms[tri_idx, 2] < -0.15:
                     continue
-                shade = 0.34 + 0.66 * float(lambert[tri_idx])
+                shade = 0.42 + 0.58 * float(lambert[tri_idx])
                 poly = QPolygonF([
                     QPointF(float(screen_x[tri_idx, 0]), float(screen_y[tri_idx, 0])),
                     QPointF(float(screen_x[tri_idx, 1]), float(screen_y[tri_idx, 1])),
                     QPointF(float(screen_x[tri_idx, 2]), float(screen_y[tri_idx, 2])),
                 ])
                 fill_col = QColor(
-                    min(255, int(base_col.red() * shade + 18)),
-                    min(255, int(base_col.green() * shade + 20)),
-                    min(255, int(base_col.blue() * shade + 24)),
-                    62 if is_glass else 225,
+                    min(255, int(base_col.red() * shade + 24)),
+                    min(255, int(base_col.green() * shade + 26)),
+                    min(255, int(base_col.blue() * shade + 30)),
+                    68 if is_glass else 235,
                 )
                 draw_tris.append((tri_z, poly, fill_col, is_glass))
 
             if item["label"]:
                 part_cam = view_rot @ ((part_pos - self._scene_center) * self._scene_scale)
-                denom_pt = max(0.6, 3.2 - float(part_cam[2]))
+                denom_pt = max(0.6, 2.75 - float(part_cam[2]))
                 lbl_x = cx + (float(part_cam[0]) / denom_pt) * proj_scale * 2.15
                 lbl_y = cy - (float(part_cam[1]) / denom_pt) * proj_scale * 2.15
                 label_points.append((lbl_x, lbl_y, item["label"], base_col))
@@ -378,26 +455,35 @@ class Jarvis3DModelRenderer:
         draw_tris.sort(key=lambda entry: entry[0])
         for _tri_z, poly, fill_col, is_glass in draw_tris:
             if is_glass:
-                painter.setPen(QPen(QColor(fill_col.red(), fill_col.green(), fill_col.blue(), 120), 0.7))
+                painter.setPen(QPen(QColor(fill_col.red(), fill_col.green(), fill_col.blue(), 135), 0.8))
             else:
-                painter.setPen(QPen(QColor(15, 25, 42, 70), 0.5))
+                painter.setPen(QPen(QColor(255, 255, 255, 42), 0.45))
             painter.setBrush(fill_col)
             painter.drawPolygon(poly)
 
-        lbl_font = QFont("Segoe UI", 8, QFont.Bold)
+        # Render compact callout badges along the right/left periphery with leader lines so the 3D mesh is never covered
+        lbl_font = QFont("Segoe UI", 7.5, QFont.Bold)
         painter.setFont(lbl_font)
-        placed_tag_rects: List[QRectF] = []
-        for lbl_x, lbl_y, lbl_text, lbl_col in label_points:
-            tag_rect = QRectF(lbl_x - 36.0, lbl_y - 22.0, 72.0, 17.0)
-            for prev_rect in placed_tag_rects:
-                if tag_rect.intersects(prev_rect):
-                    tag_rect.translate(0.0, 22.0)
-            placed_tag_rects.append(tag_rect)
+        for tag_idx, (lbl_x, lbl_y, lbl_text, lbl_col) in enumerate(label_points[:4]):
+            is_right_side = (tag_idx % 2 == 0)
+            tag_w = min(84.0, max(52.0, len(lbl_text) * 5.8 + 14.0))
+            tag_h = 16.0
+            tag_x = (rect.right() - tag_w - 6.0) if is_right_side else (rect.left() + 6.0)
+            slot_row = tag_idx // 2
+            tag_y = rect.top() + 8.0 + slot_row * 22.0
+            tag_rect = QRectF(tag_x, tag_y, tag_w, tag_h)
+            anchor_x = tag_rect.left() if is_right_side else tag_rect.right()
+            anchor_y = tag_rect.center().y()
+            painter.setPen(QPen(QColor(lbl_col.red(), lbl_col.green(), lbl_col.blue(), 145), 0.9, Qt.DotLine))
+            painter.drawLine(QPointF(lbl_x, lbl_y), QPointF(anchor_x, anchor_y))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(lbl_col)
+            painter.drawEllipse(QPointF(lbl_x, lbl_y), 2.4, 2.4)
             painter.setPen(QPen(lbl_col, 1.0))
-            painter.setBrush(QColor(10, 18, 32, 210))
+            painter.setBrush(QColor(8, 14, 26, 225))
             painter.drawRoundedRect(tag_rect, 4.0, 4.0)
-            painter.setPen(QColor(235, 245, 255))
-            painter.drawText(tag_rect, Qt.AlignCenter, lbl_text[:16])
+            painter.setPen(QColor(238, 246, 255))
+            painter.drawText(tag_rect, Qt.AlignCenter, lbl_text[:15])
 
         painter.restore()
 

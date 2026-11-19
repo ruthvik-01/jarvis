@@ -4320,8 +4320,14 @@ class VisionBrainService(QObject):
 
                             emitted_any_chunk = True
                             new_sentences, new_commands = extractor.feed_delta(delta_text)
+                            visual_only_kinds = (
+                                "paper", "underline", "ring", "point", "box", "highlight",
+                                "target", "strike", "check", "cross", "num", "connect",
+                                "spotlight", "hover", "trace", "line", "curve", "arrow",
+                                "circle", "rect", "write", "label", "button", "walkthrough_step",
+                            )
                             for cmd in new_commands:
-                                if not allow_visual_notes and cmd.kind in ("paper", "underline"):
+                                if not allow_visual_notes and cmd.kind in visual_only_kinds:
                                     continue
                                 self.drawingCommandReady.emit(cmd)
                             for sentence in new_sentences:
@@ -4345,8 +4351,14 @@ class VisionBrainService(QObject):
                                 if fallback_text:
                                     emitted_any_chunk = True
                                     new_sentences, new_commands = extractor.feed_delta(fallback_text)
+                                    visual_only_kinds = (
+                                        "paper", "underline", "ring", "point", "box", "highlight",
+                                        "target", "strike", "check", "cross", "num", "connect",
+                                        "spotlight", "hover", "trace", "line", "curve", "arrow",
+                                        "circle", "rect", "write", "label", "button", "walkthrough_step",
+                                    )
                                     for cmd in new_commands:
-                                        if not allow_visual_notes and cmd.kind in ("paper", "underline"):
+                                        if not allow_visual_notes and cmd.kind in visual_only_kinds:
                                             continue
                                         self.drawingCommandReady.emit(cmd)
                                     for sentence in new_sentences:
@@ -4393,6 +4405,7 @@ class VisionBrainService(QObject):
         memory_context: str = "",
         live_screen_context: str = "",
         suppress_visual_notes: bool = False,
+        voice_reply_mode: bool = False,
     ) -> int:
         with self._lock:
             self._generation_id += 1
@@ -4423,6 +4436,7 @@ class VisionBrainService(QObject):
                 memory_context,
                 live_screen_context,
                 suppress_visual_notes,
+                voice_reply_mode,
             ),
             daemon=True,
         ).start()
@@ -4441,6 +4455,7 @@ class VisionBrainService(QObject):
         memory_context: str = "",
         live_screen_context: str = "",
         suppress_visual_notes: bool = False,
+        voice_reply_mode: bool = False,
     ) -> None:
         pre_endpoints = self.resolve_all_vision_endpoints(
             self._settings_store,
@@ -4526,6 +4541,8 @@ class VisionBrainService(QObject):
             subagent_crew_text=str(getattr(self, "_subagent_crew_text", "") or ""),
             morning_briefing_note=briefing_note,
             voice_cues_enabled=bool(self._settings_store.get("voice_cues_enabled", True)),
+            voice_reply_mode=bool(voice_reply_mode),
+            user_honorific=str(self._settings_store.get("user_honorific", "sir") or "sir"),
         )
 
         # Keep system message completely static across turns; place compact sanitized desktop/session
@@ -4610,8 +4627,14 @@ class VisionBrainService(QObject):
                 return
 
             final_sentences, final_commands = extractor.flush_remaining()
+            visual_only_kinds = (
+                "paper", "underline", "ring", "point", "box", "highlight",
+                "target", "strike", "check", "cross", "num", "connect",
+                "spotlight", "hover", "trace", "line", "curve", "arrow",
+                "circle", "rect", "write", "label", "button", "walkthrough_step",
+            )
             for cmd in final_commands:
-                if not allow_visual_notes and cmd.kind in ("paper", "underline"):
+                if not allow_visual_notes and cmd.kind in visual_only_kinds:
                     continue
                 self.drawingCommandReady.emit(cmd)
             for sentence in final_sentences:
@@ -4622,8 +4645,9 @@ class VisionBrainService(QObject):
                 parsed_response.commands = [
                     cmd_item
                     for cmd_item in parsed_response.commands
-                    if cmd_item.kind not in ("paper", "underline")
+                    if cmd_item.kind not in visual_only_kinds
                 ]
+                parsed_response.primary_point_target = None
 
             active_drawing_mode = str(
                 self._settings_store.get(
@@ -4760,6 +4784,31 @@ class VisionBrainService(QObject):
                 self.turnFailed.emit(f"Could not reach vision model: {err}")
 
     @staticmethod
+    def _select_best_3d_preset_for_topic(combined_text: str) -> str:
+        lowered = (combined_text or "").lower()
+        if any(word in lowered for word in ("piston", "engine", "combustion", "motor", "cylinder")):
+            return "piston"
+        if any(word in lowered for word in ("atom", "electron", "nucleus", "bohr", "quantum", "proton")):
+            return "atom"
+        if any(word in lowered for word in ("solar", "planet", "earth", "orbit", "sun", "moon", "galaxy")):
+            return "solar"
+        if any(word in lowered for word in ("dna", "helix", "gene", "chromosome", "rna", "cell", "biology")):
+            return "dna"
+        if any(word in lowered for word in ("heart", "pump", "ventricle", "atrium", "cardiac")):
+            return "heart"
+        if any(word in lowered for word in ("neural", "network", "ai", "transformer", "deep", "brain", "llm", "model")):
+            return "neural"
+        if any(word in lowered for word in ("cpu", "architecture", "stack", "pipeline", "server", "cloud", "database", "system", "os", "memory", "ram", "rom", "cache")):
+            return "cpu"
+        if any(word in lowered for word in ("gear", "clock", "machine", "robotics", "torque")):
+            return "gear"
+        if any(word in lowered for word in ("wave", "pendulum", "oscillator", "frequency", "signal")):
+            return "wave"
+        if any(word in lowered for word in ("black", "hole", "gravity", "relativity")):
+            return "blackhole"
+        return "cube"
+
+    @staticmethod
     def _build_visual_note_cards_for_response(
         spoken_sentences: List[str],
         spoken_text: str,
@@ -4770,8 +4819,9 @@ class VisionBrainService(QObject):
         user_prompt: str = "",
     ) -> List[jarvis_response_parser.DrawingCommand]:
         """
-        Synthesizes structured visual diagram note cards so every visual answer has 2 to 3
-        complementary topic maps covering overview/archetype visual, connections, and recall clue.
+        Synthesizes 3 multi-themed visual cards (including an animated 60 FPS 3D model card,
+        a domain mechanics/chart/mindmap card, and a comparison/recall table card) when the
+        user says "show me".
         """
         cleaned_sentences = [sentence.strip() for sentence in spoken_sentences if sentence and sentence.strip()]
         if not cleaned_sentences and spoken_text:
@@ -4785,6 +4835,8 @@ class VisionBrainService(QObject):
             labels=underline_labels,
         )
         archetype = pattern_meta.get("archetype", "process")
+        combined_query = f"{user_prompt or ''} {spoken_text or ''}".strip()
+        chosen_3d_preset = VisionBrainService._select_best_3d_preset_for_topic(combined_query)
 
         label_topics: List[str] = []
         for raw_label in underline_labels or []:
@@ -4798,12 +4850,7 @@ class VisionBrainService(QObject):
             if topic_label and topic_label not in sentence_topics:
                 sentence_topics.append(topic_label)
 
-        desired_card_count = 1
-        if len(cleaned_sentences) >= 2 or len(label_topics) >= 2:
-            desired_card_count = 2
-        if len(cleaned_sentences) >= 5 or len(label_topics) >= 4:
-            desired_card_count = 3
-
+        desired_card_count = 3 if (len(cleaned_sentences) >= 2 or len(label_topics) >= 1) else 2
         needed_cards = max(0, desired_card_count - max(0, int(existing_paper_count)))
         if needed_cards <= 0:
             return []
@@ -4820,80 +4867,83 @@ class VisionBrainService(QObject):
             else:
                 merged_topics.append(f"Point {len(merged_topics) + 1}")
 
-        card_width = 304.0
-        card_height = 264.0
+        card_width = 334.0
+        card_height = 290.0
         right_col_x = float(max(360, int(screen_width) - int(card_width) - 24))
-        bottom_row_y = float(max(376, int(screen_height) - int(card_height) - 72))
+        bottom_row_y = float(max(400, int(screen_height) - int(card_height) - 56))
         margin_slots = [
-            (24.0, 92.0, card_width, card_height),
-            (right_col_x, 92.0, card_width, card_height),
-            (24.0, bottom_row_y, card_width, min(246.0, card_height)),
+            (24.0, 88.0, card_width, card_height, "purple"),
+            (right_col_x, 88.0, card_width, card_height, "teal"),
+            (24.0, bottom_row_y, card_width, 268.0, "amber"),
         ]
 
+        lowered_query = combined_query.lower()
         cards_to_build: List[jarvis_response_parser.DrawingCommand] = []
         total_sentences = max(1, len(cleaned_sentences))
         for card_offset in range(needed_cards):
             slot_idx = (max(0, int(existing_paper_count)) + card_offset) % len(margin_slots)
-            slot_x, slot_y, slot_w, slot_h = margin_slots[slot_idx]
+            slot_x, slot_y, slot_w, slot_h, slot_tone = margin_slots[slot_idx]
             if slot_idx == 0:
-                card_title = merged_topics[0]
-                if archetype == "comparison":
-                    card_header = "Comparison Table"
-                    card_body = (
-                        f"compare: {merged_topics[0]} vs {merged_topics[1]} | "
-                        f"section:Key Contrast | "
-                        f"{merged_topics[2]} -> {merged_topics[3]} | "
-                        f"clue:{pattern_meta['memory_clue']}"
-                    )
-                elif archetype == "hierarchy":
-                    card_header = "Hierarchy Tree"
-                    card_body = (
-                        f"tree: {merged_topics[0]} > {merged_topics[1]}, {merged_topics[2]} | "
-                        f"section:Classification | "
-                        f"doc:{merged_topics[2]} -> {merged_topics[3]} | "
-                        f"clue:{pattern_meta['memory_clue']}"
-                    )
-                elif archetype == "decision":
-                    card_header = "Decision Tree"
-                    card_body = (
-                        f"if: {merged_topics[0]}? -> {merged_topics[1]} / {merged_topics[2]} | "
-                        f"section:Outcome | "
-                        f"doc:{merged_topics[1]} -> {merged_topics[3]} | "
-                        f"clue:{pattern_meta['memory_clue']}"
-                    )
-                else:
-                    card_header = pattern_meta["header_badge"]
-                    card_body = (
-                        f"{merged_topics[0]} -> {merged_topics[1]} | "
-                        f"section:{pattern_meta['pattern_name']} | "
-                        f"doc:{merged_topics[1]} -> {merged_topics[2]} | "
-                        f"clue:{pattern_meta['memory_clue']}"
-                    )
+                card_title = f"{merged_topics[0]} in 3D"
+                card_header = f"3D Simulation · {chosen_3d_preset.upper()}"
+                card_body = (
+                    f"model3d:preset={chosen_3d_preset}|caption={merged_topics[0]} | "
+                    f"{merged_topics[0]} -> {merged_topics[1]} | "
+                    f"clue:{pattern_meta['memory_clue']}"
+                )
                 target_sentence_idx = 0
             elif slot_idx == 1:
-                pair_start = 2 if len(merged_topics) >= 4 else 1
+                pair_start = 1 if len(merged_topics) >= 3 else 0
                 topic_first = merged_topics[pair_start]
                 topic_second = merged_topics[(pair_start + 1) % len(merged_topics)]
                 topic_third = merged_topics[(pair_start + 2) % len(merged_topics)]
-                card_title = f"{topic_first} Link"
-                card_header = "Connections & Example"
-                card_body = (
-                    f"{topic_first} -> {topic_second} | "
-                    f"section:Real-Life Example | "
-                    f"doc:{topic_second} -> {topic_third} | "
-                    f"clue:Why -> How -> Effect"
-                )
-                target_sentence_idx = min(total_sentences - 1, max(1, total_sentences // 2))
+                card_title = f"{topic_first} Mechanics"
+                if any(math_tok in lowered_query for math_tok in ("plot", "parabola", "graph", "x^2", "x**2", "sin(", "cos(", "function")):
+                    card_header = "Mathematical Plot & Analysis"
+                    card_body = (
+                        "graph:expr=x**2|x_range=-3,3|caption=Function Curve | "
+                        f"math: f(x) = x^2 => {topic_first} | "
+                        "clue:Check Vertex & Domain"
+                    )
+                elif any(chem_tok in lowered_query for chem_tok in ("ethanol", "molecule", "benzene", "chemical", "smiles", "bond")):
+                    card_header = "Molecular Structure & Bonds"
+                    smiles_val = "c1ccccc1" if "benzene" in lowered_query else "CCO"
+                    card_body = (
+                        f"molecule:smiles={smiles_val}|caption={topic_first} | "
+                        f"{topic_first} -> {topic_second} | "
+                        "clue:Count Valence Bonds"
+                    )
+                elif archetype == "comparison":
+                    card_header = "Comparison & Trade-offs"
+                    card_body = (
+                        f"compare: {merged_topics[0]} vs {merged_topics[1]} | "
+                        f"bars: {merged_topics[0][:12]}=94% ; {merged_topics[1][:12]}=82% | "
+                        f"clue:{pattern_meta['memory_clue']}"
+                    )
+                elif archetype == "hierarchy":
+                    card_header = "Hierarchy & Mind Map"
+                    card_body = (
+                        f"mindmap: {merged_topics[0]} -> {merged_topics[1]}, {merged_topics[2]}, {topic_third} | "
+                        f"tree: {merged_topics[0]} > {merged_topics[1]}, {merged_topics[2]} | "
+                        f"clue:{pattern_meta['memory_clue']}"
+                    )
+                else:
+                    card_header = "Architecture & Metrics"
+                    card_body = (
+                        f"mindmap: {topic_first} -> {topic_second}, {topic_third} | "
+                        f"bars: {topic_first[:12]}=95% ; {topic_second[:12]}=88% | "
+                        "clue:Why -> Mechanism -> Effect"
+                    )
+                target_sentence_idx = min(total_sentences - 1, max(0, total_sentences // 2))
             else:
                 tail_first = merged_topics[-3]
                 tail_second = merged_topics[-2]
                 tail_third = merged_topics[-1]
-                card_title = "Pattern & Recall"
-                card_header = "Pattern & Recall"
+                card_title = "Deep Contrast & Mastery"
+                card_header = "Table & Exam Hook"
                 card_body = (
-                    f"{tail_first} -> {tail_second} | "
-                    f"section:Exam Hook | "
-                    f"doc:{tail_second} -> {tail_third} | "
+                    f"table: Aspect, {merged_topics[0][:10]}, {merged_topics[1][:10]} ; Core, yes, yes ; Advanced, yes, no | "
+                    f"timeline: Step 1 -> {tail_first[:14]} ; Step 2 -> {tail_second[:14]} | "
                     f"clue:{pattern_meta['pattern_name']}"
                 )
                 target_sentence_idx = total_sentences - 1
@@ -4908,7 +4958,7 @@ class VisionBrainService(QObject):
                     label=card_title,
                     header=card_header,
                     body=card_body,
-                    tone="blue",
+                    tone=slot_tone,
                     sentence_index=target_sentence_idx,
                 )
             )

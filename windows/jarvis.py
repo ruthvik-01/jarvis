@@ -209,6 +209,7 @@ def run_strict_selftest() -> int:
     # -----------------------------------------------------------------------
     try:
         notch_window = jarvis_notch_window.NotchWindow(settings_store)
+        notch_window.benchmark_frame_ms(iterations=6)
         notch_metrics = notch_window.benchmark_frame_ms(iterations=60)
         notch_avg_ms = float(notch_metrics.get("average_ms", 999.0))
         notch_card_texts = " ".join(
@@ -230,6 +231,7 @@ def run_strict_selftest() -> int:
     # -----------------------------------------------------------------------
     try:
         overlay_window = jarvis_overlay_windows.OverlayCanvasWindow(settings_store)
+        overlay_window.benchmark_frame_ms(iterations=6)
         overlay_metrics = overlay_window.benchmark_frame_ms(iterations=60)
         overlay_avg_ms = float(overlay_metrics.get("avg_ms", 999.0))
         sample_paper = jarvis_response_parser.DrawingCommand(
@@ -552,8 +554,9 @@ def run_strict_selftest() -> int:
             bool(parsed_diagram_rows)
             and all(row_item.kind in ("flow", "section") for row_item in parsed_diagram_rows)
             and (jarvis_response_parser.should_use_visual_explanation_notes("what is my storage left") is False)
-            and (jarvis_response_parser.should_use_visual_explanation_notes("explain the scope of HRM") is True)
-            and (jarvis_response_parser.should_use_visual_explanation_notes("explain this diagram") is True)
+            and (jarvis_response_parser.should_use_visual_explanation_notes("explain the scope of HRM") is False)
+            and (jarvis_response_parser.should_use_visual_explanation_notes("show me the scope of HRM") is True)
+            and (jarvis_response_parser.should_use_visual_explanation_notes("show me this diagram in 3D") is True)
         )
 
         web_intent = jarvis_services.DesktopAgentService.classify_contextual_intent(
@@ -841,8 +844,31 @@ def run_strict_selftest() -> int:
             seed_value=7,
         )
         mentor_prompt_text = jarvis_response_parser.build_vision_system_prompt(1536, 864)
+        jarvis_voice_prompt_text = jarvis_response_parser.build_vision_system_prompt(
+            1536,
+            864,
+            companion_look="jarvis",
+            voice_reply_mode=True,
+            user_honorific="sir",
+        )
+        glayos_voice_prompt_text = jarvis_response_parser.build_vision_system_prompt(
+            1536,
+            864,
+            companion_look="glayos",
+            voice_reply_mode=True,
+            user_honorific="sir",
+        )
+        voice_persona_ok = (
+            ("SPEAK LIKE J.A.R.V.I.S. FROM IRON MAN" in jarvis_voice_prompt_text)
+            and ("VOICE MODE IS ON" in jarvis_voice_prompt_text)
+            and ("'sir'" in jarvis_voice_prompt_text)
+            and ("Preferred Teaching Sequence & Depth" not in jarvis_voice_prompt_text)
+            and ("VOICE MODE IS ON" in glayos_voice_prompt_text)
+            and ("SPEAK LIKE J.A.R.V.I.S. FROM IRON MAN" not in glayos_voice_prompt_text)
+        )
         mentor_visuals_ok = (
             rich_archetypes_ok
+            and voice_persona_ok
             and [row_item.kind for row_item in rich_parsed_rows] == ["compare", "tree", "decision", "clue"]
             and (not rich_paper_pixmap.isNull())
             and ("5-Mark" in mentor_prompt_text)
@@ -1431,6 +1457,34 @@ def run_strict_selftest() -> int:
             and len(jarvis_services.ScreenCaptureService.expand_every_match_commands(every_cmd_parsed)) >= 1
         )
 
+        synth_3d_cards = jarvis_services.VisionBrainService._build_visual_note_cards_for_response(
+            spoken_sentences=[
+                "An atom has a dense nucleus surrounded by orbiting electrons.",
+                "Electrons occupy discrete quantum energy shells around the core.",
+            ],
+            spoken_text="An atom has a dense nucleus surrounded by orbiting electrons. Electrons occupy discrete quantum energy shells around the core.",
+            screen_width=1536,
+            screen_height=864,
+            underline_labels=["Bohr Atom", "Quantum Shells"],
+            existing_paper_count=0,
+            user_prompt="show me the Bohr atom in 3D",
+        )
+        viewports_3d_check: List[Any] = []
+        if synth_3d_cards:
+            jarvis_overlay_windows._render_paper_card_to_pixmap(
+                synth_3d_cards[0],
+                seed_value=11,
+                out_model3d_viewports=viewports_3d_check,
+            )
+        show_me_3d_themes_ok = (
+            len(synth_3d_cards) == 3
+            and ("model3d:preset=atom" in synth_3d_cards[0].body)
+            and ({card_c.tone for card_c in synth_3d_cards} == {"purple", "teal", "amber"})
+            and len(viewports_3d_check) == 1
+            and len(jarvis_roamies_visuals.resolve_3d_preset_or_parts("dna")) >= 6
+            and len(jarvis_roamies_visuals.resolve_3d_preset_or_parts("neural")) >= 4
+        )
+
         with tempfile.TemporaryDirectory() as agentic_tmp_dir:
             bound_comm = jarvis_services.CommitmentsReminderService(
                 storage_path=os.path.join(agentic_tmp_dir, "comm.json")
@@ -1502,6 +1556,7 @@ def run_strict_selftest() -> int:
             fast_capture_ok
             and math_graph_ok
             and every_mark_ok
+            and show_me_3d_themes_ok
             and ok_rem
             and ok_snz
             and ok_lst

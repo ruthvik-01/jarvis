@@ -462,6 +462,7 @@ def _default_display_name() -> str:
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "user_display_name": _default_display_name(),
+    "user_honorific": "sir",
     # Cursor & Screen Drawing & Appearance
     "cursor_color_hex": "#3380FF",
     "hide_floating_cursor": False,

@@ -157,6 +157,10 @@ def run_strict_selftest() -> int:
     main-window close-to-tray behavior, live AssemblyAI token, live River AI Vision SSE,
     and live ElevenLabs PCM speech synthesis.
     """
+    try:
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
+    except Exception:
+        pass
     qt_application = _create_qt_application()
     settings_store = jarvis_config.SettingsStore()
     failures: List[str] = []
@@ -1581,9 +1585,67 @@ def run_strict_selftest() -> int:
             and (dispatch_elapsed_ms < 2500.0)
         )
 
+        # Verify light glassmorphism themes, movable card drag, size-increasing resize/zoom, and persistent-until-Clear behavior
+        glass_theme_purple = jarvis_overlay_windows.PAPER_CARD_THEMES["purple"]
+        light_glass_ok = (
+            glass_theme_purple["bg_top"].red() >= 230
+            and glass_theme_purple["bg_top"].alpha() <= 235
+        )
+        test_overlay_cards = jarvis_overlay_windows.OverlayCanvasWindow(settings_store)
+        test_overlay_cards.add_drawing_command(
+            jarvis_response_parser.DrawingCommand(
+                kind="paper",
+                x=40.0,
+                y=90.0,
+                width=340.0,
+                height=310.0,
+                label="Interactive 3D Card",
+                header="3D Simulation",
+                body="model3d:preset=atom|caption=Bohr Atom | flow: Proton -> Electron",
+                tone="purple",
+            )
+        )
+        active_card_item = test_overlay_cards._drawings[-1]
+        orig_card_w = float(active_card_item.command.width)
+        orig_card_h = float(active_card_item.command.height)
+        hit_drag = test_overlay_cards._hit_test_interactive(
+            float(active_card_item.command.x) + 60.0,
+            float(active_card_item.command.y) + 60.0,
+        )
+        hit_zoom_in = test_overlay_cards._hit_test_interactive(
+            float(active_card_item.command.x) + orig_card_w - 42.0,
+            float(active_card_item.command.y) + 12.0,
+        )
+        hit_resize_corner = test_overlay_cards._hit_test_interactive(
+            float(active_card_item.command.x) + orig_card_w - 10.0,
+            float(active_card_item.command.y) + orig_card_h - 10.0,
+        )
+        test_overlay_cards.resize_paper_card(active_card_item, orig_card_w * 1.25, orig_card_h * 1.25)
+        resized_bigger_ok = (
+            float(active_card_item.command.width) > orig_card_w
+            and float(active_card_item.command.height) > orig_card_h
+            and len(active_card_item.model3d_viewports) >= 1
+        )
+        test_overlay_cards.clear_unpinned_drawings()
+        still_present_after_unpinned_clear = len(test_overlay_cards._drawings) == 1
+        test_overlay_cards.clear_all_drawings()
+        cleared_on_clear_button = len(test_overlay_cards._drawings) == 0
+        test_overlay_cards.clear_button_window.close()
+        test_overlay_cards.close()
+        interactive_glass_card_ok = (
+            light_glass_ok
+            and (hit_drag is not None and hit_drag[1] == "card_drag")
+            and (hit_zoom_in is not None and hit_zoom_in[1] == "card_zoom_in")
+            and (hit_resize_corner is not None and hit_resize_corner[1] == "card_resize")
+            and resized_bigger_ok
+            and still_present_after_unpinned_clear
+            and cleared_on_clear_button
+        )
+
         roamies_github_full_ok = (
             looks_ok
             and visual_cards_ok
+            and interactive_glass_card_ok
             and spoken_ok
             and safety_ok
             and mcp_add_ok

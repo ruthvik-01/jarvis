@@ -361,10 +361,13 @@ class Jarvis3DModelRenderer:
             return
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
-        # Background viewport card frame
-        painter.setPen(QPen(QColor(115, 165, 255, 80), 1.0))
-        painter.setBrush(QColor(8, 16, 30, 195))
-        painter.drawRoundedRect(rect, 8.0, 8.0)
+        # Light frosted glassmorphism 3D viewport frame
+        well_grad = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.bottom())
+        well_grad.setColorAt(0.0, QColor(255, 255, 255, 205))
+        well_grad.setColorAt(1.0, QColor(236, 244, 255, 190))
+        painter.setPen(QPen(QColor(148, 163, 184, 135), 1.0))
+        painter.setBrush(well_grad)
+        painter.drawRoundedRect(rect, 9.0, 9.0)
 
         yaw = anim_time * 0.45 + 0.55
         view_rot = self._rot_x(0.36) @ self._rot_y(yaw)
@@ -377,8 +380,8 @@ class Jarvis3DModelRenderer:
         draw_tris: List[Tuple[float, QPolygonF, QColor, bool]] = []
         label_points: List[Tuple[float, float, str, QColor]] = []
 
-        # Subtle 3D floor reference grid inside viewport
-        painter.setPen(QPen(QColor(95, 145, 225, 38), 0.75, Qt.DotLine))
+        # Subtle 3D floor reference grid inside light glass viewport
+        painter.setPen(QPen(QColor(100, 116, 139, 65), 0.8, Qt.DotLine))
         for grid_step in (-2, -1, 0, 1, 2):
             gx_off = grid_step * (rect.width() * 0.14)
             painter.drawLine(QPointF(cx + gx_off * 0.7, rect.bottom() - 22.0), QPointF(cx + gx_off * 1.15, rect.bottom() - 6.0))
@@ -438,10 +441,10 @@ class Jarvis3DModelRenderer:
                     QPointF(float(screen_x[tri_idx, 2]), float(screen_y[tri_idx, 2])),
                 ])
                 fill_col = QColor(
-                    min(255, int(base_col.red() * shade + 24)),
-                    min(255, int(base_col.green() * shade + 26)),
-                    min(255, int(base_col.blue() * shade + 30)),
-                    68 if is_glass else 235,
+                    min(255, int(base_col.red() * shade + 14)),
+                    min(255, int(base_col.green() * shade + 16)),
+                    min(255, int(base_col.blue() * shade + 20)),
+                    75 if is_glass else 238,
                 )
                 draw_tris.append((tri_z, poly, fill_col, is_glass))
 
@@ -455,9 +458,9 @@ class Jarvis3DModelRenderer:
         draw_tris.sort(key=lambda entry: entry[0])
         for _tri_z, poly, fill_col, is_glass in draw_tris:
             if is_glass:
-                painter.setPen(QPen(QColor(fill_col.red(), fill_col.green(), fill_col.blue(), 135), 0.8))
+                painter.setPen(QPen(QColor(fill_col.red(), fill_col.green(), fill_col.blue(), 145), 0.8))
             else:
-                painter.setPen(QPen(QColor(255, 255, 255, 42), 0.45))
+                painter.setPen(QPen(QColor(30, 41, 59, 52), 0.45))
             painter.setBrush(fill_col)
             painter.drawPolygon(poly)
 
@@ -474,15 +477,15 @@ class Jarvis3DModelRenderer:
             tag_rect = QRectF(tag_x, tag_y, tag_w, tag_h)
             anchor_x = tag_rect.left() if is_right_side else tag_rect.right()
             anchor_y = tag_rect.center().y()
-            painter.setPen(QPen(QColor(lbl_col.red(), lbl_col.green(), lbl_col.blue(), 145), 0.9, Qt.DotLine))
+            painter.setPen(QPen(QColor(lbl_col.darker(125).red(), lbl_col.darker(125).green(), lbl_col.darker(125).blue(), 175), 1.0, Qt.DotLine))
             painter.drawLine(QPointF(lbl_x, lbl_y), QPointF(anchor_x, anchor_y))
             painter.setPen(Qt.NoPen)
-            painter.setBrush(lbl_col)
-            painter.drawEllipse(QPointF(lbl_x, lbl_y), 2.4, 2.4)
-            painter.setPen(QPen(lbl_col, 1.0))
-            painter.setBrush(QColor(8, 14, 26, 225))
+            painter.setBrush(lbl_col.darker(115))
+            painter.drawEllipse(QPointF(lbl_x, lbl_y), 2.5, 2.5)
+            painter.setPen(QPen(lbl_col.darker(115), 1.0))
+            painter.setBrush(QColor(255, 255, 255, 232))
             painter.drawRoundedRect(tag_rect, 4.0, 4.0)
-            painter.setPen(QColor(238, 246, 255))
+            painter.setPen(QColor(15, 23, 42))
             painter.drawText(tag_rect, Qt.AlignCenter, lbl_text[:15])
 
         painter.restore()
@@ -498,11 +501,11 @@ def paint_molecule_row(painter: QPainter, rect: QRectF, smiles_str: str, accent_
     bonds = layout.get("bonds", [])
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setPen(QPen(QColor(115, 165, 255, 75), 1.0))
-    painter.setBrush(QColor(10, 20, 36, 180))
-    painter.drawRoundedRect(rect, 7.0, 7.0)
+    painter.setPen(QPen(QColor(148, 163, 184, 130), 1.0))
+    painter.setBrush(QColor(255, 255, 255, 195))
+    painter.drawRoundedRect(rect, 8.0, 8.0)
     if not atoms:
-        painter.setPen(QColor(190, 210, 240))
+        painter.setPen(QColor(30, 41, 59))
         painter.drawText(rect, Qt.AlignCenter, smiles_str[:40] or "Molecule")
         painter.restore()
         return
@@ -525,7 +528,7 @@ def paint_molecule_row(painter: QPainter, rect: QRectF, smiles_str: str, accent_
         seg_len = max(1.0, math.hypot(dx_val, dy_val))
         perp_x = -dy_val / seg_len * 3.0
         perp_y = dx_val / seg_len * 3.0
-        bond_pen = QPen(QColor(195, 220, 255, 215), 2.0, Qt.SolidLine, Qt.RoundCap)
+        bond_pen = QPen(QColor(51, 65, 85, 220), 2.1, Qt.SolidLine, Qt.RoundCap)
         painter.setPen(bond_pen)
         if order == 2:
             painter.drawLine(QPointF(pt_a.x() + perp_x, pt_a.y() + perp_y), QPointF(pt_b.x() + perp_x, pt_b.y() + perp_y))
@@ -546,11 +549,11 @@ def paint_molecule_row(painter: QPainter, rect: QRectF, smiles_str: str, accent_
     for atom_dict in atoms:
         center_pt = _pt(atom_dict)
         elem = str(atom_dict.get("element", "C"))
-        col = _ELEMENT_COLOR_MAP.get(elem, accent_color)
-        painter.setPen(QPen(col, 1.4))
-        painter.setBrush(QColor(12, 22, 40, 240))
+        col = _ELEMENT_COLOR_MAP.get(elem, accent_color).darker(115)
+        painter.setPen(QPen(col, 1.5))
+        painter.setBrush(QColor(255, 255, 255, 242))
         painter.drawEllipse(center_pt, 10.0, 10.0)
-        painter.setPen(col)
+        painter.setPen(col.darker(120))
         painter.drawText(QRectF(center_pt.x() - 10.0, center_pt.y() - 9.0, 20.0, 18.0), Qt.AlignCenter, elem)
     painter.restore()
 
@@ -677,16 +680,16 @@ def parse_geometry_spec_from_text(raw_text: str) -> Dict[str, Any]:
 def paint_graph_row(painter: QPainter, rect: QRectF, graph_spec: Dict[str, Any], accent_color: QColor) -> None:
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setPen(QPen(QColor(115, 165, 255, 75), 1.0))
-    painter.setBrush(QColor(10, 20, 36, 185))
-    painter.drawRoundedRect(rect, 7.0, 7.0)
+    painter.setPen(QPen(QColor(148, 163, 184, 130), 1.0))
+    painter.setBrush(QColor(255, 255, 255, 195))
+    painter.drawRoundedRect(rect, 8.0, 8.0)
 
     inner = rect.adjusted(26.0, 14.0, -14.0, -22.0)
     plots = graph_spec.get("plots") or []
     dots = graph_spec.get("dots") or []
     all_pts = [pt for pl in plots for pt in (pl.get("points") or [])] + [[dot_entry.get("x", 0.0), dot_entry.get("y", 0.0)] for dot_entry in dots]
     if not all_pts:
-        painter.setPen(QColor(190, 210, 240))
+        painter.setPen(QColor(30, 41, 59))
         painter.drawText(rect, Qt.AlignCenter, "2D Plot")
         painter.restore()
         return
@@ -706,7 +709,7 @@ def paint_graph_row(painter: QPainter, rect: QRectF, graph_spec: Dict[str, Any],
             inner.bottom() - ((vy - min_y) / span_y) * inner.height(),
         )
 
-    painter.setPen(QPen(QColor(140, 175, 225, 70), 1.0))
+    painter.setPen(QPen(QColor(100, 116, 139, 130), 1.1))
     painter.drawLine(inner.topLeft(), inner.bottomLeft())
     painter.drawLine(inner.bottomLeft(), inner.bottomRight())
 
@@ -714,13 +717,13 @@ def paint_graph_row(painter: QPainter, rect: QRectF, graph_spec: Dict[str, Any],
         pts_raw = plot_item.get("points") or []
         if len(pts_raw) < 2:
             continue
-        col = TONE_COLOR_MAP.get(str(plot_item.get("tone", "")).lower(), accent_color if pl_idx == 0 else TONE_COLOR_MAP["teal"])
+        col = TONE_COLOR_MAP.get(str(plot_item.get("tone", "")).lower(), accent_color if pl_idx == 0 else TONE_COLOR_MAP["teal"]).darker(110)
         path = QPainterPath()
         first_px = _to_px(float(pts_raw[0][0]), float(pts_raw[0][1]))
         path.moveTo(first_px)
         for pt_raw in pts_raw[1:]:
             path.lineTo(_to_px(float(pt_raw[0]), float(pt_raw[1])))
-        painter.setPen(QPen(col, 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.setPen(QPen(col, 2.3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         painter.setBrush(Qt.NoBrush)
         painter.drawPath(path)
 
@@ -728,12 +731,12 @@ def paint_graph_row(painter: QPainter, rect: QRectF, graph_spec: Dict[str, Any],
     painter.setFont(lbl_font)
     for dot_item in dots:
         px = _to_px(float(dot_item.get("x", 0.0)), float(dot_item.get("y", 0.0)))
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(TONE_COLOR_MAP["amber"])
-        painter.drawEllipse(px, 4.0, 4.0)
+        painter.setPen(QPen(QColor(255, 255, 255), 1.0))
+        painter.setBrush(QColor("#D97706"))
+        painter.drawEllipse(px, 4.2, 4.2)
         dot_lbl = str(dot_item.get("label", "") or "")
         if dot_lbl:
-            painter.setPen(QColor(235, 245, 255))
+            painter.setPen(QColor(15, 23, 42))
             painter.drawText(QRectF(px.x() + 6.0, px.y() - 9.0, 90.0, 18.0), Qt.AlignLeft | Qt.AlignVCenter, dot_lbl[:18])
     painter.restore()
 
@@ -741,9 +744,9 @@ def paint_graph_row(painter: QPainter, rect: QRectF, graph_spec: Dict[str, Any],
 def paint_map_row(painter: QPainter, rect: QRectF, map_spec: Dict[str, Any], accent_color: QColor, anim_time: float = 0.0) -> None:
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setPen(QPen(QColor(115, 165, 255, 80), 1.0))
-    painter.setBrush(QColor(8, 20, 38, 205))
-    painter.drawRoundedRect(rect, 7.0, 7.0)
+    painter.setPen(QPen(QColor(148, 163, 184, 130), 1.0))
+    painter.setBrush(QColor(240, 248, 255, 200))
+    painter.drawRoundedRect(rect, 8.0, 8.0)
 
     resolved = jarvis_roamies_core.resolve_map_region(
         region=str(map_spec.get("region", "")),
@@ -762,7 +765,7 @@ def paint_map_row(painter: QPainter, rect: QRectF, map_spec: Dict[str, Any], acc
         )
 
     # Graticule lines
-    painter.setPen(QPen(QColor(95, 140, 200, 36), 0.8, Qt.DashLine))
+    painter.setPen(QPen(QColor(100, 116, 139, 55), 0.8, Qt.DashLine))
     for step_idx in range(1, 4):
         gx = inner.left() + inner.width() * (step_idx / 4.0)
         gy = inner.top() + inner.height() * (step_idx / 4.0)
@@ -784,14 +787,14 @@ def paint_map_row(painter: QPainter, rect: QRectF, map_spec: Dict[str, Any], acc
         if is_shaded:
             tone_key = shade_tones.get(c_name_lower, "teal")
             col = TONE_COLOR_MAP.get(tone_key, accent_color)
-            painter.setPen(QPen(col, 1.3))
-            painter.setBrush(QColor(col.red(), col.green(), col.blue(), 110))
+            painter.setPen(QPen(col.darker(120), 1.4))
+            painter.setBrush(QColor(col.red(), col.green(), col.blue(), 105))
         else:
-            painter.setPen(QPen(QColor(110, 165, 225, 70), 0.9))
-            painter.setBrush(QColor(48, 92, 148, 65))
+            painter.setPen(QPen(QColor(148, 163, 184, 130), 0.9))
+            painter.setBrush(QColor(255, 255, 255, 165))
         painter.drawRoundedRect(box, 3.0, 3.0)
         if box.width() > 36 and box.height() > 16:
-            painter.setPen(QColor(225, 240, 255, 200))
+            painter.setPen(QColor(15, 23, 42, 235))
             painter.drawText(box, Qt.AlignCenter, country_row["n"][:14])
 
     pins_by_name: Dict[str, QPointF] = {}
@@ -800,11 +803,11 @@ def paint_map_row(painter: QPainter, rect: QRectF, map_spec: Dict[str, Any], acc
         pin_name = str(pin_item.get("name", ""))
         pins_by_name[pin_name] = pt
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 184, 77, 85))
+        painter.setBrush(QColor(245, 158, 11, 95))
         painter.drawEllipse(pt, 8.0, 8.0)
-        painter.setBrush(TONE_COLOR_MAP["amber"])
+        painter.setBrush(QColor("#D97706"))
         painter.drawEllipse(pt, 3.8, 3.8)
-        painter.setPen(QColor(245, 250, 255))
+        painter.setPen(QColor(15, 23, 42))
         painter.drawText(QRectF(pt.x() + 6.0, pt.y() - 9.0, 95.0, 18.0), Qt.AlignLeft | Qt.AlignVCenter, pin_name[:16])
 
     for route_item in (map_spec.get("routes") or []):
@@ -812,7 +815,7 @@ def paint_map_row(painter: QPainter, rect: QRectF, map_spec: Dict[str, Any], acc
         pt_to = pins_by_name.get(str(route_item.get("to", "")))
         if pt_from is None or pt_to is None:
             continue
-        r_col = TONE_COLOR_MAP.get(str(route_item.get("tone", "coral")).lower(), TONE_COLOR_MAP["coral"])
+        r_col = TONE_COLOR_MAP.get(str(route_item.get("tone", "coral")).lower(), TONE_COLOR_MAP["coral"]).darker(110)
         ctrl_pt = QPointF(0.5 * (pt_from.x() + pt_to.x()), min(pt_from.y(), pt_to.y()) - 18.0)
         arc = QPainterPath(pt_from)
         arc.quadTo(ctrl_pt, pt_to)
@@ -822,7 +825,7 @@ def paint_map_row(painter: QPainter, rect: QRectF, map_spec: Dict[str, Any], acc
         travel_t = (anim_time * 0.45) % 1.0
         dot_pt = arc.pointAtPercent(travel_t)
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 255, 255))
+        painter.setBrush(accent_color)
         painter.drawEllipse(dot_pt, 3.2, 3.2)
 
     painter.restore()
@@ -831,13 +834,13 @@ def paint_map_row(painter: QPainter, rect: QRectF, map_spec: Dict[str, Any], acc
 def paint_geometry_row(painter: QPainter, rect: QRectF, geom_spec: Dict[str, Any], accent_color: QColor) -> None:
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setPen(QPen(QColor(115, 165, 255, 75), 1.0))
-    painter.setBrush(QColor(10, 20, 36, 185))
-    painter.drawRoundedRect(rect, 7.0, 7.0)
+    painter.setPen(QPen(QColor(148, 163, 184, 130), 1.0))
+    painter.setBrush(QColor(255, 255, 255, 195))
+    painter.drawRoundedRect(rect, 8.0, 8.0)
 
     verts = geom_spec.get("vertices") or []
     if len(verts) < 2:
-        painter.setPen(QColor(200, 220, 250))
+        painter.setPen(QColor(30, 41, 59))
         painter.drawText(rect, Qt.AlignCenter, "Geometry")
         painter.restore()
         return
@@ -864,7 +867,7 @@ def paint_geometry_row(painter: QPainter, rect: QRectF, geom_spec: Dict[str, Any
         if center_pt is None:
             continue
         rad_px = float(circle_item.get("r", 1.0)) * scale_px
-        col = TONE_COLOR_MAP.get(str(circle_item.get("tone", "teal")).lower(), accent_color)
+        col = TONE_COLOR_MAP.get(str(circle_item.get("tone", "teal")).lower(), accent_color).darker(110)
         painter.setPen(QPen(col, 1.8))
         painter.setBrush(Qt.NoBrush)
         painter.drawEllipse(center_pt, rad_px, rad_px)
@@ -874,21 +877,21 @@ def paint_geometry_row(painter: QPainter, rect: QRectF, geom_spec: Dict[str, Any
         pt_b = pt_map.get(str(line_item.get("to", "")))
         if pt_a is None or pt_b is None:
             continue
-        col = TONE_COLOR_MAP.get(str(line_item.get("tone", "accent")).lower(), accent_color)
-        pen = QPen(col, 2.1, Qt.DashLine if line_item.get("dash") else Qt.SolidLine, Qt.RoundCap)
+        col = TONE_COLOR_MAP.get(str(line_item.get("tone", "accent")).lower(), accent_color).darker(110)
+        pen = QPen(col, 2.2, Qt.DashLine if line_item.get("dash") else Qt.SolidLine, Qt.RoundCap)
         painter.setPen(pen)
         painter.drawLine(pt_a, pt_b)
         side_lbl = str(line_item.get("label", "") or "")
         if side_lbl:
             mid_pt = QPointF(0.5 * (pt_a.x() + pt_b.x()), 0.5 * (pt_a.y() + pt_b.y()))
-            painter.setPen(QColor(235, 245, 255))
+            painter.setPen(QColor(15, 23, 42))
             painter.drawText(QRectF(mid_pt.x() - 28.0, mid_pt.y() - 16.0, 56.0, 16.0), Qt.AlignCenter, side_lbl[:14])
 
     for v_id, v_pt in pt_map.items():
-        painter.setPen(Qt.NoPen)
+        painter.setPen(QPen(accent_color, 1.2))
         painter.setBrush(QColor(255, 255, 255))
-        painter.drawEllipse(v_pt, 3.6, 3.6)
-        painter.setPen(TONE_COLOR_MAP["amber"])
+        painter.drawEllipse(v_pt, 3.8, 3.8)
+        painter.setPen(QColor("#B45309"))
         painter.drawText(QRectF(v_pt.x() - 14.0, v_pt.y() - 18.0, 28.0, 16.0), Qt.AlignCenter, v_id[:6])
     painter.restore()
 
@@ -907,9 +910,9 @@ def paint_photo_labeled_pins(painter: QPainter, img_rect: QRectF, pins_list: Seq
         painter.drawEllipse(QPointF(px, py), 4.0, 4.0)
         if text:
             pill = QRectF(min(img_rect.right() - 86.0, px + 6.0), max(img_rect.top(), py - 11.0), 82.0, 18.0)
-            painter.setBrush(QColor(10, 18, 34, 225))
+            painter.setBrush(QColor(255, 255, 255, 232))
             painter.drawRoundedRect(pill, 4.0, 4.0)
-            painter.setPen(QColor(240, 248, 255))
+            painter.setPen(QColor(15, 23, 42))
             painter.drawText(pill.adjusted(4.0, 0.0, -4.0, 0.0), Qt.AlignCenter, text[:14])
     painter.restore()
 
@@ -917,7 +920,7 @@ def paint_photo_labeled_pins(painter: QPainter, img_rect: QRectF, pins_list: Seq
 def paint_sources_row(painter: QPainter, rect: QRectF, sources_list: Sequence[Dict[str, str]], accent_color: QColor) -> None:
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing, True)
-    font_sm = QFont("Segoe UI", 8.5, QFont.Medium)
+    font_sm = QFont("Segoe UI", 8.5, QFont.DemiBold)
     painter.setFont(font_sm)
     cur_x = rect.left()
     cur_y = rect.top() + 2.0
@@ -928,10 +931,10 @@ def paint_sources_row(painter: QPainter, rect: QRectF, sources_list: Sequence[Di
             cur_x = rect.left()
             cur_y += 24.0
         chip_rect = QRectF(cur_x, cur_y, chip_w, 20.0)
-        painter.setPen(QPen(QColor(102, 217, 239, 130), 1.0))
-        painter.setBrush(QColor(18, 36, 58, 220))
+        painter.setPen(QPen(QColor(accent_color.red(), accent_color.green(), accent_color.blue(), 155), 1.1))
+        painter.setBrush(QColor(255, 255, 255, 210))
         painter.drawRoundedRect(chip_rect, 10.0, 10.0)
-        painter.setPen(QColor(150, 232, 255))
+        painter.setPen(accent_color.darker(125))
         painter.drawText(chip_rect, Qt.AlignCenter, name)
         cur_x += chip_w + 6.0
     painter.restore()
@@ -940,17 +943,17 @@ def paint_sources_row(painter: QPainter, rect: QRectF, sources_list: Sequence[Di
 def paint_clip_row(painter: QPainter, rect: QRectF, clip_title: str, clip_text: str, accent_color: QColor) -> None:
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setPen(QPen(QColor(120, 175, 255, 90), 1.0))
-    painter.setBrush(QColor(14, 24, 42, 210))
-    painter.drawRoundedRect(rect, 7.0, 7.0)
+    painter.setPen(QPen(QColor(148, 163, 184, 140), 1.0))
+    painter.setBrush(QColor(255, 255, 255, 205))
+    painter.drawRoundedRect(rect, 8.0, 8.0)
     painter.setPen(Qt.NoPen)
     painter.setBrush(accent_color)
-    painter.drawRoundedRect(QRectF(rect.left() + 4.0, rect.top() + 6.0, 3.0, rect.height() - 12.0), 1.5, 1.5)
+    painter.drawRoundedRect(QRectF(rect.left() + 4.0, rect.top() + 6.0, 3.2, rect.height() - 12.0), 1.5, 1.5)
     painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
-    painter.setPen(QColor(235, 245, 255))
+    painter.setPen(QColor(15, 23, 42))
     painter.drawText(QRectF(rect.left() + 14.0, rect.top() + 6.0, rect.width() - 22.0, 18.0), Qt.AlignLeft | Qt.AlignVCenter, clip_title[:48])
     painter.setFont(QFont("Consolas", 8.5))
-    painter.setPen(QColor(190, 215, 245))
+    painter.setPen(QColor(51, 65, 85))
     painter.drawText(QRectF(rect.left() + 14.0, rect.top() + 26.0, rect.width() - 22.0, rect.height() - 32.0), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, clip_text[:220])
     painter.restore()
 
@@ -958,11 +961,11 @@ def paint_clip_row(painter: QPainter, rect: QRectF, clip_title: str, clip_text: 
 def paint_legend_row(painter: QPainter, rect: QRectF, keys_list: Sequence[Dict[str, str]]) -> None:
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setFont(QFont("Segoe UI", 8.5, QFont.Medium))
+    painter.setFont(QFont("Segoe UI", 8.5, QFont.DemiBold))
     row_y = rect.top() + 2.0
     cur_x = rect.left()
     for key_item in keys_list[:8]:
-        col = TONE_COLOR_MAP.get(str(key_item.get("tone", "accent")).lower(), TONE_COLOR_MAP["accent"])
+        col = TONE_COLOR_MAP.get(str(key_item.get("tone", "accent")).lower(), TONE_COLOR_MAP["accent"]).darker(110)
         label_txt = str(key_item.get("text", ""))[:24]
         item_w = max(72.0, len(label_txt) * 7.0 + 22.0)
         if cur_x + item_w > rect.right() and cur_x > rect.left():
@@ -971,7 +974,7 @@ def paint_legend_row(painter: QPainter, rect: QRectF, keys_list: Sequence[Dict[s
         painter.setPen(Qt.NoPen)
         painter.setBrush(col)
         painter.drawEllipse(QPointF(cur_x + 6.0, row_y + 9.0), 4.5, 4.5)
-        painter.setPen(QColor(230, 240, 255))
+        painter.setPen(QColor(15, 23, 42))
         painter.drawText(QRectF(cur_x + 15.0, row_y, item_w - 15.0, 18.0), Qt.AlignLeft | Qt.AlignVCenter, label_txt)
         cur_x += item_w + 8.0
     painter.restore()
@@ -980,15 +983,15 @@ def paint_legend_row(painter: QPainter, rect: QRectF, keys_list: Sequence[Dict[s
 def paint_ticket_row(painter: QPainter, rect: QRectF, title_text: str, task_text: str, accent_color: QColor) -> None:
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setPen(QPen(QColor(120, 255, 226, 130), 1.2, Qt.DashLine))
-    painter.setBrush(QColor(12, 32, 42, 220))
+    painter.setPen(QPen(QColor(accent_color.red(), accent_color.green(), accent_color.blue(), 160), 1.2, Qt.DashLine))
+    painter.setBrush(QColor(255, 255, 255, 208))
     painter.drawRoundedRect(rect, 8.0, 8.0)
     painter.setFont(QFont("Segoe UI", 9.5, QFont.Bold))
-    painter.setPen(QColor(120, 255, 226))
+    painter.setPen(accent_color.darker(125))
     painter.drawText(QRectF(rect.left() + 12.0, rect.top() + 8.0, rect.width() - 24.0, 20.0), Qt.AlignLeft | Qt.AlignVCenter, f"TICKET: {title_text[:40]}")
     if task_text:
-        painter.setFont(QFont("Segoe UI", 8.5))
-        painter.setPen(QColor(225, 245, 242))
+        painter.setFont(QFont("Segoe UI", 8.5, QFont.Medium))
+        painter.setPen(QColor(30, 41, 59))
         painter.drawText(QRectF(rect.left() + 12.0, rect.top() + 30.0, rect.width() - 24.0, rect.height() - 36.0), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, task_text[:140])
     painter.restore()
 
@@ -996,15 +999,15 @@ def paint_ticket_row(painter: QPainter, rect: QRectF, title_text: str, task_text
 def paint_medal_row(painter: QPainter, rect: QRectF, medal_text: str) -> None:
     painter.save()
     painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setPen(QPen(QColor(255, 198, 90, 180), 1.5))
-    painter.setBrush(QColor(38, 28, 12, 220))
+    painter.setPen(QPen(QColor(217, 119, 6, 175), 1.4))
+    painter.setBrush(QColor(255, 251, 235, 220))
     painter.drawRoundedRect(rect, 9.0, 9.0)
     cx = rect.left() + 26.0
     cy = rect.center().y()
-    painter.setBrush(QColor(255, 196, 64))
+    painter.setBrush(QColor(245, 158, 11))
     painter.drawEllipse(QPointF(cx, cy), 12.0, 12.0)
     painter.setFont(QFont("Segoe UI", 9.5, QFont.Bold))
-    painter.setPen(QColor(255, 232, 165))
+    painter.setPen(QColor(146, 64, 14))
     painter.drawText(QRectF(rect.left() + 48.0, rect.top() + 6.0, rect.width() - 56.0, rect.height() - 12.0), Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap, medal_text[:120])
     painter.restore()
 
@@ -1024,8 +1027,8 @@ def _golden_sphere_points(count: int) -> np.ndarray:
     return np.asarray(pts, dtype=np.float32)
 
 
-_SPHERE_PTS_DEFAULT = _golden_sphere_points(180)
-_SPHERE_PTS_SMALL = _golden_sphere_points(96)
+_SPHERE_PTS_DEFAULT = _golden_sphere_points(112)
+_SPHERE_PTS_SMALL = _golden_sphere_points(72)
 
 _PIXEL_GRIDS: Dict[str, Tuple[str, ...]] = {
     "classic": (

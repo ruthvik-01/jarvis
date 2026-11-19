@@ -989,7 +989,7 @@ def _paint_paper_arrow(
     painter.drawLine(QPointF(end_x, end_y), wing_two)
     flow_dot_pt = shaft_path.pointAtPercent(0.55)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#78FFE2"))
+    painter.setBrush(QColor("#0D9488"))
     painter.drawEllipse(flow_dot_pt, 2.2, 2.2)
     painter.restore()
 
@@ -1011,9 +1011,9 @@ def _paint_paper_document_icon(
     )
     frame_path = _build_smooth_catmull_rom_path(frame_points, closed=True)
 
-    fill_color = QColor(39, 39, 46, 240) if highlighted else QColor(26, 26, 32, 228)
-    stroke_color = QColor("#E4E4E7") if highlighted else QColor(138, 138, 150, 235)
-    line_color = QColor("#D4D4D8") if highlighted else QColor(161, 161, 170, 200)
+    fill_color = QColor(255, 255, 255, 228) if highlighted else QColor(248, 250, 252, 205)
+    stroke_color = accent_color.darker(110) if highlighted else QColor(100, 116, 139, 195)
+    line_color = accent_color if highlighted else QColor(100, 116, 139, 170)
 
     painter.save()
     painter.setBrush(fill_color)
@@ -1033,78 +1033,82 @@ def _paint_paper_document_icon(
     painter.restore()
 
 
+PAPER_GLASS_INK = QColor(15, 23, 42, 248)
+PAPER_GLASS_MUTED = QColor(71, 85, 105, 235)
+PAPER_GLASS_HALO = QColor(255, 255, 255, 232)
+
 PAPER_CARD_THEMES: Dict[str, Dict[str, QColor]] = {
     "blue": {
-        "bg_top": QColor(14, 24, 42, 246),
-        "bg_bottom": QColor(9, 15, 28, 248),
-        "header": QColor(20, 34, 60, 250),
-        "grid": QColor(96, 165, 250, 22),
-        "border": QColor(59, 130, 246, 195),
-        "accent": QColor("#3B82F6"),
+        "bg_top": QColor(242, 248, 255, 224),
+        "bg_bottom": QColor(226, 239, 255, 212),
+        "header": QColor(219, 234, 254, 232),
+        "grid": QColor(37, 99, 235, 22),
+        "border": QColor(59, 130, 246, 175),
+        "accent": QColor("#2563EB"),
     },
     "teal": {
-        "bg_top": QColor(10, 31, 34, 246),
-        "bg_bottom": QColor(7, 19, 22, 248),
-        "header": QColor(14, 44, 48, 250),
-        "grid": QColor(45, 212, 191, 22),
-        "border": QColor(20, 184, 166, 195),
-        "accent": QColor("#14B8A6"),
+        "bg_top": QColor(240, 253, 250, 224),
+        "bg_bottom": QColor(222, 247, 243, 212),
+        "header": QColor(204, 251, 241, 232),
+        "grid": QColor(13, 148, 136, 22),
+        "border": QColor(20, 184, 166, 175),
+        "accent": QColor("#0D9488"),
     },
     "green": {
-        "bg_top": QColor(12, 30, 23, 246),
-        "bg_bottom": QColor(8, 19, 14, 248),
-        "header": QColor(16, 42, 31, 250),
-        "grid": QColor(52, 211, 153, 22),
-        "border": QColor(34, 197, 94, 195),
-        "accent": QColor("#22C55E"),
+        "bg_top": QColor(240, 253, 244, 224),
+        "bg_bottom": QColor(220, 248, 231, 212),
+        "header": QColor(209, 250, 229, 232),
+        "grid": QColor(22, 163, 74, 22),
+        "border": QColor(34, 197, 94, 175),
+        "accent": QColor("#16A34A"),
     },
     "amber": {
-        "bg_top": QColor(34, 23, 10, 246),
-        "bg_bottom": QColor(21, 14, 7, 248),
-        "header": QColor(48, 32, 14, 250),
-        "grid": QColor(251, 191, 36, 22),
-        "border": QColor(245, 158, 11, 195),
-        "accent": QColor("#F59E0B"),
+        "bg_top": QColor(255, 251, 238, 224),
+        "bg_bottom": QColor(254, 241, 214, 212),
+        "header": QColor(254, 235, 200, 232),
+        "grid": QColor(217, 119, 6, 22),
+        "border": QColor(245, 158, 11, 175),
+        "accent": QColor("#D97706"),
     },
     "purple": {
-        "bg_top": QColor(27, 16, 44, 246),
-        "bg_bottom": QColor(16, 10, 28, 248),
-        "header": QColor(38, 22, 62, 250),
-        "grid": QColor(192, 132, 252, 22),
-        "border": QColor(168, 85, 247, 195),
-        "accent": QColor("#A855F7"),
+        "bg_top": QColor(248, 244, 255, 224),
+        "bg_bottom": QColor(237, 230, 254, 212),
+        "header": QColor(233, 219, 255, 232),
+        "grid": QColor(124, 58, 237, 22),
+        "border": QColor(147, 51, 234, 175),
+        "accent": QColor("#7C3AED"),
     },
     "violet": {
-        "bg_top": QColor(27, 16, 44, 246),
-        "bg_bottom": QColor(16, 10, 28, 248),
-        "header": QColor(38, 22, 62, 250),
-        "grid": QColor(192, 132, 252, 22),
-        "border": QColor(168, 85, 247, 195),
-        "accent": QColor("#A855F7"),
+        "bg_top": QColor(248, 244, 255, 224),
+        "bg_bottom": QColor(237, 230, 254, 212),
+        "header": QColor(233, 219, 255, 232),
+        "grid": QColor(124, 58, 237, 22),
+        "border": QColor(147, 51, 234, 175),
+        "accent": QColor("#7C3AED"),
     },
     "coral": {
-        "bg_top": QColor(36, 16, 22, 246),
-        "bg_bottom": QColor(23, 10, 14, 248),
-        "header": QColor(50, 22, 30, 250),
-        "grid": QColor(251, 113, 133, 22),
-        "border": QColor(244, 63, 94, 195),
-        "accent": QColor("#F43F5E"),
+        "bg_top": QColor(255, 243, 246, 224),
+        "bg_bottom": QColor(254, 226, 234, 212),
+        "header": QColor(254, 218, 228, 232),
+        "grid": QColor(225, 29, 72, 22),
+        "border": QColor(244, 63, 94, 175),
+        "accent": QColor("#E11D48"),
     },
     "red": {
-        "bg_top": QColor(36, 15, 18, 246),
-        "bg_bottom": QColor(22, 9, 12, 248),
-        "header": QColor(50, 20, 24, 250),
-        "grid": QColor(248, 113, 113, 22),
-        "border": QColor(239, 68, 68, 195),
-        "accent": QColor("#EF4444"),
+        "bg_top": QColor(255, 243, 245, 224),
+        "bg_bottom": QColor(254, 226, 230, 212),
+        "header": QColor(254, 218, 224, 232),
+        "grid": QColor(220, 38, 38, 22),
+        "border": QColor(239, 68, 68, 175),
+        "accent": QColor("#DC2626"),
     },
     "sky": {
-        "bg_top": QColor(12, 28, 44, 246),
-        "bg_bottom": QColor(8, 18, 29, 248),
-        "header": QColor(18, 40, 62, 250),
-        "grid": QColor(56, 189, 248, 22),
-        "border": QColor(14, 165, 233, 195),
-        "accent": QColor("#38BDF8"),
+        "bg_top": QColor(240, 250, 255, 224),
+        "bg_bottom": QColor(224, 242, 254, 212),
+        "header": QColor(214, 238, 254, 232),
+        "grid": QColor(2, 132, 199, 22),
+        "border": QColor(14, 165, 233, 175),
+        "accent": QColor("#0284C7"),
     },
 }
 
@@ -1124,14 +1128,15 @@ def _render_paper_card_to_pixmap(
     out_model3d_viewports: Optional[List[Tuple[QRectF, Any]]] = None,
 ) -> QPixmap:
     """
-    Renders the cool-light gridded paper card (`DRAWING_PAPER_COOL`, `14px` corner
-    radius, slate header strip, subtle grid lines, bold haloed `hand_font` title,
-    and dynamically fitted flow diagram) into a crisp 2x cached QPixmap.
+    Renders the light frosted glassmorphism paper card (`14px` corner
+    radius, pastel glass header strip, specular sheen, subtle grid lines, bold haloed `hand_font` title,
+    and dynamically scaled diagram/3D rows) into a crisp 2.5x cached QPixmap.
     """
     card_width = max(200.0, float(command.width))
     card_height = max(180.0, float(command.height))
     parsed_rows = _parse_paper_body_rows(command.body)
-    if parsed_rows:
+    is_user_resized = bool((command.extra_data or {}).get("user_resized"))
+    if parsed_rows and not is_user_resized:
         estimated_rows_h = 0.0
         for row_item in parsed_rows:
             if row_item.kind in ("model3d", "worldmap", "graph", "geometry", "molecule"):
@@ -1145,7 +1150,7 @@ def _render_paper_card_to_pixmap(
             else:
                 estimated_rows_h += 38.0
         required_total_h = PAPER_HEADER_HEIGHT + 52.0 + estimated_rows_h + 18.0
-        card_height = max(card_height, min(680.0, required_total_h))
+        card_height = max(card_height, min(980.0, required_total_h))
         command.height = card_height
     shadow_pad = 14
     scale_factor = 2.5
@@ -1164,16 +1169,16 @@ def _render_paper_card_to_pixmap(
 
     card_rect = QRectF(0.0, 0.0, card_width, card_height)
     card_theme = _resolve_card_theme(command.tone, seed_value=seed_value)
-    accent_color = _resolve_tone_color(command.tone, card_theme["accent"])
+    accent_color = card_theme["accent"]
 
-    # 1. Soft elevation shadow behind the paper card
-    for offset_y, expand_px, alpha_value in ((8.0, 4.0, 28), (4.0, 1.5, 44), (1.5, 0.5, 54)):
+    # 1. Soft elevation shadow behind the frosted glass card
+    for offset_y, expand_px, alpha_value in ((8.0, 4.0, 24), (4.0, 1.5, 36), (1.5, 0.5, 46)):
         shadow_rect = card_rect.adjusted(-expand_px, -expand_px + offset_y, expand_px, expand_px + offset_y)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 0, 0, alpha_value))
+        painter.setBrush(QColor(15, 23, 42, alpha_value))
         painter.drawRoundedRect(shadow_rect, PAPER_CORNER_RADIUS + expand_px, PAPER_CORNER_RADIUS + expand_px)
 
-    # 2. Clipped themed paper body + header strip + graph grid
+    # 2. Clipped frosted glassmorphism body + diagonal specular sheen + header strip + graph grid
     clip_path = QPainterPath()
     clip_path.addRoundedRect(card_rect, PAPER_CORNER_RADIUS, PAPER_CORNER_RADIUS)
 
@@ -1184,10 +1189,17 @@ def _render_paper_card_to_pixmap(
     bg_grad.setColorAt(1.0, card_theme["bg_bottom"])
     painter.fillRect(card_rect, bg_grad)
 
+    # Diagonal glassmorphism specular reflection sheen
+    sheen_grad = QLinearGradient(0.0, 0.0, card_width * 0.65, card_height * 0.55)
+    sheen_grad.setColorAt(0.0, QColor(255, 255, 255, 135))
+    sheen_grad.setColorAt(0.45, QColor(255, 255, 255, 45))
+    sheen_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+    painter.fillRect(card_rect, sheen_grad)
+
     # Top header strip (`card_theme["header"]`) + glowing top accent bar
     header_rect = QRectF(0.0, 0.0, card_width, PAPER_HEADER_HEIGHT)
     painter.fillRect(header_rect, card_theme["header"])
-    painter.fillRect(QRectF(0.0, 0.0, card_width, 2.4), accent_color)
+    painter.fillRect(QRectF(0.0, 0.0, card_width, 2.6), accent_color)
     painter.setPen(QPen(card_theme["border"], 1.0))
     painter.drawLine(QPointF(0.0, PAPER_HEADER_HEIGHT), QPointF(card_width, PAPER_HEADER_HEIGHT))
 
@@ -1195,8 +1207,25 @@ def _render_paper_card_to_pixmap(
     if header_label:
         header_font = jarvis_theme.barlow_font(9.5, semibold=True)
         painter.setFont(header_font)
-        painter.setPen(accent_color.lighter(135))
-        painter.drawText(header_rect, Qt.AlignmentFlag.AlignCenter, header_label.upper())
+        painter.setPen(accent_color.darker(115))
+        header_text_rect = QRectF(12.0, 0.0, max(80.0, card_width - 96.0), PAPER_HEADER_HEIGHT)
+        painter.drawText(header_text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, header_label.upper())
+
+    # Top-right header action buttons baked into cached 2.5x HiDPI pixmap: [–] shrink, [+] increase size, [PNG] save
+    ctrl_font = jarvis_theme.ui_font(9.0, QFont.Weight.Bold)
+    painter.setFont(ctrl_font)
+    btn_specs = (
+        (card_width - 78.0, 22.0, "–", "#334155"),
+        (card_width - 53.0, 22.0, "+", accent_color.name()),
+        (card_width - 28.0, 24.0, "PNG", "#0369A1"),
+    )
+    for bx, bw, btxt, bhex in btn_specs:
+        brect = QRectF(bx, 5.0, bw, 18.0)
+        painter.setPen(QPen(QColor(bhex), 1.0))
+        painter.setBrush(QColor(255, 255, 255, 228))
+        painter.drawRoundedRect(brect, 4.5, 4.5)
+        painter.setPen(QColor(bhex))
+        painter.drawText(brect, Qt.AlignmentFlag.AlignCenter, btxt)
 
     # Graph-paper grid lines (`card_theme["grid"]`)
     painter.setPen(QPen(card_theme["grid"], 1.0))
@@ -1209,14 +1238,15 @@ def _render_paper_card_to_pixmap(
         painter.drawLine(QPointF(0.0, grid_y), QPointF(card_width, grid_y))
         grid_y += PAPER_GRID_SPACING
 
-    # 3. Title (`hand_font(19)` with soft dark outline halo)
+    # 3. Title (`hand_font` scaled proportionally to card size with frosted white halo)
+    size_scale = _clamp_float(card_width / 340.0, 0.85, 1.85)
     inner_margin_x = 20.0
     inner_width = card_width - inner_margin_x * 2.0
     cursor_y = PAPER_HEADER_HEIGHT + 16.0
 
     title_text = jarvis_response_parser.clean_spoken_text(command.label or "")
     if title_text:
-        title_point_size = 19.0
+        title_point_size = round(19.0 * size_scale, 1)
         title_font = jarvis_theme.hand_font(title_point_size)
         title_font.setWeight(QFont.Weight.Bold)
         title_metrics = QFontMetricsF(title_font)
@@ -1236,13 +1266,13 @@ def _render_paper_card_to_pixmap(
             baseline_y=baseline_y,
             text=title_text,
             font=title_font,
-            text_color=jarvis_theme.DRAWING_INK,
-            halo_color=QColor(18, 18, 22, 232),
-            halo_width=5.2,
+            text_color=PAPER_GLASS_INK,
+            halo_color=PAPER_GLASS_HALO,
+            halo_width=4.6,
         )
         cursor_y += title_metrics.height() + 14.0
 
-    # 4. Dynamic flow diagram rows from `command.body`
+    # 4. Dynamic flow diagram rows from `command.body` (scales up smoothly when card size increases)
     parsed_rows = _parse_paper_body_rows(command.body)
     if parsed_rows:
         natural_heights: List[float] = []
@@ -1285,9 +1315,9 @@ def _render_paper_card_to_pixmap(
             else:
                 natural_heights.append(34.0)
 
-        available_height = max(48.0, card_height - cursor_y - 14.0)
+        available_height = max(48.0, card_height - cursor_y - 16.0)
         total_natural = sum(natural_heights)
-        vertical_scale = _clamp_float(available_height / max(1.0, total_natural), 0.62, 1.0)
+        vertical_scale = _clamp_float(available_height / max(1.0, total_natural), 0.62, 2.60)
 
         for row_index, row in enumerate(parsed_rows):
             row_height = natural_heights[row_index] * vertical_scale
@@ -1295,7 +1325,7 @@ def _render_paper_card_to_pixmap(
                 break
 
             if row.kind == "section":
-                section_font = jarvis_theme.hand_font(16.0 * max(0.82, vertical_scale))
+                section_font = jarvis_theme.hand_font(16.0 * _clamp_float(vertical_scale, 0.82, 1.65))
                 section_font.setWeight(QFont.Weight.Bold)
                 section_metrics = QFontMetricsF(section_font)
                 section_text = section_metrics.elidedText(row.text, Qt.TextElideMode.ElideRight, inner_width)
@@ -1305,9 +1335,9 @@ def _render_paper_card_to_pixmap(
                     baseline_y=cursor_y + section_metrics.ascent() + 2.0,
                     text=section_text,
                     font=section_font,
-                    text_color=jarvis_theme.DRAWING_INK,
-                    halo_color=QColor(18, 18, 22, 230),
-                    halo_width=4.2,
+                    text_color=PAPER_GLASS_INK,
+                    halo_color=PAPER_GLASS_HALO,
+                    halo_width=4.0,
                 )
             elif row.kind == "flow":
                 _paint_paper_flow_row(
@@ -1593,9 +1623,9 @@ def _render_paper_card_to_pixmap(
                     medal_text=row.text,
                 )
             else:
-                note_font = jarvis_theme.barlow_font(11.0, semibold=False)
+                note_font = jarvis_theme.barlow_font(11.0 * _clamp_float(vertical_scale, 0.90, 1.45), semibold=False)
                 painter.setFont(note_font)
-                painter.setPen(jarvis_theme.DRAWING_INK)
+                painter.setPen(PAPER_GLASS_INK)
                 note_rect = QRectF(inner_margin_x + 4.0, cursor_y, inner_width - 8.0, row_height)
                 painter.drawText(
                     note_rect,
@@ -1605,11 +1635,20 @@ def _render_paper_card_to_pixmap(
 
             cursor_y += row_height
 
+    # Bottom-right glassmorphism resize grip lines (`◢`)
+    painter.setPen(QPen(card_theme["border"], 1.35, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    for grip_offset in (6.0, 10.5, 15.0):
+        painter.drawLine(
+            QPointF(card_width - 4.0, card_height - grip_offset),
+            QPointF(card_width - grip_offset, card_height - 4.0),
+        )
     painter.restore()
 
-    # Crisp themed rim border
-    painter.setPen(QPen(card_theme["border"], 1.35))
+    # Inner frosted white highlight rim + outer crisp themed border
     painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(QPen(QColor(255, 255, 255, 220), 1.0))
+    painter.drawRoundedRect(card_rect.adjusted(1.0, 1.0, -1.0, -1.0), PAPER_CORNER_RADIUS - 1.0, PAPER_CORNER_RADIUS - 1.0)
+    painter.setPen(QPen(card_theme["border"], 1.45))
     painter.drawRoundedRect(card_rect, PAPER_CORNER_RADIUS, PAPER_CORNER_RADIUS)
     painter.end()
     return pixmap
@@ -1636,7 +1675,7 @@ def _paint_paper_flow_row(
         doc_width = 30.0
         doc_height = min(38.0, max(26.0, row_height * 0.48))
         doc_top_y = origin_y + 4.0
-        caption_font = jarvis_theme.barlow_font(10.0, semibold=False)
+        caption_font = jarvis_theme.barlow_font(10.0, semibold=True)
         caption_metrics = QFontMetricsF(caption_font)
 
         centers_x: List[float] = []
@@ -1664,7 +1703,7 @@ def _paint_paper_flow_row(
                 )
                 painter.save()
                 painter.setFont(caption_font)
-                painter.setPen(QColor(212, 212, 216, 240))
+                painter.setPen(PAPER_GLASS_INK)
                 elided_label = caption_metrics.elidedText(node.label, Qt.TextElideMode.ElideRight, label_rect.width())
                 painter.drawText(label_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, elided_label)
                 painter.restore()
@@ -1693,7 +1732,7 @@ def _paint_paper_flow_row(
                 arrow_y,
                 arrow_end_x,
                 arrow_y,
-                color=QColor(212, 212, 216, 225),
+                color=QColor(71, 85, 105, 225),
                 seed_value=seed_value + arrow_index * 41,
             )
         return
@@ -1702,7 +1741,7 @@ def _paint_paper_flow_row(
     arrow_gap = 38.0 if node_count == 2 else 24.0
     total_gap = arrow_gap * max(0, node_count - 1)
     box_width = max(56.0, (row_width - total_gap) / float(node_count))
-    box_height = min(44.0, max(32.0, row_height - 14.0))
+    box_height = min(56.0, max(32.0, row_height - 14.0))
     box_top_y = origin_y + (row_height - box_height) * 0.42
 
     for node_index, node in enumerate(nodes):
@@ -1726,7 +1765,7 @@ def _paint_paper_flow_row(
                 arrow_mid_y,
                 arrow_end_x,
                 arrow_mid_y,
-                color=QColor(212, 212, 216, 225),
+                color=QColor(71, 85, 105, 225),
                 seed_value=seed_value + node_index * 53,
             )
 
@@ -1749,7 +1788,7 @@ def _paint_paper_compare_row(
 
     center_gap = 40.0
     box_width = max(56.0, (row_width - center_gap) * 0.5)
-    box_height = min(44.0, max(30.0, row_height - 10.0))
+    box_height = min(54.0, max(30.0, row_height - 10.0))
     box_top_y = origin_y + (row_height - box_height) * 0.5
 
     left_rect = QRectF(origin_x, box_top_y, box_width, box_height)
@@ -1779,11 +1818,11 @@ def _paint_paper_compare_row(
     vs_rect = QRectF(pill_x, pill_y, pill_width, pill_height)
 
     painter.save()
-    painter.setBrush(QColor(22, 30, 44, 245))
-    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 210), 1.2))
+    painter.setBrush(QColor(255, 255, 255, 232))
+    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 210), 1.3))
     painter.drawRoundedRect(vs_rect, 9.0, 9.0)
     painter.setFont(jarvis_theme.barlow_font(8.5, semibold=True))
-    painter.setPen(QColor(235, 244, 255, 245))
+    painter.setPen(accent_color.darker(120))
     painter.drawText(vs_rect, Qt.AlignmentFlag.AlignCenter, "VS")
     painter.restore()
 
@@ -1802,7 +1841,7 @@ def _paint_paper_tree_row(
     """Draws a parent concept box branched cleanly to child category boxes below."""
     children = child_nodes[:3] if child_nodes else [_PaperNode(label="Branch A"), _PaperNode(label="Branch B")]
     parent_width = min(176.0, max(92.0, row_width * 0.64))
-    parent_height = min(28.0, max(22.0, row_height * 0.34))
+    parent_height = min(32.0, max(22.0, row_height * 0.34))
     parent_x = origin_x + (row_width - parent_width) * 0.5
     parent_y = origin_y + 2.0
     parent_center_x = parent_x + parent_width * 0.5
@@ -1829,7 +1868,7 @@ def _paint_paper_tree_row(
         child_centers_x.append(child_x + child_width * 0.5)
 
     painter.save()
-    branch_pen = QPen(QColor(186, 198, 218, 215), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    branch_pen = QPen(QColor(100, 116, 139, 200), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
     painter.setPen(branch_pen)
     painter.drawLine(QPointF(parent_center_x, parent_y + parent_height), QPointF(parent_center_x, branch_y))
     if len(child_centers_x) >= 2:
@@ -1863,21 +1902,21 @@ def _paint_paper_decision_row(
 ) -> None:
     """Draws a condition header pill branching into YES (emerald) and NO (amber) outcome boxes."""
     cond_width = min(row_width - 12.0, 204.0)
-    cond_height = min(26.0, max(20.0, row_height * 0.34))
+    cond_height = min(28.0, max(20.0, row_height * 0.34))
     cond_x = origin_x + (row_width - cond_width) * 0.5
     cond_y = origin_y + 2.0
     cond_rect = QRectF(cond_x, cond_y, cond_width, cond_height)
     cond_center_x = cond_rect.center().x()
 
     painter.save()
-    painter.setBrush(QColor(22, 34, 54, 242))
+    painter.setBrush(QColor(255, 255, 255, 228))
     painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 215), 1.4))
     painter.drawRoundedRect(cond_rect, 11.0, 11.0)
     cond_font = jarvis_theme.barlow_font(9.5, semibold=True)
     cond_metrics = QFontMetricsF(cond_font)
     elided_cond = cond_metrics.elidedText(condition_label or "Condition?", Qt.TextElideMode.ElideRight, cond_width - 14.0)
     painter.setFont(cond_font)
-    painter.setPen(QColor(240, 246, 255, 248))
+    painter.setPen(PAPER_GLASS_INK)
     painter.drawText(cond_rect, Qt.AlignmentFlag.AlignCenter, elided_cond)
     painter.restore()
 
@@ -1895,7 +1934,7 @@ def _paint_paper_decision_row(
     ]
 
     painter.save()
-    painter.setPen(QPen(QColor(186, 198, 218, 215), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    painter.setPen(QPen(QColor(100, 116, 139, 200), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
     painter.drawLine(QPointF(cond_center_x, cond_y + cond_height), QPointF(cond_center_x, split_y))
     if len(branch_centers_x) == 2:
         painter.drawLine(QPointF(branch_centers_x[0], split_y), QPointF(branch_centers_x[1], split_y))
@@ -1907,8 +1946,8 @@ def _paint_paper_decision_row(
         box_x = origin_x + branch_index * (out_width + out_gap)
         box_rect = QRectF(box_x, out_top_y, out_width, out_height)
         is_yes = branch_index == 0
-        rim_color = QColor("#34D399") if is_yes else QColor("#FB923C")
-        fill_tint = QColor(18, 42, 36, 236) if is_yes else QColor(44, 28, 22, 236)
+        rim_color = QColor("#16A34A") if is_yes else QColor("#EA580C")
+        fill_tint = QColor(220, 252, 231, 220) if is_yes else QColor(255, 237, 213, 220)
         prefix_tag = "YES: " if (is_yes and out_count == 2) else ("NO: " if out_count == 2 else "")
         display_text = f"{prefix_tag}{branch_node.label}" if prefix_tag else branch_node.label
 
@@ -1930,7 +1969,7 @@ def _paint_paper_decision_row(
         text_rect = box_rect.adjusted(6.0, 2.0, -6.0, -2.0)
         elided_branch = out_metrics.elidedText(display_text, Qt.TextElideMode.ElideRight, text_rect.width())
         painter.setFont(out_font)
-        painter.setPen(QColor(244, 248, 255, 245))
+        painter.setPen(PAPER_GLASS_INK)
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, elided_branch)
         painter.restore()
 
@@ -1949,7 +1988,7 @@ def _paint_paper_clue_row(
     strip_rect = QRectF(origin_x, origin_y + 3.0, row_width, strip_height)
 
     painter.save()
-    painter.setBrush(QColor(22, 32, 50, 232))
+    painter.setBrush(QColor(255, 255, 255, 215))
     painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 175), 1.15))
     painter.drawRoundedRect(strip_rect, 7.0, 7.0)
 
@@ -1961,11 +2000,11 @@ def _paint_paper_clue_row(
         badge_width,
         badge_height,
     )
-    painter.setBrush(jarvis_theme.with_alpha(accent_color, 64))
+    painter.setBrush(jarvis_theme.with_alpha(accent_color, 38))
     painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 215), 1.0))
     painter.drawRoundedRect(badge_rect, 5.0, 5.0)
     painter.setFont(jarvis_theme.barlow_font(8.0, semibold=True))
-    painter.setPen(QColor(210, 236, 255, 248))
+    painter.setPen(accent_color.darker(120))
     painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "CLUE")
 
     text_rect = QRectF(
@@ -1978,7 +2017,7 @@ def _paint_paper_clue_row(
     clue_metrics = QFontMetricsF(clue_font)
     elided_clue = clue_metrics.elidedText((clue_text or "").strip(), Qt.TextElideMode.ElideRight, text_rect.width())
     painter.setFont(clue_font)
-    painter.setPen(jarvis_theme.DRAWING_INK)
+    painter.setPen(PAPER_GLASS_INK)
     painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_clue)
     painter.restore()
 
@@ -2008,7 +2047,7 @@ def _paint_paper_bars_row(
         return
     max_val = max(pair[1] for pair in parsed_pairs) or 1.0
     slot_height = row_height / max(1, len(parsed_pairs))
-    palette = [accent_color, QColor("#2DD4BF"), QColor("#F59E0B"), QColor("#A78BFA"), QColor("#34D399")]
+    palette = [accent_color, QColor("#0D9488"), QColor("#D97706"), QColor("#7C3AED"), QColor("#16A34A")]
 
     painter.save()
     lbl_font = jarvis_theme.barlow_font(10.0, semibold=True)
@@ -2016,22 +2055,22 @@ def _paint_paper_bars_row(
         item_y = origin_y + bar_idx * slot_height + 2.0
         label_rect = QRectF(origin_x, item_y, 76.0, slot_height - 4.0)
         painter.setFont(lbl_font)
-        painter.setPen(jarvis_theme.DRAWING_INK)
+        painter.setPen(PAPER_GLASS_INK)
         painter.drawText(label_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, bar_lbl)
 
         bar_area_x = origin_x + 80.0
         bar_area_w = max(40.0, row_width - 126.0)
         fill_w = max(8.0, bar_area_w * _clamp_float(bar_val / max_val, 0.05, 1.0))
-        bar_h = min(13.0, max(8.0, slot_height - 8.0))
+        bar_h = min(14.0, max(8.0, slot_height - 8.0))
         bar_y = item_y + (slot_height - 4.0 - bar_h) * 0.5
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(39, 39, 46, 200))
+        painter.setBrush(QColor(203, 213, 225, 185))
         painter.drawRoundedRect(QRectF(bar_area_x, bar_y, bar_area_w, bar_h), 4.0, 4.0)
         painter.setBrush(palette[bar_idx % len(palette)])
         painter.drawRoundedRect(QRectF(bar_area_x, bar_y, fill_w, bar_h), 4.0, 4.0)
 
         val_rect = QRectF(bar_area_x + bar_area_w + 4.0, item_y, 40.0, slot_height - 4.0)
-        painter.setPen(QColor("#A1A1AA"))
+        painter.setPen(PAPER_GLASS_MUTED)
         painter.drawText(val_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, bar_display)
     painter.restore()
 
@@ -2052,7 +2091,7 @@ def _paint_paper_timeline_row(
     rail_x = origin_x + 12.0
     painter.save()
     if len(timeline_entries) >= 2:
-        painter.setPen(QPen(QColor(82, 82, 91, 220), 1.8))
+        painter.setPen(QPen(QColor(148, 163, 184, 220), 1.8))
         painter.drawLine(
             QPointF(rail_x, origin_y + slot_height * 0.5),
             QPointF(rail_x, origin_y + row_height - slot_height * 0.5),
@@ -2061,8 +2100,8 @@ def _paint_paper_timeline_row(
     font_desc = jarvis_theme.barlow_font(10.0, semibold=False)
     for idx, raw_item in enumerate(timeline_entries[:5]):
         center_y = origin_y + (idx + 0.5) * slot_height
-        painter.setPen(QPen(accent_color, 1.5))
-        painter.setBrush(QColor(24, 24, 30, 245))
+        painter.setPen(QPen(accent_color, 1.6))
+        painter.setBrush(QColor(255, 255, 255, 245))
         painter.drawEllipse(QPointF(rail_x, center_y), 4.2, 4.2)
 
         normalized_item = raw_item.replace("→", "->")
@@ -2072,11 +2111,11 @@ def _paint_paper_timeline_row(
             when_str, event_str = f"Step {idx + 1}", normalized_item
         when_rect = QRectF(origin_x + 24.0, center_y - 10.0, 58.0, 20.0)
         painter.setFont(font_when)
-        painter.setPen(accent_color)
+        painter.setPen(accent_color.darker(115))
         painter.drawText(when_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, when_str.strip()[:10])
         desc_rect = QRectF(origin_x + 84.0, center_y - 10.0, max(40.0, row_width - 88.0), 20.0)
         painter.setFont(font_desc)
-        painter.setPen(jarvis_theme.DRAWING_INK)
+        painter.setPen(PAPER_GLASS_INK)
         painter.drawText(desc_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, event_str.strip()[:36])
     painter.restore()
 
@@ -2108,8 +2147,12 @@ def _paint_paper_table_row(
     for r_idx, row_cells in enumerate(parsed_grid):
         row_y = origin_y + r_idx * cell_height
         is_header = r_idx == 0
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(34, 42, 58, 220) if is_header else QColor(24, 24, 30, 180 if r_idx % 2 else 110))
+        painter.setPen(QPen(QColor(203, 213, 225, 140), 0.8))
+        painter.setBrush(
+            jarvis_theme.with_alpha(accent_color, 34)
+            if is_header
+            else QColor(255, 255, 255, 195 if r_idx % 2 else 145)
+        )
         painter.drawRoundedRect(QRectF(origin_x, row_y + 1.0, row_width, cell_height - 2.0), 4.0, 4.0)
         for c_idx in range(col_count):
             cell_text = row_cells[c_idx] if c_idx < len(row_cells) else ""
@@ -2118,15 +2161,15 @@ def _paint_paper_table_row(
             align_flag = Qt.AlignmentFlag.AlignLeft if c_idx == 0 else Qt.AlignmentFlag.AlignCenter
             if not is_header and lowered_cell in ("yes", "true", "✓"):
                 painter.setFont(hdr_font)
-                painter.setPen(QColor("#34D399"))
+                painter.setPen(QColor("#16A34A"))
                 painter.drawText(cell_rect, Qt.AlignmentFlag.AlignVCenter | align_flag, "✓")
             elif not is_header and lowered_cell in ("no", "false", "✗"):
                 painter.setFont(hdr_font)
-                painter.setPen(QColor("#F87171"))
+                painter.setPen(QColor("#DC2626"))
                 painter.drawText(cell_rect, Qt.AlignmentFlag.AlignVCenter | align_flag, "✗")
             else:
                 painter.setFont(hdr_font if is_header else cell_font)
-                painter.setPen(accent_color if is_header else jarvis_theme.DRAWING_INK)
+                painter.setPen(accent_color.darker(120) if is_header else PAPER_GLASS_INK)
                 painter.drawText(cell_rect, Qt.AlignmentFlag.AlignVCenter | align_flag, cell_text)
     painter.restore()
 
@@ -2144,19 +2187,19 @@ def _paint_paper_math_row(
     """Renders worked mathematical equation step + short explanation."""
     painter.save()
     box_rect = QRectF(origin_x + 2.0, origin_y + 2.0, row_width - 4.0, row_height - 4.0)
-    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 130), 1.1))
-    painter.setBrush(QColor(22, 26, 36, 228))
+    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 145), 1.1))
+    painter.setBrush(QColor(255, 255, 255, 210))
     painter.drawRoundedRect(box_rect, 6.0, 6.0)
 
     eq_rect = box_rect.adjusted(10.0, 4.0, -10.0, -16.0 if note_text else -4.0)
     painter.setFont(jarvis_theme.barlow_font(12.0, semibold=True))
-    painter.setPen(jarvis_theme.DRAWING_INK)
+    painter.setPen(PAPER_GLASS_INK)
     painter.drawText(eq_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, formula_text[:48])
 
     if note_text:
         note_rect = QRectF(box_rect.left() + 10.0, box_rect.bottom() - 18.0, box_rect.width() - 20.0, 15.0)
         painter.setFont(jarvis_theme.barlow_font(9.5, semibold=False))
-        painter.setPen(QColor("#A1A1AA"))
+        painter.setPen(PAPER_GLASS_MUTED)
         painter.drawText(note_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, note_text[:54])
     painter.restore()
 
@@ -2191,7 +2234,7 @@ def _paint_paper_mindmap_row(
     branch_w = max(60.0, row_width - hub_width - 22.0)
     slot_h = row_height / max(1, len(branch_nodes))
     for idx, child_node in enumerate(branch_nodes[:6]):
-        pill_h = min(24.0, max(18.0, slot_h - 4.0))
+        pill_h = min(28.0, max(18.0, slot_h - 4.0))
         pill_y = origin_y + (idx + 0.5) * slot_h - pill_h * 0.5
         pill_rect = QRectF(branch_area_x, pill_y, branch_w, pill_h)
         _paint_paper_arrow(
@@ -2221,7 +2264,7 @@ def _paint_paper_quiz_row(
     painter.save()
     q_rect = QRectF(origin_x + 4.0, origin_y + 2.0, row_width - 8.0, 24.0)
     painter.setFont(jarvis_theme.barlow_font(10.5, semibold=True))
-    painter.setPen(accent_color)
+    painter.setPen(accent_color.darker(120))
     painter.drawText(q_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, question_text[:52])
 
     opts_y = origin_y + 27.0
@@ -2231,10 +2274,10 @@ def _paint_paper_quiz_row(
         is_correct = raw_opt.startswith("*")
         display_opt = raw_opt.lstrip("*").strip()[:40]
         row_rect = QRectF(origin_x + 6.0, opts_y + idx * opt_h + 1.0, row_width - 12.0, opt_h - 3.0)
-        painter.setPen(QPen(QColor("#34D399") if is_correct else QColor(63, 63, 70, 200), 1.0))
-        painter.setBrush(QColor(22, 42, 34, 210) if is_correct else QColor(24, 24, 30, 210))
+        painter.setPen(QPen(QColor("#16A34A") if is_correct else QColor(148, 163, 184, 180), 1.0))
+        painter.setBrush(QColor(220, 252, 231, 220) if is_correct else QColor(255, 255, 255, 205))
         painter.drawRoundedRect(row_rect, 4.0, 4.0)
-        painter.setPen(QColor("#6EE7B7") if is_correct else jarvis_theme.DRAWING_INK)
+        painter.setPen(QColor("#15803D") if is_correct else PAPER_GLASS_INK)
         prefix_sym = "✓ " if is_correct else f"{chr(65 + idx)}. "
         painter.drawText(row_rect.adjusted(6.0, 0.0, -6.0, 0.0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, prefix_sym + display_opt)
     painter.restore()
@@ -2261,13 +2304,13 @@ def _paint_paper_checklist_row(
         label_str = re.sub(r"^(?:\[[x\s]\]|done:)\s*", "", stripped, flags=re.IGNORECASE).strip()
         box_y = origin_y + idx * slot_h + (slot_h - 12.0) * 0.5
         box_rect = QRectF(origin_x + 6.0, box_y, 12.0, 12.0)
-        painter.setPen(QPen(QColor("#34D399") if is_done else accent_color, 1.3))
-        painter.setBrush(QColor("#34D399") if is_done else Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor("#16A34A") if is_done else accent_color, 1.3))
+        painter.setBrush(QColor("#16A34A") if is_done else QColor(255, 255, 255, 215))
         painter.drawRoundedRect(box_rect, 3.0, 3.0)
         if is_done:
-            painter.setPen(QColor("#09090B"))
+            painter.setPen(QColor("#FFFFFF"))
             painter.drawText(box_rect, Qt.AlignmentFlag.AlignCenter, "✓")
-        painter.setPen(QColor("#71717A") if is_done else jarvis_theme.DRAWING_INK)
+        painter.setPen(PAPER_GLASS_MUTED if is_done else PAPER_GLASS_INK)
         text_rect = QRectF(origin_x + 24.0, origin_y + idx * slot_h, max(40.0, row_width - 28.0), slot_h)
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label_str[:46])
     painter.restore()
@@ -2286,8 +2329,8 @@ def _paint_paper_photo_row(
     """Renders cached Wikipedia/image thumbnail or clean visual placeholder frame inside paper."""
     frame_rect = QRectF(origin_x + 4.0, origin_y + 2.0, row_width - 8.0, row_height - 20.0)
     painter.save()
-    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 140), 1.1))
-    painter.setBrush(QColor(20, 24, 34, 235))
+    painter.setPen(QPen(jarvis_theme.with_alpha(accent_color, 145), 1.1))
+    painter.setBrush(QColor(255, 255, 255, 210))
     painter.drawRoundedRect(frame_rect, 6.0, 6.0)
 
     loaded_image: Optional[QImage] = None
@@ -2314,13 +2357,13 @@ def _paint_paper_photo_row(
         painter.drawImage(QPointF(draw_x, draw_y), scaled_img)
     else:
         painter.setFont(jarvis_theme.barlow_font(10.0, semibold=True))
-        painter.setPen(accent_color)
+        painter.setPen(accent_color.darker(115))
         painter.drawText(frame_rect, Qt.AlignmentFlag.AlignCenter, f"Photo: {query_or_url[:30]}")
 
     if caption_text:
         cap_rect = QRectF(origin_x + 6.0, frame_rect.bottom() + 2.0, row_width - 12.0, 16.0)
         painter.setFont(jarvis_theme.barlow_font(9.5, semibold=False))
-        painter.setPen(QColor("#A1A1AA"))
+        painter.setPen(PAPER_GLASS_MUTED)
         painter.drawText(cap_rect, Qt.AlignmentFlag.AlignCenter, caption_text[:44])
     painter.restore()
 
@@ -2333,20 +2376,20 @@ def _paint_sketched_node_box(
     accent_color: QColor,
     seed_value: int,
 ) -> None:
-    """Draws one slightly wobbly hand-sketched diagram box with adaptive text sizing."""
+    """Draws one slightly wobbly hand-sketched diagram box with light frosted glass fill."""
     outline_points = _build_wobbly_rect_points(
         box_rect.left(),
         box_rect.top(),
         box_rect.width(),
         box_rect.height(),
-        corner_radius=3.5,
+        corner_radius=4.5,
         seed_value=seed_value,
     )
     outline_path = _build_smooth_catmull_rom_path(outline_points, closed=True)
 
-    fill_color = QColor(26, 40, 64, 244) if highlighted else QColor(24, 24, 30, 232)
-    border_color = _blend_colors(accent_color, QColor("#E4E4E7"), 0.35) if highlighted else QColor(82, 82, 91, 235)
-    border_width = 1.9 if highlighted else 1.4
+    fill_color = jarvis_theme.with_alpha(accent_color.lighter(175), 215) if highlighted else QColor(255, 255, 255, 212)
+    border_color = accent_color if highlighted else QColor(148, 163, 184, 210)
+    border_width = 1.9 if highlighted else 1.35
 
     painter.save()
     painter.setBrush(fill_color)
@@ -2364,7 +2407,7 @@ def _paint_sketched_node_box(
         metrics = QFontMetricsF(label_font)
 
     painter.setFont(label_font)
-    painter.setPen(jarvis_theme.DRAWING_INK)
+    painter.setPen(PAPER_GLASS_INK)
     if metrics.horizontalAdvance(label) <= text_area.width() + 2.0:
         painter.drawText(text_area, Qt.AlignmentFlag.AlignCenter, label)
     else:
@@ -2640,6 +2683,11 @@ class OverlayCanvasWindow(QWidget):
         self._circle_talk_active: bool = False
         self._circle_talk_points: List[Tuple[float, float]] = []
         self._hover_interactive_active: bool = False
+        self._dragging_card_item: Optional[_ActiveDrawingItem] = None
+        self._card_drag_offset: Tuple[float, float] = (0.0, 0.0)
+        self._resizing_card_item: Optional[_ActiveDrawingItem] = None
+        self._card_resize_anchor: Tuple[float, float, float, float] = (0.0, 0.0, 340.0, 320.0)
+        self.setMouseTracking(True)
 
         # Bottom LiveCaption state & sprite cache
         self._caption_text = ""
@@ -2780,23 +2828,53 @@ class OverlayCanvasWindow(QWidget):
         self._walkthrough_wait_mode = ""
         self._walkthrough_hover_since = 0.0
 
+    def _bring_card_to_front(self, item: _ActiveDrawingItem) -> None:
+        if item in self._drawings and self._drawings[-1] is not item:
+            self._drawings.remove(item)
+            self._drawings.append(item)
+
+    def resize_paper_card(self, item: _ActiveDrawingItem, new_width: float, new_height: float) -> None:
+        if item.command.kind != "paper":
+            return
+        screen_w = float(max(640, self.width()))
+        screen_h = float(max(480, self.height()))
+        clamped_w = _clamp_float(float(new_width), 220.0, max(240.0, screen_w - 36.0))
+        clamped_h = _clamp_float(float(new_height), 190.0, max(200.0, screen_h - 80.0))
+        item.command.width = clamped_w
+        item.command.height = clamped_h
+        item.command.x = _clamp_float(float(item.command.x), 12.0, max(12.0, screen_w - clamped_w - 12.0))
+        item.command.y = _clamp_float(float(item.command.y), 36.0, max(36.0, screen_h - clamped_h - 24.0))
+        if item.command.extra_data is None:
+            item.command.extra_data = {}
+        item.command.extra_data["user_resized"] = True
+        self._prebuild_drawing_cache(item)
+        self.update()
+
     def _hit_test_interactive(self, local_x: float, local_y: float) -> Optional[Tuple[_ActiveDrawingItem, str, Any]]:
         pt = QPointF(local_x, local_y)
         for item in reversed(self._drawings):
             if item.command.kind == "paper":
                 card_w = max(200.0, float(item.command.width))
+                card_h = max(180.0, float(item.command.height))
                 card_x = float(item.command.x)
                 card_y = float(item.command.y)
-                # Header action buttons at top right of paper header: Pin, Save PNG, Close
-                btn_close = QRectF(card_x + card_w - 26.0, card_y + 4.0, 20.0, 20.0)
-                btn_save = QRectF(card_x + card_w - 50.0, card_y + 4.0, 20.0, 20.0)
-                btn_pin = QRectF(card_x + card_w - 74.0, card_y + 4.0, 20.0, 20.0)
-                if btn_close.contains(pt):
-                    return item, "card_close", None
+                full_card_rect = QRectF(card_x, card_y, card_w, card_h)
+                if not full_card_rect.contains(pt):
+                    continue
+                # Header action buttons at top right of paper header: [-] shrink, [+] increase size, [PNG] save
+                btn_zoom_out = QRectF(card_x + card_w - 78.0, card_y + 4.0, 22.0, 20.0)
+                btn_zoom_in = QRectF(card_x + card_w - 53.0, card_y + 4.0, 22.0, 20.0)
+                btn_save = QRectF(card_x + card_w - 28.0, card_y + 4.0, 24.0, 20.0)
+                if btn_zoom_out.contains(pt):
+                    return item, "card_zoom_out", None
+                if btn_zoom_in.contains(pt):
+                    return item, "card_zoom_in", None
                 if btn_save.contains(pt):
                     return item, "card_save", None
-                if btn_pin.contains(pt):
-                    return item, "card_pin", None
+                # Bottom-right corner resize grip handle
+                resize_grip = QRectF(card_x + card_w - 24.0, card_y + card_h - 24.0, 24.0, 24.0)
+                if resize_grip.contains(pt):
+                    return item, "card_resize", None
                 # Checklist interactive rows inside paper cards
                 parsed_rows = _parse_paper_body_rows(item.command.body)
                 for row_obj in parsed_rows:
@@ -2812,6 +2890,8 @@ class OverlayCanvasWindow(QWidget):
                             opt_rect = QRectF(card_x + 16.0, opt_top + opt_idx * 24.0, card_w - 32.0, 22.0)
                             if opt_rect.contains(pt):
                                 return item, "quiz_pick", (opt_idx, opt_text, row_obj.text)
+                # Clicking/dragging anywhere else on the card moves it (and never dismisses it)
+                return item, "card_drag", None
             elif item.command.kind == "button":
                 btn_rect = QRectF(item.command.x, item.command.y, max(110.0, item.command.width), max(32.0, item.command.height))
                 if btn_rect.contains(pt):
@@ -2874,15 +2954,37 @@ class OverlayCanvasWindow(QWidget):
             hit = self._hit_test_interactive(float(pos.x()), float(pos.y()))
             if hit is not None:
                 target_item, hit_kind, hit_payload = hit
-                if hit_kind == "card_close":
-                    if target_item in self._drawings:
-                        self._drawings.remove(target_item)
-                    self._sync_clear_button_visibility()
+                if target_item.command.kind == "paper":
+                    self._bring_card_to_front(target_item)
+                if hit_kind == "card_zoom_in":
+                    self.resize_paper_card(
+                        target_item,
+                        float(target_item.command.width) * 1.18,
+                        float(target_item.command.height) * 1.18,
+                    )
+                elif hit_kind == "card_zoom_out":
+                    self.resize_paper_card(
+                        target_item,
+                        float(target_item.command.width) * 0.85,
+                        float(target_item.command.height) * 0.85,
+                    )
+                elif hit_kind == "card_resize":
+                    self._resizing_card_item = target_item
+                    self._card_resize_anchor = (
+                        float(pos.x()),
+                        float(pos.y()),
+                        float(target_item.command.width),
+                        float(target_item.command.height),
+                    )
+                    self.setCursor(Qt.CursorShape.SizeFDiagCursor)
                     self.update()
-                elif hit_kind == "card_pin":
-                    target_item.is_pinned = not target_item.is_pinned
-                    if target_item.is_pinned:
-                        target_item.expires_at = max(target_item.expires_at, time.monotonic() + 3600.0)
+                elif hit_kind == "card_drag":
+                    self._dragging_card_item = target_item
+                    self._card_drag_offset = (
+                        float(pos.x()) - float(target_item.command.x),
+                        float(pos.y()) - float(target_item.command.y),
+                    )
+                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
                     self.update()
                 elif hit_kind == "card_save":
                     pix = target_item.cached_paper_pixmap or _render_paper_card_to_pixmap(target_item.command, target_item.seed_value)
@@ -2920,13 +3022,43 @@ class OverlayCanvasWindow(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        pos = event.position()
         if self._interactive_lasso_active and self._interactive_lasso_dragging:
-            pos = event.position()
             self._append_smoothed_highlight_point(float(pos.x()), float(pos.y()))
             self._ensure_timer_running()
             self.update()
             event.accept()
             return
+        if self._dragging_card_item is not None:
+            card_item = self._dragging_card_item
+            screen_w = float(max(640, self.width()))
+            screen_h = float(max(480, self.height()))
+            card_w = max(200.0, float(card_item.command.width))
+            card_h = max(180.0, float(card_item.command.height))
+            new_x = _clamp_float(float(pos.x()) - self._card_drag_offset[0], 10.0, max(10.0, screen_w - card_w - 10.0))
+            new_y = _clamp_float(float(pos.y()) - self._card_drag_offset[1], 34.0, max(34.0, screen_h - card_h - 16.0))
+            card_item.command.x = new_x
+            card_item.command.y = new_y
+            self.update()
+            event.accept()
+            return
+        if self._resizing_card_item is not None:
+            card_item = self._resizing_card_item
+            start_mx, start_my, start_w, start_h = self._card_resize_anchor
+            delta_w = float(pos.x()) - start_mx
+            delta_h = float(pos.y()) - start_my
+            self.resize_paper_card(card_item, start_w + delta_w, start_h + delta_h)
+            event.accept()
+            return
+        hit = self._hit_test_interactive(float(pos.x()), float(pos.y()))
+        if hit is not None:
+            _, hit_kind, _ = hit
+            if hit_kind == "card_resize":
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            elif hit_kind == "card_drag":
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
@@ -2941,7 +3073,39 @@ class OverlayCanvasWindow(QWidget):
                 self.interactiveLassoCompleted.emit(captured_points)
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton and (self._dragging_card_item is not None or self._resizing_card_item is not None):
+            self._dragging_card_item = None
+            self._resizing_card_item = None
+            pos = event.position()
+            hit = self._hit_test_interactive(float(pos.x()), float(pos.y()))
+            if hit is not None and hit[1] == "card_drag":
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            elif hit is not None and hit[1] == "card_resize":
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            else:
+                self.unsetCursor()
+            self.update()
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        pos = event.position()
+        hit = self._hit_test_interactive(float(pos.x()), float(pos.y()))
+        if hit is not None and hit[0].command.kind == "paper":
+            target_item = hit[0]
+            delta_y = event.angleDelta().y()
+            if delta_y != 0:
+                zoom_factor = 1.12 if delta_y > 0 else 0.89
+                self._bring_card_to_front(target_item)
+                self.resize_paper_card(
+                    target_item,
+                    float(target_item.command.width) * zoom_factor,
+                    float(target_item.command.height) * zoom_factor,
+                )
+                event.accept()
+                return
+        super().wheelEvent(event)
 
     def _append_smoothed_highlight_point(self, raw_x: float, raw_y: float) -> bool:
         """Applies exponential moving average smoothing before appending a highlight point."""
@@ -3290,8 +3454,8 @@ class OverlayCanvasWindow(QWidget):
             delay_seconds = max(0.0, scheduled_start - now_seconds)
             self._next_stroke_schedule_time = scheduled_start + stroke_duration + 0.08
 
-        is_pinned_card = bool((prepared_command.extra_data or {}).get("keep_card"))
-        hold_dur = 3600.0 if is_pinned_card else DEFAULT_DRAWING_HOLD_SECONDS
+        is_pinned_card = (prepared_command.kind == "paper") or bool((prepared_command.extra_data or {}).get("keep_card"))
+        hold_dur = (86400.0 * 7) if prepared_command.kind == "paper" else (3600.0 if is_pinned_card else DEFAULT_DRAWING_HOLD_SECONDS)
         model3d_obj = None
         if prepared_command.kind == "paper":
             card_rows = _parse_paper_body_rows(prepared_command.body or "")
@@ -3459,13 +3623,15 @@ class OverlayCanvasWindow(QWidget):
             self._next_drawing_seed += 41
             clamped = self._clamp_drawing_command(command)
             stroke_duration = self._compute_stroke_duration_seconds(clamped)
+            demo_hold = (86400.0 * 7) if clamped.kind == "paper" else DEFAULT_DRAWING_HOLD_SECONDS
             item = _ActiveDrawingItem(
                 command=clamped,
                 created_at=now_seconds,
                 delay_seconds=delay,
                 duration_seconds=stroke_duration,
-                expires_at=now_seconds + delay + stroke_duration + DEFAULT_DRAWING_HOLD_SECONDS,
+                expires_at=now_seconds + delay + stroke_duration + demo_hold,
                 seed_value=self._next_drawing_seed,
+                is_pinned=(clamped.kind == "paper"),
             )
             self._prebuild_drawing_cache(item)
             self._drawings.append(item)
@@ -3481,6 +3647,8 @@ class OverlayCanvasWindow(QWidget):
         self.update()
 
     def clear_all_drawings(self) -> None:
+        self._dragging_card_item = None
+        self._resizing_card_item = None
         self._drawings.clear()
         self._next_stroke_schedule_time = 0.0
         self._was_actively_drawing = False
@@ -3510,8 +3678,8 @@ class OverlayCanvasWindow(QWidget):
         self.update()
 
     def clear_unpinned_drawings(self) -> None:
-        """Clears drawings when switching apps while leaving user-pinned cards intact."""
-        kept = [item for item in self._drawings if item.is_pinned]
+        """Clears transient drawings when switching apps while leaving all paper cards intact."""
+        kept = [item for item in self._drawings if item.is_pinned or item.command.kind == "paper"]
         if len(kept) == len(self._drawings):
             return
         self._drawings = kept
@@ -3616,14 +3784,14 @@ class OverlayCanvasWindow(QWidget):
         image = QImage(surface_width, surface_height, QImage.Format.Format_ARGB32_Premultiplied)
         bounds = QRectF(0.0, 0.0, float(surface_width), float(surface_height))
 
-        # Warm one frame so fonts/glyph caches settle before timing
+        # Warm one settled frame so fonts/glyph/stroke caches settle before timing
+        base_time = time.monotonic() + 4.8
         warmup_painter = QPainter(image)
         image.fill(Qt.GlobalColor.transparent)
-        self._render_canvas(warmup_painter, bounds, time.monotonic() + 0.15)
+        self._render_canvas(warmup_painter, bounds, base_time)
         warmup_painter.end()
 
         frame_durations_ms: List[float] = []
-        base_time = time.monotonic()
         for frame_index in range(iteration_count):
             simulated_now = base_time + frame_index * 0.016667
             start_ns = time.perf_counter_ns()
@@ -3902,8 +4070,37 @@ class OverlayCanvasWindow(QWidget):
                     self.walkthroughStepCompleted.emit()
                 self._walkthrough_prev_lbutton = lbutton_down
 
+        if self._dragging_card_item is not None or self._resizing_card_item is not None:
+            try:
+                lbutton_held = bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+            except Exception:
+                lbutton_held = True
+            if not lbutton_held:
+                self._dragging_card_item = None
+                self._resizing_card_item = None
+                self.unsetCursor()
+                changed = True
+            elif self._dragging_card_item is not None and mouse_moved:
+                card_item = self._dragging_card_item
+                screen_w = float(max(640, self.width()))
+                screen_h = float(max(480, self.height()))
+                card_w = max(200.0, float(card_item.command.width))
+                card_h = max(180.0, float(card_item.command.height))
+                card_item.command.x = _clamp_float(mouse_x - self._card_drag_offset[0], 10.0, max(10.0, screen_w - card_w - 10.0))
+                card_item.command.y = _clamp_float(mouse_y - self._card_drag_offset[1], 34.0, max(34.0, screen_h - card_h - 16.0))
+                changed = True
+            elif self._resizing_card_item is not None and mouse_moved:
+                card_item = self._resizing_card_item
+                start_mx, start_my, start_w, start_h = self._card_resize_anchor
+                self.resize_paper_card(card_item, start_w + (mouse_x - start_mx), start_h + (mouse_y - start_my))
+                changed = True
+
         if self._drawings and (not self._interactive_lasso_active) and (not self._game_mode_parked):
-            want_interactive = self._hit_test_interactive(mouse_x, mouse_y) is not None
+            want_interactive = (
+                self._dragging_card_item is not None
+                or self._resizing_card_item is not None
+                or self._hit_test_interactive(mouse_x, mouse_y) is not None
+            )
             if want_interactive != self._hover_interactive_active:
                 self._hover_interactive_active = want_interactive
                 self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not want_interactive)
@@ -4017,7 +4214,7 @@ class OverlayCanvasWindow(QWidget):
             still_active: List[_ActiveDrawingItem] = []
             active_drawing_now = False
             for item in self._drawings:
-                if now_seconds < item.expires_at:
+                if item.command.kind == "paper" or now_seconds < item.expires_at:
                     still_active.append(item)
                     elapsed_item = now_seconds - item.created_at - item.delay_seconds
                     if 0.0 <= elapsed_item < item.duration_seconds and not item.has_started_sound:
@@ -4043,7 +4240,7 @@ class OverlayCanvasWindow(QWidget):
                                 self._navigation_mode = "pointing"
                     if item.model3d_renderer is not None or item.model3d_viewports:
                         changed = True
-                    if elapsed_item <= item.duration_seconds + 0.05 or (item.expires_at - now_seconds) <= DRAWING_FADE_OUT_SECONDS:
+                    if elapsed_item <= item.duration_seconds + 0.05 or (item.command.kind != "paper" and (item.expires_at - now_seconds) <= DRAWING_FADE_OUT_SECONDS):
                         changed = True
             if self._was_actively_drawing and not active_drawing_now:
                 self.strokeAnimationFinished.emit()
@@ -4146,28 +4343,13 @@ class OverlayCanvasWindow(QWidget):
                 item.model3d_viewports = viewports_out
             lift_offset = (1.0 - draw_progress) * 12.0
             painter.save()
-            painter.setOpacity(draw_progress * fade_alpha)
+            painter.setOpacity(draw_progress)
             painter.drawPixmap(
                 QPointF(command.x - 14.0, command.y - 14.0 + lift_offset),
                 item.cached_paper_pixmap,
             )
-            # Interactive card top-right action controls: Pin, Save PNG, Close
             card_w = max(200.0, float(command.width))
             card_y = float(command.y) + lift_offset
-            ctrl_font = jarvis_theme.ui_font(9.0, QFont.Weight.Bold)
-            painter.setFont(ctrl_font)
-            btn_specs = (
-                (command.x + card_w - 74.0, "PIN" if item.is_pinned else "Pin", "#78FFE2" if item.is_pinned else "#94A3B8"),
-                (command.x + card_w - 50.0, "PNG", "#93C5FD"),
-                (command.x + card_w - 26.0, "x", "#FCA5A5"),
-            )
-            for bx, btxt, bhex in btn_specs:
-                brect = QRectF(bx, card_y + 5.0, 20.0, 18.0)
-                painter.setPen(QPen(QColor(bhex), 0.9))
-                painter.setBrush(QColor(22, 24, 32, 220))
-                painter.drawRoundedRect(brect, 4.0, 4.0)
-                painter.setPen(QColor(bhex))
-                painter.drawText(brect, Qt.AlignmentFlag.AlignCenter, btxt if len(btxt) <= 3 else btxt[:3])
             # Live animated 3D viewport overlays inside single-row or multi-row 3D cards at 60 FPS
             if draw_progress > 0.35:
                 if item.model3d_viewports:

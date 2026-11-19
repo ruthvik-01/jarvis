@@ -4753,6 +4753,7 @@ class VisionBrainService(QObject):
                     underline_labels=underline_labels,
                     existing_paper_count=existing_paper_count,
                     user_prompt=user_prompt,
+                    settings_store=self._settings_store,
                 )
                 for synthesized_card in synthesized_cards:
                     parsed_response.commands.append(synthesized_card)
@@ -4782,6 +4783,149 @@ class VisionBrainService(QObject):
             self._is_running = False
             if self._generation_id == turn_generation:
                 self.turnFailed.emit(f"Could not reach vision model: {err}")
+
+    _DYNAMIC_3D_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+    @classmethod
+    def synthesize_dynamic_3d_model_via_river(
+        cls,
+        topic_query: str,
+        settings_store: Optional[jarvis_config.SettingsStore] = None,
+        timeout_seconds: float = 2.4,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Dynamically generates bespoke 3D interactive model parts list from River AI
+        (DeepSeek-V4.1-Flash) without hardcoding presets.
+        """
+        clean_query = (topic_query or "").strip()
+        if not clean_query or len(clean_query) < 3:
+            return None
+        cache_key = clean_query.lower()[:120]
+        if cache_key in cls._DYNAMIC_3D_CACHE:
+            return cls._DYNAMIC_3D_CACHE[cache_key]
+
+        river_key = ""
+        if settings_store is not None:
+            river_key = settings_store.get_secret(jarvis_config.SECRET_RIVER_API_KEY)
+        if not river_key:
+            river_key = os.getenv("RIVER_AI_API", "")
+
+        if not river_key:
+            return None
+
+        prompt_instructions = (
+            f"You are a 3D visualization architect. Generate a bespoke 3D interactive model specification for: '{clean_query}'.\n"
+            "Return ONLY a valid JSON list of 3 to 6 parts representing the exact components/mechanism.\n"
+            "Each part dictionary must have:\n"
+            "- 'shape': one of 'box', 'sphere', 'cylinder', 'torus', 'cone'\n"
+            "- 'at': [x, y, z] float list between -1.0 and 1.0\n"
+            "- 'size': [w, h, d] float list between 0.2 and 1.2\n"
+            "- 'tone': one of 'teal', 'sky', 'amber', 'coral', 'lilac', 'lime', 'accent'\n"
+            "- 'label': concise topic-specific label (e.g. 'Query Q', 'Key K', 'Value V', 'Attention Weights', 'Softmax')\n"
+            "- 'motion': {'do': 'spin'|'orbit'|'slide'|'pulse', 'axis': 'x'|'y'|'z', 'secs': 3.0}\n"
+            "Output ONLY the JSON array, no markdown fences, no explanation."
+        )
+
+        try:
+            http_session = get_shared_http_session()
+            headers = {
+                "Authorization": f"Bearer {river_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+                "messages": [{"role": "user", "content": prompt_instructions}],
+                "max_tokens": 500,
+                "temperature": 0.2,
+            }
+            response = http_session.post(
+                cls.RIVER_CHAT_URL,
+                headers=headers,
+                json=payload,
+                timeout=timeout_seconds,
+            )
+            if response.status_code == 200:
+                response_json = response.json()
+                content_text = (response_json.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+                json_match = re.search(r"(\[[\s\S]*\])", content_text)
+                if json_match:
+                    parts_candidate = json.loads(json_match.group(1))
+                    if isinstance(parts_candidate, list) and parts_candidate and isinstance(parts_candidate[0], dict):
+                        validated_parts: List[Dict[str, Any]] = []
+                        for part_item in parts_candidate[:8]:
+                            if isinstance(part_item, dict) and "shape" in part_item:
+                                validated_parts.append(part_item)
+                        if validated_parts:
+                            cls._DYNAMIC_3D_CACHE[cache_key] = validated_parts
+                            return validated_parts
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def synthesize_procedural_3d_model_for_topic(
+        cls,
+        topic_query: str,
+        merged_topics: List[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Synthesizes topic-relevant 3D part geometries (boxes, spheres, toruses, cylinders)
+        with specific domain labels and motion when River AI is unavailable or offline.
+        """
+        lowered_query = (topic_query or "").lower()
+        topic_primary = merged_topics[0] if merged_topics else "Core"
+        topic_secondary = merged_topics[1] if len(merged_topics) >= 2 else "Transform"
+        topic_tertiary = merged_topics[2] if len(merged_topics) >= 3 else "Output"
+
+        if any(token in lowered_query for token in ("transformer", "attention", "qkv", "query", "self-attention", "token")):
+            return [
+                {"shape": "box", "at": [-0.62, 0.22, 0.0], "size": [0.42, 0.65, 0.42], "tone": "teal", "label": "Query (Q)", "motion": {"do": "spin", "axis": "y", "secs": 3.6}},
+                {"shape": "box", "at": [0.0, 0.22, 0.0], "size": [0.42, 0.65, 0.42], "tone": "sky", "label": "Key (K)", "motion": {"do": "spin", "axis": "y", "secs": 3.6}},
+                {"shape": "box", "at": [0.62, 0.22, 0.0], "size": [0.42, 0.65, 0.42], "tone": "amber", "label": "Value (V)", "motion": {"do": "spin", "axis": "y", "secs": 3.6}},
+                {"shape": "torus", "at": [0.0, -0.42, 0.0], "size": [1.4, 1.4, 1.4], "rot": [80, 0, 0], "tone": "coral", "label": "Attention Matrix", "motion": {"do": "pulse", "secs": 2.2}},
+                {"shape": "sphere", "at": [0.0, -0.85, 0.0], "size": 0.40, "tone": "lilac", "label": "Context Output", "motion": {"do": "pulse", "secs": 1.8}},
+            ]
+
+        if any(token in lowered_query for token in ("neural", "ann", "deep", "mlp", "perceptron", "layer", "backprop")):
+            return [
+                {"shape": "sphere", "at": [-0.85, 0.45, 0.0], "size": 0.28, "tone": "teal", "label": f"{topic_primary} Input", "motion": {"do": "pulse", "secs": 2.0}},
+                {"shape": "sphere", "at": [-0.85, -0.45, 0.0], "size": 0.28, "tone": "teal", "label": "Bias / Feat", "motion": {"do": "pulse", "secs": 2.0}},
+                {"shape": "cylinder", "at": [-0.35, 0.0, 0.0], "size": [0.22, 1.1, 0.22], "rot": [0, 0, 90], "tone": "sky", "label": "Synaptic Weights"},
+                {"shape": "box", "at": [0.10, 0.0, 0.0], "size": [0.62, 0.85, 0.62], "tone": "amber", "label": f"{topic_secondary} Hidden", "motion": {"do": "spin", "axis": "y", "secs": 3.4}},
+                {"shape": "sphere", "at": [0.85, 0.0, 0.0], "size": 0.36, "tone": "coral", "label": f"{topic_tertiary} Logits", "motion": {"do": "pulse", "secs": 1.6}},
+            ]
+
+        if any(token in lowered_query for token in ("cnn", "convolution", "kernel", "filter", "vision", "image", "resnet")):
+            return [
+                {"shape": "box", "at": [-0.65, 0.0, 0.0], "size": [0.95, 0.95, 0.12], "tone": "sky", "label": "Feature Map"},
+                {"shape": "box", "at": [-0.25, 0.25, 0.10], "size": [0.35, 0.35, 0.20], "tone": "amber", "label": "Conv Kernel 3x3", "motion": {"do": "slide", "to": [-0.25, -0.25, 0.10], "secs": 2.2}},
+                {"shape": "cylinder", "at": [0.35, 0.0, 0.0], "size": [0.55, 0.55, 0.55], "tone": "teal", "label": "Max Pooling", "motion": {"do": "spin", "axis": "y", "secs": 3.0}},
+                {"shape": "sphere", "at": [0.85, 0.0, 0.0], "size": 0.35, "tone": "coral", "label": "Class Head", "motion": {"do": "pulse", "secs": 1.6}},
+            ]
+
+        if any(token in lowered_query for token in ("compiler", "ast", "parse", "syntax", "lexer", "grammar")):
+            return [
+                {"shape": "box", "at": [-0.75, 0.0, 0.0], "size": [0.45, 0.95, 0.45], "tone": "teal", "label": "Token Stream"},
+                {"shape": "sphere", "at": [0.0, 0.55, 0.0], "size": 0.44, "tone": "amber", "label": "AST Root", "motion": {"do": "pulse", "secs": 2.0}},
+                {"shape": "box", "at": [-0.45, -0.45, 0.0], "size": [0.35, 0.35, 0.35], "tone": "sky", "label": "Left Subtree", "motion": {"do": "spin", "axis": "y", "secs": 3.0}},
+                {"shape": "box", "at": [0.45, -0.45, 0.0], "size": [0.35, 0.35, 0.35], "tone": "coral", "label": "Right Subtree", "motion": {"do": "spin", "axis": "y", "secs": 3.0}},
+            ]
+
+        if any(token in lowered_query for token in ("database", "sql", "btree", "b-tree", "index", "storage", "disk")):
+            return [
+                {"shape": "box", "at": [0.0, 0.65, 0.0], "size": [1.25, 0.35, 0.75], "tone": "amber", "label": "B-Tree Root", "motion": {"do": "pulse", "secs": 2.2}},
+                {"shape": "box", "at": [-0.55, 0.05, 0.0], "size": [0.85, 0.30, 0.65], "tone": "teal", "label": "Internal Page A"},
+                {"shape": "box", "at": [0.55, 0.05, 0.0], "size": [0.85, 0.30, 0.65], "tone": "teal", "label": "Internal Page B"},
+                {"shape": "cylinder", "at": [0.0, -0.65, 0.0], "size": [1.4, 0.45, 1.4], "tone": "sky", "label": "Leaf Data Blocks", "motion": {"do": "spin", "axis": "y", "secs": 4.5}},
+            ]
+
+        # General dynamic synthesis binding screen topic terms directly
+        return [
+            {"shape": "box", "at": [-0.70, 0.0, 0.0], "size": [0.45, 0.85, 0.45], "tone": "teal", "label": f"{topic_primary[:14]} In", "motion": {"do": "pulse", "secs": 2.2}},
+            {"shape": "box", "at": [0.0, 0.0, 0.0], "size": [0.75, 0.75, 0.75], "tone": "amber", "label": f"{topic_secondary[:14]} Core", "motion": {"do": "spin", "axis": "y", "secs": 3.6}},
+            {"shape": "torus", "at": [0.0, 0.0, 0.0], "size": [1.65, 1.65, 1.65], "rot": [45, 0, 15], "tone": "lilac", "label": "Coupling Ring", "motion": {"do": "spin", "axis": "x", "secs": 4.2}},
+            {"shape": "sphere", "at": [0.75, 0.0, 0.0], "size": 0.38, "tone": "coral", "label": f"{topic_tertiary[:14]} Out", "motion": {"do": "orbit", "around": [0.0, 0.0, 0.0], "axis": "y", "secs": 2.6}},
+        ]
 
     @staticmethod
     def _select_best_3d_preset_for_topic(combined_text: str) -> str:
@@ -4817,6 +4961,7 @@ class VisionBrainService(QObject):
         underline_labels: Optional[List[str]] = None,
         existing_paper_count: int = 0,
         user_prompt: str = "",
+        settings_store: Optional[jarvis_config.SettingsStore] = None,
     ) -> List[jarvis_response_parser.DrawingCommand]:
         """
         Synthesizes 3 multi-themed visual cards (including an animated 60 FPS 3D model card,
@@ -4884,13 +5029,36 @@ class VisionBrainService(QObject):
             slot_idx = (max(0, int(existing_paper_count)) + card_offset) % len(margin_slots)
             slot_x, slot_y, slot_w, slot_h, slot_tone = margin_slots[slot_idx]
             if slot_idx == 0:
-                card_title = f"{merged_topics[0]} in 3D"
-                card_header = f"3D Simulation · {chosen_3d_preset.upper()}"
-                card_body = (
-                    f"model3d:preset={chosen_3d_preset}|caption={merged_topics[0]} | "
-                    f"{merged_topics[0]} -> {merged_topics[1]} | "
-                    f"clue:{pattern_meta['memory_clue']}"
+                is_named_preset = (
+                    chosen_3d_preset in ("atom", "piston", "solar", "dna", "heart", "gear", "wave", "blackhole")
+                    and any(word in lowered_query for word in ("atom", "bohr", "piston", "engine", "solar", "planet", "dna", "helix", "heart", "gear", "wave", "black hole"))
                 )
+                if is_named_preset:
+                    card_title = f"{merged_topics[0]} in 3D"
+                    card_header = f"3D Simulation · {chosen_3d_preset.upper()}"
+                    card_body = (
+                        f"model3d:preset={chosen_3d_preset}|caption={merged_topics[0]} | "
+                        f"{merged_topics[0]} -> {merged_topics[1]} | "
+                        f"clue:{pattern_meta['memory_clue']}"
+                    )
+                else:
+                    dynamic_parts = VisionBrainService.synthesize_dynamic_3d_model_via_river(
+                        combined_query,
+                        settings_store=settings_store,
+                    )
+                    if not dynamic_parts:
+                        dynamic_parts = VisionBrainService.synthesize_procedural_3d_model_for_topic(
+                            combined_query,
+                            merged_topics,
+                        )
+                    parts_json_payload = json.dumps(dynamic_parts)
+                    card_title = f"{merged_topics[0]} 3D Core"
+                    card_header = f"3D Simulation · {merged_topics[0].upper()[:16]}"
+                    card_body = (
+                        f"model3d:caption={merged_topics[0]}|parts={parts_json_payload} | "
+                        f"{merged_topics[0]} -> {merged_topics[1]} | "
+                        f"clue:{pattern_meta['memory_clue']}"
+                    )
                 target_sentence_idx = 0
             elif slot_idx == 1:
                 pair_start = 1 if len(merged_topics) >= 3 else 0
@@ -4912,6 +5080,13 @@ class VisionBrainService(QObject):
                         f"molecule:smiles={smiles_val}|caption={topic_first} | "
                         f"{topic_first} -> {topic_second} | "
                         "clue:Count Valence Bonds"
+                    )
+                elif any(dl_tok in lowered_query for dl_tok in ("transformer", "ann", "neural", "attention", "qkv", "exam")):
+                    card_header = "Architecture & Mechanisms"
+                    card_body = (
+                        f"mindmap: {topic_first} -> Self-Attention, Feedforward, Layernorm | "
+                        "bars: Relevance=96% ; Attention=92% ; Context=98% | "
+                        "clue:Self-attention weights relate every token to every other token"
                     )
                 elif archetype == "comparison":
                     card_header = "Comparison & Trade-offs"
@@ -4939,13 +5114,22 @@ class VisionBrainService(QObject):
                 tail_first = merged_topics[-3]
                 tail_second = merged_topics[-2]
                 tail_third = merged_topics[-1]
-                card_title = "Deep Contrast & Mastery"
-                card_header = "Table & Exam Hook"
-                card_body = (
-                    f"table: Aspect, {merged_topics[0][:10]}, {merged_topics[1][:10]} ; Core, yes, yes ; Advanced, yes, no | "
-                    f"timeline: Step 1 -> {tail_first[:14]} ; Step 2 -> {tail_second[:14]} | "
-                    f"clue:{pattern_meta['pattern_name']}"
-                )
+                if any(dl_tok in lowered_query for dl_tok in ("transformer", "ann", "neural", "attention", "exam")):
+                    card_title = "Contrast & Recall"
+                    card_header = "Exam Mastery Hook"
+                    card_body = (
+                        "compare: Transformer vs ANN | "
+                        "table: Dimension, Transformer, ANN ; Mechanism, Self-Attention, Stacking Layers ; Routing, Parallel (All), Sequential ; Marks, Full 10/10, Partial 3/10 | "
+                        "clue:ANN stacks layers. Transformer attends across all tokens in parallel"
+                    )
+                else:
+                    card_title = "Deep Contrast & Mastery"
+                    card_header = "Table & Exam Hook"
+                    card_body = (
+                        f"table: Aspect, {merged_topics[0][:10]}, {merged_topics[1][:10]} ; Core, yes, yes ; Advanced, yes, no | "
+                        f"timeline: Step 1 -> {tail_first[:14]} ; Step 2 -> {tail_second[:14]} | "
+                        f"clue:{pattern_meta['pattern_name']}"
+                    )
                 target_sentence_idx = total_sentences - 1
 
             cards_to_build.append(

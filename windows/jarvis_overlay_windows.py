@@ -1546,10 +1546,16 @@ def _render_paper_card_to_pixmap(
                 )
             elif row.kind == "model3d":
                 model3d_spec = row.text.strip()
-                if not model3d_spec.startswith(("[", "{")):
+                json_spec_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", row.text)
+                if json_spec_match:
+                    model3d_spec = json_spec_match.group(1).strip()
+                elif not model3d_spec.startswith(("[", "{")):
                     for model_part in row.text.split("|"):
                         clean_part = model_part.strip()
                         if clean_part.lower().startswith("preset="):
+                            model3d_spec = clean_part.split("=", 1)[1].strip()
+                            break
+                        if clean_part.lower().startswith("parts="):
                             model3d_spec = clean_part.split("=", 1)[1].strip()
                             break
                 row_rect_3d = QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(64.0, row_height - 4.0))

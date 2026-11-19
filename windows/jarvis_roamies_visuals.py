@@ -83,6 +83,16 @@ _ELEMENT_COLOR_MAP: Dict[str, QColor] = {
 def _build_mesh_arrays(shape_name: str) -> Tuple[np.ndarray, np.ndarray]:
     """Builds `(vertices_Nx3x3, face_normals_Nx3)` for box, sphere, cylinder, cone, torus."""
     kind = str(shape_name or "box").strip().lower()
+    if kind in ("cube", "rect", "block", "matrix"):
+        kind = "box"
+    elif kind in ("ring", "donut", "orbit"):
+        kind = "torus"
+    elif kind in ("disc", "disk", "plate", "coin", "capsule"):
+        kind = "cylinder"
+    elif kind in ("pyramid",):
+        kind = "cone"
+    elif kind in ("orb", "ball", "atom", "node"):
+        kind = "sphere"
     tris: List[List[Tuple[float, float, float]]] = []
     if kind == "box":
         for axis_idx, sign_val in ((0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)):
@@ -173,10 +183,13 @@ def resolve_3d_preset_or_parts(spec: Any) -> List[Dict[str, Any]]:
     if isinstance(spec, dict) and isinstance(spec.get("parts"), list):
         return [item for item in spec["parts"] if isinstance(item, dict)][:40]
     raw_text = str(spec or "").strip()
-    if raw_text.startswith("[") or raw_text.startswith("{"):
+    json_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", raw_text)
+    if json_match:
         try:
-            parsed = json.loads(raw_text)
-            return resolve_3d_preset_or_parts(parsed)
+            parsed = json.loads(json_match.group(1))
+            extracted = resolve_3d_preset_or_parts(parsed)
+            if extracted:
+                return extracted
         except Exception:
             pass
     key = raw_text.lower()
@@ -298,8 +311,18 @@ class Jarvis3DModelRenderer:
                 math.radians(float(rot_deg[1])),
                 math.radians(float(rot_deg[2])),
             )
-            tone_key = str(part.get("tone", "accent")).lower()
-            base_color = TONE_COLOR_MAP.get(tone_key, TONE_COLOR_MAP["accent"])
+            custom_color_val = part.get("color")
+            if isinstance(custom_color_val, str) and custom_color_val.strip().startswith("#"):
+                base_color = QColor(custom_color_val.strip())
+            else:
+                tone_key = str(part.get("tone", "accent")).lower()
+                base_color = TONE_COLOR_MAP.get(tone_key, TONE_COLOR_MAP["accent"])
+            motion_spec = part.get("motion")
+            if isinstance(motion_spec, str):
+                clean_mode = motion_spec.strip().lower()
+                motion_spec = {"do": clean_mode}
+            elif not isinstance(motion_spec, dict):
+                motion_spec = None
             self._items.append({
                 "verts": verts,
                 "norms": norms,
@@ -308,7 +331,7 @@ class Jarvis3DModelRenderer:
                 "rot_mat": rot_mat,
                 "color": base_color,
                 "label": str(part.get("label", "") or "").strip(),
-                "motion": part.get("motion") if isinstance(part.get("motion"), dict) else None,
+                "motion": motion_spec,
                 "radius": float(np.max(size_vec)),
                 "glass": False,
             })
@@ -467,9 +490,9 @@ class Jarvis3DModelRenderer:
         # Render compact callout badges along the right/left periphery with leader lines so the 3D mesh is never covered
         lbl_font = QFont("Segoe UI", 7.5, QFont.Bold)
         painter.setFont(lbl_font)
-        for tag_idx, (lbl_x, lbl_y, lbl_text, lbl_col) in enumerate(label_points[:4]):
+        for tag_idx, (lbl_x, lbl_y, lbl_text, lbl_col) in enumerate(label_points[:6]):
             is_right_side = (tag_idx % 2 == 0)
-            tag_w = min(84.0, max(52.0, len(lbl_text) * 5.8 + 14.0))
+            tag_w = min(112.0, max(52.0, len(lbl_text) * 5.8 + 14.0))
             tag_h = 16.0
             tag_x = (rect.right() - tag_w - 6.0) if is_right_side else (rect.left() + 6.0)
             slot_row = tag_idx // 2
@@ -486,7 +509,7 @@ class Jarvis3DModelRenderer:
             painter.setBrush(QColor(255, 255, 255, 232))
             painter.drawRoundedRect(tag_rect, 4.0, 4.0)
             painter.setPen(QColor(15, 23, 42))
-            painter.drawText(tag_rect, Qt.AlignCenter, lbl_text[:15])
+            painter.drawText(tag_rect, Qt.AlignCenter, lbl_text[:22])
 
         painter.restore()
 

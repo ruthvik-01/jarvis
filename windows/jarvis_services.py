@@ -56,6 +56,7 @@ import pygame
 from pynput import keyboard
 from PySide6.QtCore import QObject, Signal
 import requests
+from requests.adapters import HTTPAdapter
 import websockets
 
 import jarvis_config
@@ -68,6 +69,24 @@ AUDIO_CHANNELS = 1
 AUDIO_FRAMES_PER_BUFFER = 1600  # 100 ms chunks at 16 kHz
 TTS_SAMPLE_RATE = 24000
 ASSEMBLYAI_TTS_URL = "https://tts.us.assemblyai.com/v1/speech"
+
+_SHARED_HTTP_SESSION: Optional[requests.Session] = None
+_SHARED_HTTP_LOCK = threading.Lock()
+
+
+def get_shared_http_session() -> requests.Session:
+    """Returns a thread-safe keep-alive HTTP session to eliminate cold TLS handshake latency."""
+    global _SHARED_HTTP_SESSION
+    if _SHARED_HTTP_SESSION is not None:
+        return _SHARED_HTTP_SESSION
+    with _SHARED_HTTP_LOCK:
+        if _SHARED_HTTP_SESSION is None:
+            session_obj = requests.Session()
+            adapter_obj = HTTPAdapter(pool_connections=12, pool_maxsize=24)
+            session_obj.mount("https://", adapter_obj)
+            session_obj.mount("http://", adapter_obj)
+            _SHARED_HTTP_SESSION = session_obj
+    return _SHARED_HTTP_SESSION
 
 
 class JarvisMemoryService(QObject):
@@ -429,7 +448,7 @@ def _request_assemblyai_tts_stream(
     if resolved_voice_id == "windows-sapi" or not api_key:
         return None
     clamped_speed = max(0.75, min(1.2, float(speech_speed)))
-    response = requests.post(
+    response = get_shared_http_session().post(
         ASSEMBLYAI_TTS_URL,
         headers={
             "Authorization": api_key,
@@ -1540,7 +1559,7 @@ class ScreenCaptureService:
         logical_width = max(1, int(logical_width))
         logical_height = max(1, int(logical_height))
         if raw_shot.size != (logical_width, logical_height):
-            return raw_shot.resize((logical_width, logical_height), Image.Resampling.LANCZOS)
+            return raw_shot.resize((logical_width, logical_height), Image.Resampling.BILINEAR)
         return raw_shot
 
     @classmethod
@@ -1549,6 +1568,7 @@ class ScreenCaptureService:
         highlight_points: Optional[List[Tuple[float, float]]] = None,
         highlight_color_hex: str = jarvis_theme.JARVIS_BLUE_HEX,
         logical_screen_size: Optional[Tuple[int, int]] = None,
+        fast_agent_mode: bool = False,
     ) -> Tuple[str, int, int, float, float]:
         """
         Returns `(jpeg_base64, logical_width, logical_height, 1.0, 1.0)` so vision model
@@ -1570,12 +1590,25 @@ class ScreenCaptureService:
         logical_height = max(1, int(logical_height))
 
         if full_res_shot.size != (logical_width, logical_height):
-            logical_shot = full_res_shot.resize((logical_width, logical_height), Image.Resampling.LANCZOS)
+            logical_shot = full_res_shot.resize((logical_width, logical_height), Image.Resampling.BILINEAR)
         else:
-            logical_shot = full_res_shot.copy()
+            logical_shot = full_res_shot
 
         # Store clean un-annotated logical frame for baseline snapping & scroll diff detection
         cls._last_raw_logical_image = logical_shot.copy()
+
+        if fast_agent_mode and (not highlight_points or len(highlight_points) < 2):
+            target_w = min(logical_width, 1280)
+            target_h = max(1, int(round(logical_height * (float(target_w) / float(max(1, logical_width))))))
+            fast_shot = (
+                logical_shot.resize((target_w, target_h), Image.Resampling.BILINEAR)
+                if (target_w, target_h) != logical_shot.size
+                else logical_shot
+            )
+            output_buffer = io.BytesIO()
+            fast_shot.save(output_buffer, format="JPEG", quality=78)
+            jpeg_b64 = base64.b64encode(output_buffer.getvalue()).decode("ascii")
+            return jpeg_b64, logical_width, logical_height, 1.0, 1.0
 
         annotated_shot = _paint_coordinate_ruler_on_screenshot(logical_shot)
 
@@ -1602,7 +1635,7 @@ class ScreenCaptureService:
             )
 
         output_buffer = io.BytesIO()
-        annotated_shot.save(output_buffer, format="JPEG", quality=88)
+        annotated_shot.save(output_buffer, format="JPEG", quality=85)
         jpeg_b64 = base64.b64encode(output_buffer.getvalue()).decode("ascii")
         return jpeg_b64, logical_width, logical_height, 1.0, 1.0
 
@@ -1689,6 +1722,97 @@ class ScreenCaptureService:
                     continue
             split_bands.append((curr_start, curr_end))
         return split_bands
+
+    @classmethod
+    def expand_every_match_commands(
+        cls,
+        command: jarvis_response_parser.DrawingCommand,
+        hands_exe: str = "",
+    ) -> List[jarvis_response_parser.DrawingCommand]:
+        """When `extra_data.get('every')` is True, duplicates the mark across every OCR/UIA text match on screen."""
+        extra_map = getattr(command, "extra_data", None) or {}
+        if not extra_map.get("every"):
+            return [command]
+        cleaned_label = (command.label or "").strip()
+        if not cleaned_label or command.kind not in ("underline", "ring", "target", "highlight", "hover", "strike"):
+            return [command]
+        matches = RoamiesHandsService.find_all_text_matches(cleaned_label, spec="front", hands_exe=hands_exe)
+        if not matches:
+            return [command]
+        expanded_commands: List[jarvis_response_parser.DrawingCommand] = []
+        for match_idx, (bx, by, bw, bh) in enumerate(matches[:16]):
+            if bw < 6 or bh < 6:
+                continue
+            cloned_extra = dict(extra_map)
+            cloned_extra["every"] = False
+            cloned_extra["match_index"] = match_idx
+            if command.kind == "underline":
+                expanded_commands.append(
+                    jarvis_response_parser.DrawingCommand(
+                        kind="underline",
+                        x=float(bx),
+                        y=float(by + bh + 3),
+                        width=float(max(24, bw)),
+                        label=command.label if match_idx == 0 else "",
+                        tone=command.tone,
+                        sentence_index=command.sentence_index,
+                        extra_data=cloned_extra,
+                    )
+                )
+            elif command.kind == "strike":
+                expanded_commands.append(
+                    jarvis_response_parser.DrawingCommand(
+                        kind="strike",
+                        x=float(bx),
+                        y=float(by + bh * 0.52),
+                        width=float(max(24, bw)),
+                        label=command.label if match_idx == 0 else "",
+                        tone=command.tone,
+                        sentence_index=command.sentence_index,
+                        extra_data=cloned_extra,
+                    )
+                )
+            elif command.kind in ("highlight",):
+                expanded_commands.append(
+                    jarvis_response_parser.DrawingCommand(
+                        kind="highlight",
+                        x=float(bx - 2),
+                        y=float(by - 2),
+                        width=float(max(24, bw + 4)),
+                        height=float(max(18, bh + 4)),
+                        label=command.label if match_idx == 0 else "",
+                        tone=command.tone,
+                        sentence_index=command.sentence_index,
+                        extra_data=cloned_extra,
+                    )
+                )
+            elif command.kind in ("ring", "target"):
+                expanded_commands.append(
+                    jarvis_response_parser.DrawingCommand(
+                        kind=command.kind,
+                        x=float(bx + bw * 0.5),
+                        y=float(by + bh * 0.5),
+                        radius=float(max(16.0, min(58.0, max(bw, bh) * 0.55))),
+                        label=command.label if match_idx == 0 else "",
+                        tone=command.tone,
+                        sentence_index=command.sentence_index,
+                        extra_data=cloned_extra,
+                    )
+                )
+            else:
+                expanded_commands.append(
+                    jarvis_response_parser.DrawingCommand(
+                        kind=command.kind,
+                        x=float(bx + bw * 0.5),
+                        y=float(by + bh * 0.5),
+                        label=command.label,
+                        body=command.body or command.label,
+                        tone=command.tone,
+                        sentence_index=command.sentence_index,
+                        extra_data=cloned_extra,
+                    )
+                )
+        return expanded_commands or [command]
 
     @classmethod
     def snap_mark_to_screen_text(
@@ -2515,7 +2639,7 @@ class MicrophoneStreamService(QObject):
         if not api_key:
             return ""
         try:
-            response = requests.get(
+            response = get_shared_http_session().get(
                 "https://streaming.assemblyai.com/v3/token?expires_in_seconds=480",
                 headers={"authorization": api_key},
                 timeout=6,
@@ -2806,7 +2930,7 @@ class WakeWordService(QObject):
                 wav_writer.setsampwidth(2)
                 wav_writer.setframerate(AUDIO_SAMPLE_RATE)
                 wav_writer.writeframes(pcm_bytes)
-            upload_resp = requests.post(
+            upload_resp = get_shared_http_session().post(
                 "https://api.assemblyai.com/v2/upload",
                 headers={"authorization": api_key, "content-type": "application/octet-stream"},
                 data=wav_buffer.getvalue(),
@@ -2817,7 +2941,7 @@ class WakeWordService(QObject):
             upload_url = upload_resp.json().get("upload_url", "")
             if not upload_url:
                 return ""
-            tx_resp = requests.post(
+            tx_resp = get_shared_http_session().post(
                 "https://api.assemblyai.com/v2/transcript",
                 headers={"authorization": api_key, "content-type": "application/json"},
                 json={"audio_url": upload_url, "speech_model": "universal"},
@@ -2829,7 +2953,7 @@ class WakeWordService(QObject):
             if not tx_id:
                 return ""
             for _ in range(12):
-                poll_resp = requests.get(
+                poll_resp = get_shared_http_session().get(
                     f"https://api.assemblyai.com/v2/transcript/{tx_id}",
                     headers={"authorization": api_key},
                     timeout=3.0,
@@ -2884,7 +3008,7 @@ def _request_gemini_tts_pcm(
             },
         },
     }
-    response = requests.post(
+    response = get_shared_http_session().post(
         url,
         headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
         json=payload,
@@ -2927,7 +3051,7 @@ def _request_fish_tts_stream(
     }
     if (voice_id or "").strip():
         payload["reference_id"] = voice_id.strip()
-    response = requests.post(
+    response = get_shared_http_session().post(
         "https://api.fish.audio/v1/tts",
         headers=headers,
         json=payload,
@@ -2962,7 +3086,7 @@ def _request_voicestudio_tts_pcm(
     }
     for route_suffix in ("/tts", "/v1/audio/speech", "/synthesize"):
         try:
-            response = requests.post(
+            response = get_shared_http_session().post(
                 f"{clean_base}{route_suffix}",
                 json=payload,
                 timeout=timeout_seconds,
@@ -4123,7 +4247,7 @@ class VisionBrainService(QObject):
                         request_json["reasoning_effort"] = effort_clean
 
                 try:
-                    with requests.post(
+                    with get_shared_http_session().post(
                         request_url,
                         headers=request_headers,
                         json=request_json,
@@ -4829,31 +4953,47 @@ class VisionBrainService(QObject):
             )
 
         agent_system_prompt = (
-            "You are J.A.R.V.I.S, an ultra-capable Windows & D:\\Projects autonomous builder and desktop agent.\n"
+            "You are J.A.R.V.I.S, an ultra-capable Windows & D:\\Projects autonomous builder, Roamies visual companion, and desktop agent.\n"
             "You operate in a strict Plan-Act-Observe loop. On each turn you receive the live OS observation "
             "(foreground window, UI Automation controls, D:\\Projects folders, and previous step output/exit code).\n\n"
             "Available single-line tool commands (emit 1 to 4 commands FIRST, followed by one concise natural spoken sentence):\n"
+            '- plan_steps("Step 1 | Step 2 | Step 3", "1")\n'
             '- write_project_file("project-folder/relative/path.ext", "full file content with \\n escapes")\n'
             '- read_project_file("project-folder/relative/path.ext")\n'
             '- run_project_command("shell command e.g. python -m pytest or npm run build or python app.py", "project-folder")\n'
             '- open_project("project-folder", "vscode|explorer|terminal|auto")\n'
+            '- list_files("project-folder")\n'
+            '- search_files("regex pattern", "project-folder")\n'
+            '- run_shell_read("read-only PowerShell pipeline e.g. Get-Process | Select-Object -First 8 Name,CPU", "Process check")\n'
             '- open_app("app name, Downloads/Desktop/Documents, or settings:<topic>")\n'
             '- open_url("https://... or http://localhost:PORT")\n'
             '- search_web("query")\n'
             '- open_side_by_side("left app/site", "right app/site")\n'
             '- window_action("focus|minimize|maximize|snap_left|snap_right|close", "window title")\n'
+            '- read_window("front or app name")\n'
+            '- list_windows("all")\n'
+            '- act_in_app("front or app name", "click:Button | type:Text | key:enter")\n'
+            '- find_text_on_screen("text to locate")\n'
             '- click_ui("exact UI control name or x,y")\n'
             '- inspect_ui("optional window query")\n'
             '- type_text("text", "submit")\n'
             '- press_keys("ctrl+s")\n'
+            '- remember_commitment("task text", "today 5pm", "optional repeat")\n'
+            '- schedule_job("Routine name", "in 60 minutes", "agent brief")\n'
+            '- save_skill("skill-name", "description", "markdown steps")\n'
+            '- use_skill("skill-name")\n'
+            '- learn_fact("persistent user preference or fact")\n'
+            '- send_agent("researcher|builder|reviewer|planner|writer", "delegated brief")\n'
+            '- use_connection("server_name", "tool_name", "{\\"arg\\":\\"val\\"}")\n'
             '- request_admin_permission("action title", "risk reason")\n'
             '- agent_done("short completion summary")\n\n'
             "Rules:\n"
             "1. ALWAYS create and build new user coding projects inside D:\\Projects\\<project-name> unless Desktop/Documents is requested.\n"
-            "2. Emit real runnable files cleanly with proper \\n escapes inside write_project_file(...) — never leave placeholders.\n"
-            "3. Verify builds/tests with run_project_command(...) when appropriate, and open the result in VS Code/Chrome/Explorer if helpful.\n"
-            "4. Emit agent_done(\"...\") as soon as the goal is verified complete.\n"
-            "5. Spoken text MUST be crisp, polite, direct JARVIS status (1 short sentence, zero raw tool syntax spoken)."
+            "2. Emit plan_steps(\"Step 1 | Step 2 | Step 3\", \"1\") on step 1 for multi-step builds so the user sees the live progress HUD.\n"
+            "3. Emit real runnable files cleanly with proper \\n escapes inside write_project_file(...) — never leave placeholders.\n"
+            "4. Verify builds/tests with run_project_command(...) when appropriate, and open the result in VS Code/Chrome/Explorer if helpful.\n"
+            "5. Emit agent_done(\"...\") as soon as the goal is verified complete.\n"
+            "6. Spoken text MUST be crisp, polite, direct JARVIS status (1 short sentence, zero raw tool syntax spoken)."
         )
         user_step_prompt = (
             f"User Goal: {user_goal}\n"
@@ -4934,7 +5074,7 @@ class VisionBrainService(QObject):
                     req_payload["reasoning_effort"] = "none"
 
             try:
-                with requests.post(
+                with get_shared_http_session().post(
                     resolved_url,
                     headers=req_headers,
                     json=req_payload,
@@ -5923,11 +6063,32 @@ class WindowsUIAService:
         50030: "Document",
     }
 
+    _cached_hwnd: int = 0
+    _cached_timestamp: float = 0.0
+    _cached_elements: List[Dict[str, Any]] = []
+    _last_clicked_bounds: Optional[Tuple[int, int, int, int, str]] = None
+
+    @classmethod
+    def get_last_clicked_bounds(cls) -> Optional[Tuple[int, int, int, int, str]]:
+        return cls._last_clicked_bounds
+
     @classmethod
     def get_active_window_ui_elements(cls, max_elements: int = 24) -> List[Dict[str, Any]]:
         """Walks the foreground window UIA tree and returns named interactive elements with coordinates."""
         if sys.platform != "win32":
             return []
+        try:
+            active_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        except Exception:
+            active_hwnd = 0
+        now_mono = time.monotonic()
+        if (
+            active_hwnd
+            and active_hwnd == cls._cached_hwnd
+            and (now_mono - cls._cached_timestamp) <= 1.2
+            and cls._cached_elements
+        ):
+            return list(cls._cached_elements[:max_elements])
         try:
             import comtypes
             import comtypes.client
@@ -6010,6 +6171,10 @@ class WindowsUIAService:
                     comtypes.CoUninitialize()
                 except Exception:
                     pass
+        if elements and active_hwnd:
+            cls._cached_hwnd = active_hwnd
+            cls._cached_timestamp = now_mono
+            cls._cached_elements = list(elements)
         return elements
 
     @classmethod
@@ -6033,6 +6198,7 @@ class WindowsUIAService:
         if coord_match:
             target_x = int(coord_match.group(1))
             target_y = int(coord_match.group(2))
+            cls._last_clicked_bounds = (target_x - 18, target_y - 18, 36, 36, f"({target_x},{target_y})")
             if pyautogui is not None:
                 pyautogui.click(target_x, target_y)
                 return True, f"Clicked screen coordinates ({target_x}, {target_y})"
@@ -6068,6 +6234,15 @@ class WindowsUIAService:
 
         click_x = int(exact_hit["x"])
         click_y = int(exact_hit["y"])
+        hit_w = max(24, int(exact_hit.get("width") or 36))
+        hit_h = max(20, int(exact_hit.get("height") or 28))
+        cls._last_clicked_bounds = (
+            click_x - hit_w // 2,
+            click_y - hit_h // 2,
+            hit_w,
+            hit_h,
+            str(exact_hit["name"])[:40],
+        )
         if pyautogui is not None:
             pyautogui.click(click_x, click_y)
             return True, f"Clicked {exact_hit['control_type']} '{exact_hit['name']}' at ({click_x}, {click_y})"
@@ -6548,24 +6723,24 @@ class DesktopAgentService:
     def _wait_for_foreground_window_change(
         cls,
         previous_hwnd: int,
-        timeout_seconds: float = 2.8,
+        timeout_seconds: float = 2.0,
     ) -> None:
-        deadline = time.monotonic() + max(0.4, timeout_seconds)
+        deadline = time.monotonic() + max(0.25, timeout_seconds)
         window_switched = False
         while time.monotonic() < deadline:
             active_hwnd = cls._current_foreground_hwnd()
             if active_hwnd and active_hwnd != previous_hwnd:
                 window_switched = True
                 break
-            time.sleep(0.1)
-        time.sleep(0.55 if window_switched else 0.9)
+            time.sleep(0.025)
+        time.sleep(0.10 if window_switched else 0.18)
 
     @classmethod
     def _press_win32_combo(cls, virtual_keys: List[int]) -> None:
         user32 = ctypes.windll.user32
         for vk_code in virtual_keys:
             user32.keybd_event(vk_code, 0, 0, 0)
-        time.sleep(0.03)
+        time.sleep(0.02)
         for vk_code in reversed(virtual_keys):
             user32.keybd_event(vk_code, 0, cls.KEYEVENTF_KEYUP, 0)
 
@@ -6582,12 +6757,12 @@ class DesktopAgentService:
         try:
             if focus_address_bar:
                 cls._press_win32_combo([cls.VK_CONTROL, cls.VK_L])
-                time.sleep(0.12)
+                time.sleep(0.05)
             SmartDictationInjector._set_clipboard_unicode(cleaned)
-            time.sleep(0.05)
+            time.sleep(0.02)
             cls._press_win32_combo([cls.VK_CONTROL, cls.VK_V])
             if submit_enter:
-                time.sleep(0.08)
+                time.sleep(0.03)
                 cls._press_win32_combo([cls.VK_RETURN])
             return True
         except Exception:
@@ -7334,6 +7509,42 @@ class DesktopAgentService:
     _safety_allow_app_control: bool = True
     _safety_skip_allow: bool = False
     _confirmed_action_keys: set = set()
+    _bound_commitments_service: Optional[CommitmentsReminderService] = None
+    _bound_skills_service: Optional[SkillsManagerService] = None
+    _bound_jobs_service: Optional[ScheduledJobsService] = None
+    _bound_facts_service: Optional[LearnedFactsService] = None
+    _bound_focus_service: Optional[FocusGuardianService] = None
+    _bound_mcp_manager: Optional[Any] = None
+    _bound_subagent_manager: Optional[Any] = None
+    _bound_subagent_runner: Optional[Any] = None
+    _last_visual_feedback: Optional[Tuple[float, float, float, float, str, str]] = None
+
+    @classmethod
+    def bind_companion_services(
+        cls,
+        commitments_service: Optional[CommitmentsReminderService] = None,
+        skills_service: Optional[SkillsManagerService] = None,
+        jobs_service: Optional[ScheduledJobsService] = None,
+        facts_service: Optional[LearnedFactsService] = None,
+        focus_service: Optional[FocusGuardianService] = None,
+        mcp_manager: Optional[Any] = None,
+        subagent_manager: Optional[Any] = None,
+        subagent_runner: Optional[Any] = None,
+    ) -> None:
+        cls._bound_commitments_service = commitments_service
+        cls._bound_skills_service = skills_service
+        cls._bound_jobs_service = jobs_service
+        cls._bound_facts_service = facts_service
+        cls._bound_focus_service = focus_service
+        cls._bound_mcp_manager = mcp_manager
+        cls._bound_subagent_manager = subagent_manager
+        cls._bound_subagent_runner = subagent_runner
+
+    @classmethod
+    def pop_last_visual_feedback(cls) -> Optional[Tuple[float, float, float, float, str, str]]:
+        feedback = cls._last_visual_feedback
+        cls._last_visual_feedback = None
+        return feedback
 
     @classmethod
     def configure_safety_settings(cls, settings_store: Any) -> None:
@@ -7692,7 +7903,20 @@ class DesktopAgentService:
             )
 
         if command_kind == "click_ui":
-            return WindowsUIAService.find_and_click_control(argument_text)
+            WindowsUIAService._last_clicked_bounds = None
+            clicked_ok, clicked_msg = WindowsUIAService.find_and_click_control(argument_text)
+            hit_bounds = WindowsUIAService.get_last_clicked_bounds()
+            if hit_bounds is not None:
+                bx, by, bw, bh, hit_lbl = hit_bounds
+                cls._last_visual_feedback = (
+                    float(bx + bw * 0.5),
+                    float(by + bh * 0.5),
+                    float(bw),
+                    float(bh),
+                    hit_lbl,
+                    "target",
+                )
+            return clicked_ok, clicked_msg
 
         if command_kind == "inspect_ui":
             return True, WindowsUIAService.format_ui_summary(max_elements=18)
@@ -7788,6 +8012,17 @@ class DesktopAgentService:
         if command_kind == "read_window":
             res = RoamiesHandsService.read_window_controls(argument_text or "front")
             controls = res.get("controls") or []
+            win_meta = res.get("window") if isinstance(res, dict) else None
+            if isinstance(win_meta, dict) and isinstance(win_meta.get("bounds"), list) and len(win_meta["bounds"]) == 4:
+                wb = win_meta["bounds"]
+                cls._last_visual_feedback = (
+                    float(wb[0]),
+                    float(wb[1]),
+                    float(max(120, wb[2])),
+                    float(max(80, wb[3])),
+                    str(win_meta.get("title") or win_meta.get("app") or "Active Window")[:36],
+                    "box",
+                )
             if not controls:
                 return False, f"No controls readable in {argument_text or 'active window'}"
             preview = ", ".join(
@@ -7807,12 +8042,34 @@ class DesktopAgentService:
             return True, summary
 
         if command_kind == "act_in_app":
-            return RoamiesHandsService.act_in_app(command.body or "front", command.header or command.label)
+            WindowsUIAService._last_clicked_bounds = None
+            act_ok, act_msg = RoamiesHandsService.act_in_app(command.body or "front", command.header or command.label)
+            hit_bounds = WindowsUIAService.get_last_clicked_bounds()
+            if hit_bounds is not None:
+                bx, by, bw, bh, hit_lbl = hit_bounds
+                cls._last_visual_feedback = (
+                    float(bx + bw * 0.5),
+                    float(by + bh * 0.5),
+                    float(bw),
+                    float(bh),
+                    hit_lbl,
+                    "target",
+                )
+            return act_ok, act_msg
 
         if command_kind == "find_text_on_screen":
             bounds = RoamiesHandsService.find_text_bounds(argument_text, spec="front", allow_scroll=False)
             if bounds is None:
                 return False, f"Could not find '{argument_text}' on screen"
+            bx, by, bw, bh = bounds
+            cls._last_visual_feedback = (
+                float(bx + bw * 0.5),
+                float(by + bh * 0.5),
+                float(max(24, bw)),
+                float(max(18, bh)),
+                argument_text[:36],
+                "target",
+            )
             return True, f"Found '{argument_text}' at {bounds}"
 
         if command_kind == "list_files":
@@ -7847,52 +8104,99 @@ class DesktopAgentService:
             return True, ", ".join(hits) if hits else f"No matches for '{pattern_text}'"
 
         if command_kind == "remember_commitment":
-            service = CommitmentsReminderService()
+            service = cls._bound_commitments_service or CommitmentsReminderService()
             item = service.add_commitment(command.label or argument_text, command.header or "", command.body or "")
             return True, f"Saved commitment: {item['text']}"
 
         if command_kind == "snooze_reminder":
-            return CommitmentsReminderService().snooze_commitment(argument_text or "10")
+            service = cls._bound_commitments_service or CommitmentsReminderService()
+            return service.snooze_commitment(argument_text or "10")
 
         if command_kind in ("list_commitments", "show_list"):
-            grouped = CommitmentsReminderService().list_commitments()
+            service = cls._bound_commitments_service or CommitmentsReminderService()
+            grouped = service.list_commitments()
             today_txt = "; ".join(item["text"] for item in grouped["today"][:5]) or "None"
             later_txt = "; ".join(item["text"] for item in grouped["later"][:4]) or "None"
             return True, f"Today: {today_txt} | Later: {later_txt}"
 
+        if command_kind == "start_focus":
+            focus_srv = cls._bound_focus_service
+            if focus_srv is None:
+                return False, "Focus service unavailable"
+            mins_match = re.search(r"(\d+)", command.body or argument_text or "")
+            mins_val = float(mins_match.group(1)) if mins_match else 25.0
+            return focus_srv.start_focus(minutes=mins_val, task_title=command.header or command.label or "Deep focus")
+
+        if command_kind == "stop_focus":
+            focus_srv = cls._bound_focus_service
+            if focus_srv is None:
+                return False, "Focus service unavailable"
+            return focus_srv.stop_focus()
+
         if command_kind == "save_skill":
-            ok, _slug, msg = SkillsManagerService().save_skill(command.label or "skill", command.header or "Saved skill", command.body or "")
+            skill_srv = cls._bound_skills_service or SkillsManagerService()
+            ok, _slug, msg = skill_srv.save_skill(command.label or "skill", command.header or "Saved skill", command.body or "")
             return ok, msg
 
         if command_kind == "use_skill":
-            skill_md = SkillsManagerService().read_skill(argument_text)
+            skill_srv = cls._bound_skills_service or SkillsManagerService()
+            skill_md = skill_srv.read_skill(argument_text)
             if not skill_md:
                 return False, f"No saved skill named '{argument_text}'"
             return True, re.sub(r"\s+", " ", skill_md)[:320]
 
         if command_kind == "forget_skill":
-            deleted = SkillsManagerService().delete_skill(argument_text)
+            skill_srv = cls._bound_skills_service or SkillsManagerService()
+            deleted = skill_srv.delete_skill(argument_text)
             return (True, f"Removed skill '{argument_text}'") if deleted else (False, f"No skill named '{argument_text}'")
 
         if command_kind == "install_skill":
-            return SkillsManagerService().install_skill_from_source(command.body, command.header)
+            skill_srv = cls._bound_skills_service or SkillsManagerService()
+            return skill_srv.install_skill_from_source(command.body, command.header)
 
         if command_kind == "schedule_job":
-            job = ScheduledJobsService().schedule_job(command.label or "Routine", command.body or command.label, command.header or "in 60 minutes")
+            jobs_srv = cls._bound_jobs_service or ScheduledJobsService()
+            job = jobs_srv.schedule_job(command.label or "Routine", command.body or command.label, command.header or "in 60 minutes")
             return True, f"Scheduled '{job['title']}'"
 
         if command_kind == "list_jobs":
-            jobs_list = ScheduledJobsService().list_jobs()
+            jobs_srv = cls._bound_jobs_service or ScheduledJobsService()
+            jobs_list = jobs_srv.list_jobs()
             if not jobs_list:
                 return True, "No scheduled jobs."
             return True, "; ".join(item["title"] for item in jobs_list[:8])
 
         if command_kind == "learn_fact":
-            entry = LearnedFactsService().learn_fact(argument_text)
+            facts_srv = cls._bound_facts_service or LearnedFactsService()
+            entry = facts_srv.learn_fact(argument_text)
             return True, f"Saved fact [{entry['id']}]: {entry['text']}"
 
         if command_kind == "forget_fact":
-            return LearnedFactsService().forget_fact(argument_text)
+            facts_srv = cls._bound_facts_service or LearnedFactsService()
+            return facts_srv.forget_fact(argument_text)
+
+        if command_kind == "send_agent" and cls._bound_subagent_manager is not None:
+            spec_name = (command.label or command.header or "").strip()
+            brief_text = (command.body or "").strip()
+            sent_ok, _entry, sent_msg = cls._bound_subagent_manager.send_agent(
+                brief=brief_text,
+                subagent=spec_name,
+                runner_fn=cls._bound_subagent_runner,
+            )
+            return sent_ok, sent_msg
+
+        if command_kind == "agent_report" and cls._bound_subagent_manager is not None:
+            return cls._bound_subagent_manager.get_agent_report(command.label or command.body)
+
+        if command_kind == "use_connection" and cls._bound_mcp_manager is not None:
+            srv_name = (command.label or "").strip()
+            tool_name = (command.header or "").strip()
+            raw_args = (command.body or "{}").strip()
+            try:
+                parsed_args = json.loads(raw_args) if raw_args.startswith("{") else {"input": raw_args}
+            except Exception:
+                parsed_args = {"input": raw_args}
+            return cls._bound_mcp_manager.call_tool(srv_name, tool_name, parsed_args)
 
         if command_kind == "photo":
             img_bytes, title_text = WikipediaPhotoService.fetch_photo(command.body or argument_text)

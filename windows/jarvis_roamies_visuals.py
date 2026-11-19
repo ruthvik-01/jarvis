@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -53,6 +54,11 @@ TONE_COLOR_MAP: Dict[str, QColor] = {
     "lilac": QColor("#C69CFF"),
     "sky": QColor("#66D9EF"),
     "lime": QColor("#7CE38B"),
+    "green": QColor("#34D399"),
+    "violet": QColor("#C69CFF"),
+    "purple": QColor("#C69CFF"),
+    "yellow": QColor("#FBBF24"),
+    "orange": QColor("#FB923C"),
     "red": QColor("#FF5252"),
     "white": QColor("#EDF4FF"),
 }
@@ -380,8 +386,13 @@ class Jarvis3DModelRenderer:
 
         lbl_font = QFont("Segoe UI", 8, QFont.Bold)
         painter.setFont(lbl_font)
+        placed_tag_rects: List[QRectF] = []
         for lbl_x, lbl_y, lbl_text, lbl_col in label_points:
-            tag_rect = QRectF(lbl_x - 44.0, lbl_y - 10.0, 88.0, 18.0)
+            tag_rect = QRectF(lbl_x - 36.0, lbl_y - 22.0, 72.0, 17.0)
+            for prev_rect in placed_tag_rects:
+                if tag_rect.intersects(prev_rect):
+                    tag_rect.translate(0.0, 22.0)
+            placed_tag_rects.append(tag_rect)
             painter.setPen(QPen(lbl_col, 1.0))
             painter.setBrush(QColor(10, 18, 32, 210))
             painter.drawRoundedRect(tag_rect, 4.0, 4.0)
@@ -411,7 +422,14 @@ def paint_molecule_row(painter: QPainter, rect: QRectF, smiles_str: str, accent_
         return
 
     def _pt(atom_dict: Dict[str, Any]) -> QPointF:
-        return QPointF(rect.left() + atom_dict["nx"] * rect.width(), rect.top() + atom_dict["ny"] * rect.height())
+        inner_pad_x = min(28.0, rect.width() * 0.14)
+        inner_pad_y = min(22.0, rect.height() * 0.22)
+        usable_w = max(24.0, rect.width() - inner_pad_x * 2.0)
+        usable_h = max(20.0, rect.height() - inner_pad_y * 2.0)
+        return QPointF(
+            rect.left() + inner_pad_x + atom_dict["nx"] * usable_w,
+            rect.top() + inner_pad_y + atom_dict["ny"] * usable_h,
+        )
 
     for idx_a, idx_b, order in bonds:
         pt_a = _pt(atoms[idx_a])
@@ -449,6 +467,125 @@ def paint_molecule_row(painter: QPainter, rect: QRectF, smiles_str: str, accent_
         painter.setPen(col)
         painter.drawText(QRectF(center_pt.x() - 10.0, center_pt.y() - 9.0, 20.0, 18.0), Qt.AlignCenter, elem)
     painter.restore()
+
+
+def parse_graph_spec_from_text(raw_text: str) -> Dict[str, Any]:
+    """Parses either JSON graph spec or Roamies shorthand `expr=x**2|x_range=-3,3|caption=Parabola` into sampled points."""
+    cleaned = (raw_text or "").strip()
+    if cleaned.startswith("{"):
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict) and (parsed.get("plots") or parsed.get("dots")):
+                return parsed
+        except Exception:
+            pass
+    expr_list: List[str] = []
+    x_min_val = -3.0
+    x_max_val = 3.0
+    dots_list: List[Dict[str, Any]] = []
+    for segment in cleaned.split("|"):
+        seg_clean = segment.strip()
+        if not seg_clean:
+            continue
+        seg_lower = seg_clean.lower()
+        if seg_lower.startswith(("expr=", "fn=", "formula=", "y=")):
+            raw_expr = seg_clean.split("=", 1)[1].strip()
+            for sub_expr in raw_expr.split(";"):
+                if sub_expr.strip():
+                    expr_list.append(sub_expr.strip())
+        elif seg_lower.startswith(("x_range=", "xrange=", "domain=")):
+            nums = [float(num) for num in re.findall(r"-?\d+(?:\.\d+)?", seg_clean.split("=", 1)[1])]
+            if len(nums) >= 2 and nums[1] > nums[0]:
+                x_min_val, x_max_val = nums[0], nums[1]
+        elif seg_lower.startswith("points="):
+            pts_raw = seg_clean.split("=", 1)[1].strip()
+            sampled_pts: List[List[float]] = []
+            for pair_str in re.split(r"[;\s]+", pts_raw):
+                pair_nums = [float(num) for num in re.findall(r"-?\d+(?:\.\d+)?", pair_str)]
+                if len(pair_nums) >= 2:
+                    sampled_pts.append([pair_nums[0], pair_nums[1]])
+            if len(sampled_pts) >= 2:
+                return {"plots": [{"points": sampled_pts, "tone": "accent"}]}
+        elif ("=" not in seg_clean) and any(tok in seg_lower for tok in ("x", "sin", "cos", "tan", "exp", "log", "^", "**")):
+            expr_list.append(seg_clean)
+
+    if not expr_list:
+        expr_list = ["x**2"]
+
+    safe_math_env = {
+        "sin": math.sin,
+        "cos": math.cos,
+        "tan": math.tan,
+        "sqrt": lambda val: math.sqrt(max(0.0, float(val))),
+        "abs": abs,
+        "exp": lambda val: math.exp(min(12.0, max(-12.0, float(val)))),
+        "log": lambda val: math.log(max(1e-4, float(val))),
+        "pi": math.pi,
+        "e": math.e,
+    }
+    tones_cycle = ("accent", "teal", "amber", "violet")
+    plots_out: List[Dict[str, Any]] = []
+    sample_count = 41
+    for expr_idx, expr_str in enumerate(expr_list[:3]):
+        py_expr = expr_str.replace("^", "**")
+        py_expr = re.sub(r"(\d)([a-zA-Z\(])", r"\1*\2", py_expr)
+        if re.search(r"[^0-9xX+\-*/().\s_a-zA-Z]", py_expr):
+            continue
+        sampled_points: List[List[float]] = []
+        for step_idx in range(sample_count):
+            frac = step_idx / float(sample_count - 1)
+            x_val = x_min_val + frac * (x_max_val - x_min_val)
+            try:
+                local_vars = dict(safe_math_env)
+                local_vars["x"] = x_val
+                local_vars["X"] = x_val
+                y_val = float(eval(py_expr, {"__builtins__": {}}, local_vars))
+                if math.isfinite(y_val):
+                    sampled_points.append([round(x_val, 4), round(y_val, 4)])
+            except Exception:
+                continue
+        if len(sampled_points) >= 2:
+            plots_out.append({"points": sampled_points, "tone": tones_cycle[expr_idx % len(tones_cycle)]})
+            if expr_idx == 0 and any(abs(pt[0]) < 0.08 for pt in sampled_points):
+                zero_pt = min(sampled_points, key=lambda pt: abs(pt[0]))
+                dots_out_label = f"({zero_pt[0]:.0f},{zero_pt[1]:.1f})".replace(".0)", ")")
+                dots_list.append({"x": zero_pt[0], "y": zero_pt[1], "label": dots_out_label})
+
+    if not plots_out:
+        plots_out = [{"points": [[-2.0, 4.0], [-1.0, 1.0], [0.0, 0.0], [1.0, 1.0], [2.0, 4.0]], "tone": "accent"}]
+    return {"plots": plots_out, "dots": dots_list, "x_range": [x_min_val, x_max_val]}
+
+
+def parse_geometry_spec_from_text(raw_text: str) -> Dict[str, Any]:
+    """Parses either JSON geometry spec or shorthand `shapes=triangle 0,0 100,0 50,80` into vertices/lines/circles."""
+    cleaned = (raw_text or "").strip()
+    if cleaned.startswith("{"):
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict) and parsed.get("vertices"):
+                return parsed
+        except Exception:
+            pass
+    coord_pairs = re.findall(r"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)", cleaned)
+    if len(coord_pairs) >= 3:
+        letters = "ABCDEFGH"
+        vertices = [
+            {"id": letters[idx % len(letters)], "x": float(pair_xy[0]), "y": float(pair_xy[1])}
+            for idx, pair_xy in enumerate(coord_pairs[:6])
+        ]
+        lines = [
+            {
+                "from": vertices[idx]["id"],
+                "to": vertices[(idx + 1) % len(vertices)]["id"],
+                "label": f"{math.hypot(vertices[(idx + 1) % len(vertices)]['x'] - vertices[idx]['x'], vertices[(idx + 1) % len(vertices)]['y'] - vertices[idx]['y']):.0f}",
+            }
+            for idx in range(len(vertices))
+        ]
+        return {"vertices": vertices, "lines": lines}
+    return {
+        "vertices": [{"id": "A", "x": 0.0, "y": 0.0}, {"id": "B", "x": 4.0, "y": 0.0}, {"id": "C", "x": 2.0, "y": 3.0}],
+        "lines": [{"from": "A", "to": "B", "label": "4"}, {"from": "B", "to": "C"}, {"from": "C", "to": "A"}],
+    }
 
 
 def paint_graph_row(painter: QPainter, rect: QRectF, graph_spec: Dict[str, Any], accent_color: QColor) -> None:

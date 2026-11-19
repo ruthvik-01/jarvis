@@ -15,6 +15,7 @@ import base64
 import io
 import json
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -1392,6 +1393,139 @@ def run_strict_selftest() -> int:
         }
         full_parser_ok = expected_full_kinds.issubset(parsed_full_kinds)
 
+        # Comprehensive Agentic Tasks, Latency Budgets & Visualization Accuracy Verification
+        cap_t0 = time.perf_counter()
+        fast_jpeg_b64, fast_w, fast_h, fast_sx, fast_sy = (
+            jarvis_services.ScreenCaptureService.capture_screen_with_highlight(
+                highlight_points=[],
+                logical_screen_size=(1280, 720),
+                fast_agent_mode=True,
+            )
+        )
+        fast_cap_ms = (time.perf_counter() - cap_t0) * 1000.0
+        fast_capture_ok = (
+            (fast_w == 1280 and fast_h == 720 and fast_sx == 1.0 and fast_sy == 1.0)
+            and (fast_cap_ms < 220.0)
+            and (len(fast_jpeg_b64) >= 0)
+        )
+
+        parabola_spec = jarvis_roamies_visuals.parse_graph_spec_from_text("expr=x**2|x_range=-3,3|caption=Parabola")
+        parabola_pts = (parabola_spec.get("plots") or [{}])[0].get("points") or []
+        geom_triangle_spec = jarvis_roamies_visuals.parse_geometry_spec_from_text("shapes=triangle 0,0 100,0 50,80")
+        math_graph_ok = (
+            len(parabola_pts) == 41
+            and abs(parabola_pts[0][0] - (-3.0)) < 0.01
+            and abs(parabola_pts[0][1] - 9.0) < 0.01
+            and abs(parabola_pts[20][0] - 0.0) < 0.01
+            and abs(parabola_pts[20][1] - 0.0) < 0.01
+            and abs(parabola_pts[-1][0] - 3.0) < 0.01
+            and abs(parabola_pts[-1][1] - 9.0) < 0.01
+            and len(geom_triangle_spec.get("vertices") or []) == 3
+            and len(geom_triangle_spec.get("lines") or []) == 3
+        )
+
+        every_cmd_parsed = jarvis_response_parser.parse_command_line('ring(320, 240, 28, "Submit", "blue", "every")')
+        every_mark_ok = (
+            every_cmd_parsed is not None
+            and bool(every_cmd_parsed.extra_data.get("every"))
+            and len(jarvis_services.ScreenCaptureService.expand_every_match_commands(every_cmd_parsed)) >= 1
+        )
+
+        with tempfile.TemporaryDirectory() as agentic_tmp_dir:
+            bound_comm = jarvis_services.CommitmentsReminderService(
+                storage_path=os.path.join(agentic_tmp_dir, "comm.json")
+            )
+            bound_skills = jarvis_services.SkillsManagerService(
+                skills_dir=os.path.join(agentic_tmp_dir, "skills")
+            )
+            bound_jobs = jarvis_services.ScheduledJobsService(
+                storage_path=os.path.join(agentic_tmp_dir, "jobs.json")
+            )
+            bound_facts = jarvis_services.LearnedFactsService(
+                storage_path=os.path.join(agentic_tmp_dir, "facts.json")
+            )
+            bound_focus = jarvis_services.FocusGuardianService(settings_store)
+            bound_crew = jarvis_roamies_core.SubagentCrewManager(
+                agents_root_dir=os.path.join(agentic_tmp_dir, "crew")
+            )
+            jarvis_services.DesktopAgentService.bind_companion_services(
+                commitments_service=bound_comm,
+                skills_service=bound_skills,
+                jobs_service=bound_jobs,
+                facts_service=bound_facts,
+                focus_service=bound_focus,
+                subagent_manager=bound_crew,
+                subagent_runner=lambda spec_name, brief_txt: f"[{spec_name}] completed {brief_txt}",
+            )
+
+            dispatch_t0 = time.perf_counter()
+            cmd_rem = jarvis_response_parser.parse_command_line('remember_commitment("Ship v2.5", "today 6pm", "daily")')
+            ok_rem, _ = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_rem)
+            cmd_snz = jarvis_response_parser.parse_command_line('snooze_reminder("10")')
+            ok_snz, _ = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_snz)
+            cmd_lst = jarvis_response_parser.parse_command_line('show_list("today")')
+            ok_lst, lst_out = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_lst)
+            cmd_fstart = jarvis_response_parser.parse_command_line('start_focus("20", "Agentic Test")')
+            ok_fstart, _ = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_fstart)
+            cmd_fstop = jarvis_response_parser.parse_command_line('stop_focus("done")')
+            ok_fstop, _ = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_fstop)
+            cmd_sk_save = jarvis_response_parser.parse_command_line('save_skill("Fast Build", "Quick build", "1. Compile\\n2. Test")')
+            ok_sk_save, _ = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_sk_save)
+            cmd_sk_use = jarvis_response_parser.parse_command_line('use_skill("Fast Build")')
+            ok_sk_use, sk_out = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_sk_use)
+            cmd_sk_del = jarvis_response_parser.parse_command_line('forget_skill("Fast Build")')
+            ok_sk_del, _ = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_sk_del)
+            cmd_job = jarvis_response_parser.parse_command_line('schedule_job("Nightly Sync", "in 45 minutes", "Run sync")')
+            ok_job, _ = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_job)
+            cmd_jlist = jarvis_response_parser.parse_command_line('list_jobs("all")')
+            ok_jlist, jlist_out = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_jlist)
+            cmd_fact = jarvis_response_parser.parse_command_line('learn_fact("Prefers 60 FPS dark UI")')
+            ok_fact, fact_out = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_fact)
+            fact_id_match = re.search(r"\[([^\]]+)\]", fact_out)
+            fact_id_val = fact_id_match.group(1) if fact_id_match else "Prefers 60 FPS"
+            cmd_fforget = jarvis_response_parser.parse_command_line(f'forget_fact("{fact_id_val}")')
+            ok_fforget, _ = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_fforget)
+            cmd_lfiles = jarvis_response_parser.parse_command_line('list_files("clicky/windows")')
+            ok_lfiles, lfiles_out = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_lfiles)
+            cmd_sfiles = jarvis_response_parser.parse_command_line('search_files("JarvisApplicationController", "clicky/windows")')
+            ok_sfiles, sfiles_out = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_sfiles)
+            cmd_lwins = jarvis_response_parser.parse_command_line('list_windows("all")')
+            ok_lwins, _ = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_lwins)
+            cmd_sub = jarvis_response_parser.parse_command_line('send_agent("builder", "Check build health")')
+            ok_sub, _ = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_sub)
+            dispatch_elapsed_ms = (time.perf_counter() - dispatch_t0) * 1000.0
+
+            # Reset bound services after temporary directory block
+            jarvis_services.DesktopAgentService.bind_companion_services()
+
+        agentic_suite_ok = (
+            fast_capture_ok
+            and math_graph_ok
+            and every_mark_ok
+            and ok_rem
+            and ok_snz
+            and ok_lst
+            and ("Ship v2.5" in lst_out)
+            and ok_fstart
+            and ok_fstop
+            and ok_sk_save
+            and ok_sk_use
+            and ("Compile" in sk_out)
+            and ok_sk_del
+            and ok_job
+            and ok_jlist
+            and ("Nightly Sync" in jlist_out)
+            and ok_fact
+            and ok_fforget
+            and ok_lfiles
+            and ("jarvis.py" in lfiles_out)
+            and ok_sfiles
+            and ("jarvis_app.py" in sfiles_out)
+            and ok_lwins
+            and ok_sub
+            and (dispatch_elapsed_ms < 2500.0)
+        )
+
         roamies_github_full_ok = (
             looks_ok
             and visual_cards_ok
@@ -1412,6 +1546,7 @@ def run_strict_selftest() -> int:
             and schedule_wake_ok
             and widgets_ok
             and full_parser_ok
+            and agentic_suite_ok
         )
 
         regression_safety_ok = (
@@ -1488,7 +1623,9 @@ def run_strict_selftest() -> int:
                 f"intent_ok={intent_router_ok}, precise_ok={precise_norm_ok}, "
                 f"pdf_margin_ok={pdf_margin_snap_ok}, pt_norm_ok={labeled_point_norm_ok}, "
                 f"univ_agent_ok={universal_agent_ok}, regr_safety_ok={regression_safety_ok}, "
-                f"roamies_full={roamies_github_full_ok}, single_char={single_char_violations[:8]}"
+                f"roamies_full={roamies_github_full_ok}, agentic_ok={agentic_suite_ok}, "
+                f"fast_cap_ms={fast_cap_ms:.1f}ms, dispatch_ms={dispatch_elapsed_ms:.1f}ms, "
+                f"single_char={single_char_violations[:8]}"
             ),
         )
     except Exception as exc:

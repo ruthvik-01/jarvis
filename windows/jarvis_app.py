@@ -41,6 +41,9 @@ class JarvisApplicationController(QObject):
     _webLookupContextReady = Signal(str, str, int)
     _brainAgentResultReady = Signal(str, str, str, bool)
     _subagentArtifactReady = Signal(str, str, list)
+    _agentVisualFeedbackRequested = Signal(float, float, float, float, str, str)
+    _agentPlanStepsRequested = Signal(list, int)
+    _agentDrawingCommandDispatched = Signal(object)
 
     def __init__(self, settings_store: Optional[jarvis_config.SettingsStore] = None) -> None:
         super().__init__()
@@ -72,6 +75,16 @@ class JarvisApplicationController(QObject):
         self.risky_approval_bar = jarvis_roamies_visuals.RiskyActionApprovalBar()
         self.artifact_toast = jarvis_roamies_visuals.AgentArtifactToastWindow()
         jarvis_services.DesktopAgentService.configure_safety_settings(self.settings_store)
+        jarvis_services.DesktopAgentService.bind_companion_services(
+            commitments_service=self.commitments_service,
+            skills_service=self.skills_service,
+            jobs_service=self.jobs_service,
+            facts_service=self.facts_service,
+            focus_service=self.focus_service,
+            mcp_manager=self.mcp_manager,
+            subagent_manager=self.subagent_manager,
+            subagent_runner=self._run_subagent_runner,
+        )
 
         self._tray_icon: Optional[QSystemTrayIcon] = None
         self._agent_monitor_timer = QTimer(self)
@@ -182,6 +195,9 @@ class JarvisApplicationController(QObject):
         self._agentSequenceCompleted.connect(self._on_agent_sequence_completed)
         self._webLookupContextReady.connect(self._on_web_lookup_context_ready)
         self._brainAgentResultReady.connect(self._on_brain_agent_result_ready)
+        self._agentVisualFeedbackRequested.connect(self._on_agent_visual_feedback_requested)
+        self._agentPlanStepsRequested.connect(self._on_agent_plan_steps_requested)
+        self._agentDrawingCommandDispatched.connect(self._on_brain_drawing_command)
 
         # Notch Window
         self.notch_window.promptSubmitted.connect(self._on_notch_prompt_submitted)
@@ -1081,6 +1097,18 @@ class JarvisApplicationController(QObject):
         search_query: str,
         worker_generation: int,
     ) -> None:
+        prev_hwnd = jarvis_services.DesktopAgentService._current_foreground_hwnd()
+        fetched_context_holder: List[str] = [""]
+
+        def _fetch_context_bg() -> None:
+            fetched_context_holder[0] = jarvis_services.LiveWebLookupService.fetch_live_web_context(
+                search_query,
+                timeout_seconds=3.5,
+            )
+
+        fetch_thread = threading.Thread(target=_fetch_context_bg, name="JarvisWebContextFetch", daemon=True)
+        fetch_thread.start()
+
         action_ok, status_msg = jarvis_services.DesktopAgentService.open_chrome_search(search_query)
         self.memory_service.record_action(
             action_kind="search_web",
@@ -1088,14 +1116,17 @@ class JarvisApplicationController(QObject):
             status_text=status_msg,
             succeeded=action_ok,
         )
-        web_context = jarvis_services.LiveWebLookupService.fetch_live_web_context(
-            search_query,
-            timeout_seconds=4.5,
-        )
-        for _wait_tick in range(15):
+        fetch_thread.join(timeout=3.6)
+        web_context = fetched_context_holder[0]
+
+        # Brief window readiness poll (up to 0.25s instead of 1.5s dead wait)
+        for _wait_tick in range(5):
             if self._quitting or worker_generation != self._agent_worker_generation:
                 return
-            time.sleep(0.1)
+            curr_hwnd = jarvis_services.DesktopAgentService._current_foreground_hwnd()
+            if curr_hwnd and curr_hwnd != prev_hwnd:
+                break
+            time.sleep(0.05)
 
         if self._quitting or worker_generation != self._agent_worker_generation:
             return
@@ -1137,6 +1168,60 @@ class JarvisApplicationController(QObject):
             suppress_visual_notes=False,
         )
 
+    def _emit_visual_feedback_if_present(self) -> None:
+        vis_fb = jarvis_services.DesktopAgentService.pop_last_visual_feedback()
+        if vis_fb is not None:
+            fb_x, fb_y, fb_w, fb_h, fb_lbl, fb_kind = vis_fb
+            self._agentVisualFeedbackRequested.emit(fb_x, fb_y, fb_w, fb_h, fb_lbl, fb_kind)
+
+    def _on_agent_visual_feedback_requested(
+        self,
+        pos_x: float,
+        pos_y: float,
+        box_w: float,
+        box_h: float,
+        label_text: str,
+        visual_kind: str,
+    ) -> None:
+        if self._quitting:
+            return
+        if visual_kind == "box":
+            frame_cmd = jarvis_response_parser.DrawingCommand(
+                kind="box",
+                x=max(4.0, pos_x),
+                y=max(4.0, pos_y),
+                width=max(80.0, box_w),
+                height=max(48.0, box_h),
+                label=label_text[:34],
+                tone="blue",
+            )
+            self.overlay_window.add_drawing_command(frame_cmd)
+            self.overlay_window.fly_cursor_to(
+                pos_x + box_w * 0.5,
+                pos_y + min(42.0, box_h * 0.25),
+                label=label_text[:32],
+                hold_seconds=2.8,
+            )
+        else:
+            ring_radius = max(18.0, min(52.0, max(box_w, box_h) * 0.55))
+            target_cmd = jarvis_response_parser.DrawingCommand(
+                kind="target",
+                x=pos_x,
+                y=pos_y,
+                radius=ring_radius,
+                label=label_text[:34],
+                tone="blue",
+            )
+            self.overlay_window.add_drawing_command(target_cmd)
+            self.overlay_window.fly_cursor_to(pos_x, pos_y, label=label_text[:32], hold_seconds=2.8)
+
+    def _on_agent_plan_steps_requested(self, step_labels: list, active_index: int) -> None:
+        if self._quitting:
+            return
+        cleaned_steps = [str(item).strip() for item in (step_labels or []) if str(item).strip()]
+        if cleaned_steps:
+            self.overlay_window.set_plan_steps(cleaned_steps, active_index=max(0, int(active_index)), hold_seconds=18.0)
+
     def _run_autonomous_agent_worker(
         self,
         user_goal: str,
@@ -1146,7 +1231,36 @@ class JarvisApplicationController(QObject):
         max_steps = max(2, min(10, int(self.settings_store.get("autonomous_agent_max_steps", 6) or 6)))
         projects_root = self.settings_store.get_projects_root_dir()
         step_observations: List[str] = []
+        live_plan_labels: List[str] = []
         final_spoken_summary = ""
+        ui_only_command_kinds = {
+            "plan_steps",
+            "edit_drawing",
+            "show_list",
+            "emote",
+            "sfx",
+            "about_jarvis",
+            "walkthrough_step",
+            "add_connection",
+            "remove_connection",
+            "connection_tools",
+            "tell_agent",
+            "answer_agent",
+            "stop_agent",
+            "paper",
+            "ring",
+            "target",
+            "box",
+            "highlight",
+            "underline",
+            "point",
+            "connect",
+            "spotlight",
+            "strike",
+            "check",
+            "cross",
+            "num",
+        }
 
         for step_index in range(max_steps):
             if self._quitting or worker_generation != self._agent_worker_generation:
@@ -1168,11 +1282,12 @@ class JarvisApplicationController(QObject):
                 try:
                     screen_w = max(640, self.overlay_window.width())
                     screen_h = max(480, self.overlay_window.height())
-                    screenshot_b64, _crop_b64, _sw, _sh = (
+                    screenshot_b64, _sw, _sh, _sx, _sy = (
                         jarvis_services.ScreenCaptureService.capture_screen_with_highlight(
                             highlight_points=[],
                             highlight_color_hex=jarvis_theme.JARVIS_BLUE_HEX,
                             logical_screen_size=(screen_w, screen_h),
+                            fast_agent_mode=True,
                         )
                     )
                 except Exception:
@@ -1203,11 +1318,33 @@ class JarvisApplicationController(QObject):
                 if cmd_item.kind == "agent_done":
                     final_spoken_summary = (cmd_item.body or step_spoken or "Completed, sir.").strip()
                     done_reached = True
+                    if live_plan_labels:
+                        self._agentPlanStepsRequested.emit(live_plan_labels, len(live_plan_labels))
                     break
+                if cmd_item.kind == "plan_steps":
+                    parsed_labels = [part.strip() for part in (cmd_item.body or "").split("|") if part.strip()]
+                    if parsed_labels:
+                        live_plan_labels = parsed_labels[:8]
+                    active_idx = int(cmd_item.header) - 1 if (cmd_item.header or "").strip().isdigit() else step_index
+                    if live_plan_labels:
+                        self._agentPlanStepsRequested.emit(live_plan_labels, max(0, active_idx))
+                    continue
+                if cmd_item.kind in ui_only_command_kinds:
+                    self._agentDrawingCommandDispatched.emit(cmd_item)
+                    continue
+
                 step_banner = step_spoken or jarvis_services.DesktopAgentService.describe_step_for_speech(cmd_item)
+                if not live_plan_labels:
+                    live_plan_labels = [step_banner[:44]]
+                    self._agentPlanStepsRequested.emit(live_plan_labels, 0)
+                elif step_banner[:44] not in live_plan_labels and len(live_plan_labels) < 7:
+                    live_plan_labels.append(step_banner[:44])
+                    self._agentPlanStepsRequested.emit(live_plan_labels, len(live_plan_labels) - 1)
+
                 if step_banner and cmd_item == parsed_step.commands[0]:
                     self._agentStepSpeechRequested.emit(step_banner, step_banner)
                 action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command_blocking(cmd_item)
+                self._emit_visual_feedback_if_present()
                 self.memory_service.record_action(
                     action_kind=cmd_item.kind,
                     target_summary=cmd_item.label or cmd_item.body or cmd_item.header,
@@ -1218,9 +1355,9 @@ class JarvisApplicationController(QObject):
                     f"[Step {step_index + 1}] {cmd_item.kind}({cmd_item.body[:60]}): "
                     f"{'OK' if action_ok else 'FAILED'} -> {status_msg[:180]}"
                 )
-                self.screen_monitor.poll_once()
-                time.sleep(0.15)
+                time.sleep(0.03)
 
+            self.screen_monitor.poll_once()
             if done_reached:
                 break
         else:
@@ -1238,14 +1375,22 @@ class JarvisApplicationController(QObject):
     ) -> None:
         action_statuses: List[str] = []
         any_action_failed = False
+        plan_labels = [
+            jarvis_services.DesktopAgentService.describe_step_for_speech(cmd_item).rstrip(".")
+            for cmd_item in commands_to_run[:8]
+        ]
+        show_plan_hud = len(plan_labels) >= 2
 
-        for agent_cmd in commands_to_run:
+        for cmd_idx, agent_cmd in enumerate(commands_to_run):
             if self._quitting or worker_generation != self._agent_worker_generation:
                 return
+            if show_plan_hud:
+                self._agentPlanStepsRequested.emit(plan_labels, cmd_idx)
             step_speech = jarvis_services.DesktopAgentService.describe_step_for_speech(agent_cmd)
             self._agentStepSpeechRequested.emit(step_speech, step_speech)
 
             action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command_blocking(agent_cmd)
+            self._emit_visual_feedback_if_present()
             self.memory_service.record_action(
                 action_kind=agent_cmd.kind,
                 target_summary=agent_cmd.label or agent_cmd.body or agent_cmd.header,
@@ -1259,8 +1404,12 @@ class JarvisApplicationController(QObject):
 
             if self._quitting or worker_generation != self._agent_worker_generation:
                 return
-            self.screen_monitor.poll_once()
-            time.sleep(0.18)
+            if cmd_idx + 1 < len(commands_to_run):
+                time.sleep(0.04)
+
+        if show_plan_hud:
+            self._agentPlanStepsRequested.emit(plan_labels, len(plan_labels))
+        self.screen_monitor.poll_once()
 
         if self._quitting or worker_generation != self._agent_worker_generation:
             return
@@ -1470,6 +1619,7 @@ class JarvisApplicationController(QObject):
             action_ok, status_msg = jarvis_services.DesktopAgentService.execute_agent_command_blocking(
                 queued_command
             )
+            self._emit_visual_feedback_if_present()
             if item_generation != self._agent_worker_generation:
                 continue
             self._brainAgentResultReady.emit(
@@ -1542,7 +1692,7 @@ class JarvisApplicationController(QObject):
             return f"[{specialist_name}] No model endpoint available to run subagent brief."
         selected_cfg = endpoints[0]
         try:
-            import requests as http_requests
+            http_session = jarvis_services.get_shared_http_session()
 
             if selected_cfg["wire_protocol"] == "openai":
                 headers = {"Content-Type": "application/json"}
@@ -1560,7 +1710,7 @@ class JarvisApplicationController(QObject):
                     "max_tokens": 600,
                     "stream": False,
                 }
-                resp = http_requests.post(selected_cfg["endpoint_url"], headers=headers, json=payload, timeout=30)
+                resp = http_session.post(selected_cfg["endpoint_url"], headers=headers, json=payload, timeout=30)
                 if resp.ok:
                     choices = resp.json().get("choices") or []
                     if choices:
@@ -1571,7 +1721,7 @@ class JarvisApplicationController(QObject):
                     "contents": [{"role": "user", "parts": [{"text": f"Act as {specialist_name}: {brief_text}"}]}],
                     "generationConfig": {"maxOutputTokens": 600},
                 }
-                resp = http_requests.post(req_url, headers={"x-goog-api-key": selected_cfg["api_key"], "Content-Type": "application/json"}, json=payload, timeout=30)
+                resp = http_session.post(req_url, headers={"x-goog-api-key": selected_cfg["api_key"], "Content-Type": "application/json"}, json=payload, timeout=30)
                 if resp.ok:
                     cands = resp.json().get("candidates") or []
                     if cands:
@@ -1823,38 +1973,40 @@ class JarvisApplicationController(QObject):
                 self._brain_agent_queue.put((self._agent_worker_generation, command))
             return
 
-        snapped_command = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(command)
-        if self._turn_sentences and (snapped_command.label or "").strip():
-            matched_idx = jarvis_response_parser.match_command_to_best_sentence_index(
-                snapped_command,
-                self._turn_sentences,
-                fallback_index=-1,
-                min_score=4,
+        expanded_commands = jarvis_services.ScreenCaptureService.expand_every_match_commands(command)
+        for single_command in expanded_commands:
+            snapped_command = jarvis_services.ScreenCaptureService.snap_drawing_command_to_content(single_command)
+            if self._turn_sentences and (snapped_command.label or "").strip():
+                matched_idx = jarvis_response_parser.match_command_to_best_sentence_index(
+                    snapped_command,
+                    self._turn_sentences,
+                    fallback_index=-1,
+                    min_score=4,
+                )
+                if matched_idx >= 0:
+                    snapped_command.sentence_index = matched_idx
+
+            target_desc = snapped_command.label or snapped_command.header or f"({snapped_command.x:.0f},{snapped_command.y:.0f})"
+            self.memory_service.record_action(
+                action_kind=snapped_command.kind,
+                target_summary=target_desc,
+                status_text=f"synced@{max(0, int(snapped_command.sentence_index))}",
+                succeeded=True,
             )
-            if matched_idx >= 0:
-                snapped_command.sentence_index = matched_idx
+            if not self._speak_current_turn:
+                self._execute_visual_drawing_command(snapped_command)
+                continue
 
-        target_desc = snapped_command.label or snapped_command.header or f"({snapped_command.x:.0f},{snapped_command.y:.0f})"
-        self.memory_service.record_action(
-            action_kind=snapped_command.kind,
-            target_summary=target_desc,
-            status_text=f"synced@{max(0, int(snapped_command.sentence_index))}",
-            succeeded=True,
-        )
-        if not self._speak_current_turn:
-            self._execute_visual_drawing_command(snapped_command)
-            return
-
-        target_sentence_idx = max(0, int(snapped_command.sentence_index))
-        if self._should_execute_command_for_spoken_sentence(
-            snapped_command,
-            sentence_key=target_sentence_idx,
-            spoken_idx=self._current_spoken_sentence_index,
-            spoken_text=self._current_spoken_sentence_text,
-        ):
-            self._execute_visual_drawing_command(snapped_command)
-        else:
-            self._pending_voice_synced_commands.setdefault(target_sentence_idx, []).append(snapped_command)
+            target_sentence_idx = max(0, int(snapped_command.sentence_index))
+            if self._should_execute_command_for_spoken_sentence(
+                snapped_command,
+                sentence_key=target_sentence_idx,
+                spoken_idx=self._current_spoken_sentence_index,
+                spoken_text=self._current_spoken_sentence_text,
+            ):
+                self._execute_visual_drawing_command(snapped_command)
+            else:
+                self._pending_voice_synced_commands.setdefault(target_sentence_idx, []).append(snapped_command)
 
     def _on_stroke_animation_started(self, stroke_kind: str, duration_ms: int) -> None:
         if stroke_kind == "paper":

@@ -903,7 +903,12 @@ def _parse_paper_body_rows(body_text: str) -> List[_PaperRow]:
 
         if "->" in normalized_arrow_segment:
             _flush_pending_topics()
-            raw_parts = [part.strip() for part in normalized_arrow_segment.split("->") if part.strip()]
+            flow_body_text = (
+                normalized_arrow_segment.split(":", 1)[1].strip()
+                if lowered_segment.startswith(("flow:", "steps:", "pipeline:"))
+                else normalized_arrow_segment
+            )
+            raw_parts = [part.strip() for part in flow_body_text.split("->") if part.strip()]
             row_nodes: List[_PaperNode] = []
             for part in raw_parts[:3]:
                 is_doc = part.lower().startswith("doc:")
@@ -981,6 +986,10 @@ def _paint_paper_arrow(
     )
     painter.drawLine(QPointF(end_x, end_y), wing_one)
     painter.drawLine(QPointF(end_x, end_y), wing_two)
+    flow_dot_pt = shaft_path.pointAtPercent(0.55)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#78FFE2"))
+    painter.drawEllipse(flow_dot_pt, 2.2, 2.2)
     painter.restore()
 
 
@@ -1034,6 +1043,23 @@ def _render_paper_card_to_pixmap(
     """
     card_width = max(200.0, float(command.width))
     card_height = max(180.0, float(command.height))
+    parsed_rows = _parse_paper_body_rows(command.body)
+    if parsed_rows:
+        estimated_rows_h = 0.0
+        for row_item in parsed_rows:
+            if row_item.kind in ("model3d", "worldmap", "graph", "geometry", "molecule"):
+                estimated_rows_h += 128.0
+            elif row_item.kind == "photo":
+                estimated_rows_h += 92.0
+            elif row_item.kind in ("flow", "tree", "decision", "clip", "ticket", "quiz", "mindmap"):
+                estimated_rows_h += 76.0
+            elif row_item.kind in ("compare", "bars", "timeline", "table", "list", "math"):
+                estimated_rows_h += 58.0
+            else:
+                estimated_rows_h += 38.0
+        required_total_h = PAPER_HEADER_HEIGHT + 52.0 + estimated_rows_h + 18.0
+        card_height = max(card_height, min(680.0, required_total_h))
+        command.height = card_height
     shadow_pad = 14
     scale_factor = 2.5
 
@@ -1350,10 +1376,7 @@ def _render_paper_card_to_pixmap(
                     accent_color=accent_color,
                 )
             elif row.kind == "graph":
-                try:
-                    graph_spec = json.loads(row.text) if row.text.strip().startswith("{") else {"plots": [{"points": [[0, 1], [1, 3], [2, 2], [3, 5]]}]}
-                except Exception:
-                    graph_spec = {"plots": [{"points": [[0, 1], [1, 3], [2, 2], [3, 5]]}]}
+                graph_spec = jarvis_roamies_visuals.parse_graph_spec_from_text(row.text)
                 jarvis_roamies_visuals.paint_graph_row(
                     painter=painter,
                     rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(64.0, row_height - 4.0)),
@@ -1361,15 +1384,7 @@ def _render_paper_card_to_pixmap(
                     accent_color=accent_color,
                 )
             elif row.kind == "geometry":
-                try:
-                    geom_spec = json.loads(row.text) if row.text.strip().startswith("{") else {}
-                except Exception:
-                    geom_spec = {}
-                if not geom_spec.get("vertices"):
-                    geom_spec = {
-                        "vertices": [{"id": "A", "x": 0, "y": 0}, {"id": "B", "x": 4, "y": 0}, {"id": "C", "x": 2, "y": 3}],
-                        "lines": [{"from": "A", "to": "B"}, {"from": "B", "to": "C"}, {"from": "C", "to": "A"}],
-                    }
+                geom_spec = jarvis_roamies_visuals.parse_geometry_spec_from_text(row.text)
                 jarvis_roamies_visuals.paint_geometry_row(
                     painter=painter,
                     rect=QRectF(inner_margin_x, cursor_y + 2.0, inner_width, max(64.0, row_height - 4.0)),
@@ -3182,11 +3197,17 @@ class OverlayCanvasWindow(QWidget):
         is_pinned_card = bool((prepared_command.extra_data or {}).get("keep_card"))
         hold_dur = 3600.0 if is_pinned_card else DEFAULT_DRAWING_HOLD_SECONDS
         model3d_obj = None
-        if prepared_command.kind == "paper" and "3d:" in (prepared_command.body or "").lower():
-            for body_part in (prepared_command.body or "").split("|"):
-                if body_part.strip().lower().startswith(("3d:", "model3d:", "model:")):
-                    model3d_obj = jarvis_roamies_visuals.Jarvis3DModelRenderer(body_part.split(":", 1)[1].strip())
-                    break
+        if prepared_command.kind == "paper":
+            card_rows = _parse_paper_body_rows(prepared_command.body or "")
+            if len(card_rows) == 1 and card_rows[0].kind == "model3d":
+                model3d_spec = card_rows[0].text.strip()
+                if not model3d_spec.startswith(("[", "{")):
+                    for model_part in card_rows[0].text.split("|"):
+                        clean_part = model_part.strip()
+                        if clean_part.lower().startswith("preset="):
+                            model3d_spec = clean_part.split("=", 1)[1].strip()
+                            break
+                model3d_obj = jarvis_roamies_visuals.Jarvis3DModelRenderer(model3d_spec)
 
         drawing_item = _ActiveDrawingItem(
             command=prepared_command,
@@ -4131,12 +4152,29 @@ class OverlayCanvasWindow(QWidget):
             painter.save()
             painter.setOpacity(draw_progress * fade_alpha)
             painter.setPen(QPen(tone_color, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            path = QPainterPath(QPointF(command.x, command.y))
             if command.kind == "curve":
-                path = QPainterPath(QPointF(command.x, command.y))
                 path.quadTo(QPointF((command.x + end_x) * 0.5, min(command.y, end_y) - 36.0), QPointF(end_x, end_y))
-                painter.drawPath(path)
             else:
-                painter.drawLine(QPointF(command.x, command.y), QPointF(end_x, end_y))
+                path.lineTo(QPointF(end_x, end_y))
+            painter.drawPath(path)
+            if command.kind in ("arrow", "curve", "trace"):
+                for dot_idx in range(2):
+                    phase = (now_seconds * 0.72 + dot_idx * 0.5) % 1.0
+                    dot_pt = path.pointAtPercent(phase)
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QColor("#F4F4F6"))
+                    painter.drawEllipse(dot_pt, 3.0, 3.0)
+                if command.kind == "arrow" and draw_progress > 0.5:
+                    tip_pt = path.pointAtPercent(1.0)
+                    prev_pt = path.pointAtPercent(0.90)
+                    angle = math.atan2(tip_pt.y() - prev_pt.y(), tip_pt.x() - prev_pt.x())
+                    painter.setPen(QPen(tone_color, 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                    for wing in (-0.52, 0.52):
+                        painter.drawLine(
+                            tip_pt,
+                            QPointF(tip_pt.x() - 10.0 * math.cos(angle + wing), tip_pt.y() - 10.0 * math.sin(angle + wing)),
+                        )
             painter.restore()
             if command.label and draw_progress > 0.3:
                 _paint_callout_pill(painter, (command.x + end_x) * 0.5, min(command.y, end_y) - 22.0, command.label, tone_color, opacity=fade_alpha)
@@ -5275,6 +5313,104 @@ def save_visual_snapshots(output_directory: str) -> List[str]:
     demo_image.save(demo_path)
     saved_paths.append(demo_path)
 
+    # 4. roamies_agentic_visuals_showcase.png (STEM cards, parabola x**2, molecule, map, 3D, plan_steps HUD, Watch-It-Work target ring & moving flow connectors)
+    showcase_width, showcase_height = 1440, 860
+    showcase_image = QImage(
+        int(showcase_width * hd_scale),
+        int(showcase_height * hd_scale),
+        QImage.Format.Format_ARGB32_Premultiplied,
+    )
+    showcase_image.setDevicePixelRatio(hd_scale)
+    showcase_painter = QPainter(showcase_image)
+    showcase_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    showcase_painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+    showcase_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    _paint_dark_snapshot_backdrop(showcase_painter, showcase_width, showcase_height)
+
+    overlay.clear_all_drawings()
+    overlay.clear_caption()
+    stem_card = jarvis_response_parser.DrawingCommand(
+        kind="paper",
+        x=32.0,
+        y=72.0,
+        width=400.0,
+        height=720.0,
+        label="STEM & 3D Visuals",
+        header="Roamies Parity",
+        body=(
+            "model3d:preset=atom|caption=Bohr Atom | "
+            "molecule:smiles=CCO|caption=Ethanol | "
+            "graph:expr=x**2|x_range=-3,3|caption=Parabola y=x^2 | "
+            "map:region=Europe|highlight=France,Germany | "
+            "geometry:shapes=triangle 0,0 100,0 50,80"
+        ),
+        tone="blue",
+    )
+    media_card = jarvis_response_parser.DrawingCommand(
+        kind="paper",
+        x=456.0,
+        y=72.0,
+        width=390.0,
+        height=540.0,
+        label="Agentic Task & Study Card",
+        header="Multi-Mode",
+        body=(
+            "flow: Inspect UIA -> Act in App | "
+            "bars: Speed=96% ; Accuracy=99% | "
+            "sources:Roamies|https://github.com/KenKaiii/Roamies;Python|https://python.org | "
+            "ticket:AG-101|Watch It Work Active|Low Latency | "
+            "medal:Gold|60 FPS Verified | "
+            "legend:Blue=Target;Green=Completed"
+        ),
+        tone="green",
+    )
+    overlay.add_drawing_command(stem_card)
+    overlay.add_drawing_command(media_card)
+    overlay.add_drawing_command(
+        jarvis_response_parser.DrawingCommand(
+            kind="target",
+            x=1010.0,
+            y=430.0,
+            radius=36.0,
+            label="Deploy Build Button",
+            tone="blue",
+        )
+    )
+    overlay.add_drawing_command(
+        jarvis_response_parser.DrawingCommand(
+            kind="connect",
+            x=846.0,
+            y=340.0,
+            width=1010.0,
+            height=430.0,
+            label="act_in_app click",
+            tone="blue",
+        )
+    )
+    overlay.set_plan_steps(
+        [
+            "Inspect foreground UIA controls",
+            "Click Deploy Build Button",
+            "Run unit tests in D:\\Projects",
+            "Verify 0 warnings & report",
+        ],
+        active_index=1,
+        hold_seconds=30.0,
+    )
+    overlay.set_bubble_message("Clicking Deploy Build Button in active window...", word_by_word=False, hold_seconds=5.0)
+    overlay._cursor_x_spring.snap(1018.0)
+    overlay._cursor_y_spring.snap(438.0)
+    overlay._cursor_opacity_spring.snap(1.0)
+    showcase_time = time.monotonic() + 3.2
+    overlay._plan_steps_expires_at = showcase_time + 20.0
+    overlay._render_canvas(showcase_painter, QRectF(0.0, 0.0, float(showcase_width), float(showcase_height)), showcase_time)
+    showcase_painter.end()
+
+    showcase_path = os.path.join(output_directory, "roamies_agentic_visuals_showcase.png")
+    showcase_image.save(showcase_path)
+    saved_paths.append(showcase_path)
+
+    overlay.clear_plan_steps()
     overlay.close()
     return saved_paths
 
